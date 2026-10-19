@@ -532,15 +532,14 @@ void shim_main(uint64_t dtb)
 	}
 	con_skip();
 	/*
-	 * kunzite: every core has the 16K granule, so xnu boots right here on
-	 * the ABL boot core. topaz proved xnu hangs after initCPU unless the
-	 * GIC is prepared first (GICD groups, redistributor wake, SGIs/PPIs in
-	 * Group 1, timers/SGI1 enabled), so do that on this core and pre-prepare
-	 * the other seven redistributors before the jump. The VTIMER/SGI windows
-	 * double as the boot #1 diagnostics for INTID 30.
+	 * kunzite boot #1 (2026-10-19): the topaz GIC prep is NOT wanted here.
+	 * GICD 0x17200000 answers, our redistributor wakes (TYPER/WAKER at
+	 * 0x17260000), but the SGI-frame IPRIORITYR write at 0x17270400 takes
+	 * a synchronous data abort (ESR 0x96000010) - this ABL/pKVM handoff
+	 * state rejects it, unlike khaje's. sweet boots xnu with no shim GIC
+	 * prep at all; xnu's own GIC init is the real test. test_gic() stays
+	 * reachable below in the no-payload diagnostics flow via PSCI/gic probe.
 	 */
-	test_gic();
-	gold_gicr_prepare();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();

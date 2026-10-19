@@ -49,6 +49,18 @@ Risks / unverified (GUESSES - first boot decides):
 - 0127/0128 apply AFTER the series reaches 0126; line numbers are the inverted
   originals - check the CI log applies them cleanly.
 
+**BOOT #1 (2026-10-19 ~23:40, diagnostics shim, no payload): partial success + one finding.**
+`fastboot boot` of our v4 image: accepted, jumped (OKAY 0.29s). Console painted (red), then
+blue PANIC: `STAGE gic config`, `FAR 0x17270400` = GICR+0x10400 = SGI-frame IPRIORITYR,
+ESR 0x96000010 (data abort, current EL), MPIDR 0x81000000 = U+MT, Aff all 0 → booted on CPU0.
+Decoded: GICD 0x17200000 answers; redistributor RD frame works (TYPER match + WAKER wake);
+the SGI-frame priority access aborts in this ABL/pKVM handoff state. So the topaz GIC prep
+does NOT transfer to kunzite — removed from the direct path (sweet needs none; xnu's own GIC
+init is the real test). Live FDT confirms redistributor-stride 0x20000, 1 RD region, cpus
+reg 0x000-0x700 (2-cell) — frame math was right; this is an access-permission effect, not
+addressing. Phone recovered (PSCI reset) and booted LOS. CI on kunzite: run 39302653336
+GREEN (0127/0128 apply + build).
+
 NEXT (in order):
 1. Push `kunzite`, run the `xnu` workflow: expect 0127/0128 to apply and build green;
    artifact = the kunzite kernel.
