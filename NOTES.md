@@ -1,5 +1,72 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> KUNZITE PORT (2026-10-19, read this first) <<<
+
+Port #3: **POCO M8 5G** (`kunzite`, Qualcomm SM6475 `parrot`, = Redmi Note 15 5G, model
+25118PC98G). Base = MakrSas/ios-topaz @ 590f001 on branch `kunzite` of the user's fork
+mkukarin01/ios-topaz-experiments. Full tagged-fact dossier: `../kunzite-hw-dossier.md`
+(user workspace); live phone artifacts in `../../temp/ios-m8/phone-facts/` (outside git).
+
+**State: first code delta committed, NOT yet CI-built with the kunzite patches, NOT yet
+booted.** M0 done: the fork's `xnu` workflow ran green on unmodified 590f001
+(run 39298601870). [obs]
+
+Why kunzite should be EASIER than topaz (all from the live FDT / user observation):
+- All 8 cores have the 16K granule: 4x A55 MPIDR 0x000-0x300 + 4x A78 0x400-0x700,
+  **Aff1 = core index, Aff0 = 0 - exactly sweet's encoding**. No silver parking, no gold
+  handoff, no LSE emulation (A78/A55 = ARMv8.2 with LSE+RCpc+PAN). [live]
+- `fastboot boot` RAM-boot WORKS on the 2025 HyperOS ABL (user booted the LOS boot.img
+  from RAM; phone survived reboot; nothing flashed). [obs]
+- 12 GB RAM (spec sheet says 8): clean 6 GiB bank at 0x900000000 for `--highmem`. [live]
+
+This delta (first kunzite commit):
+- `tools/mkadt.py`: kunzite constants — GICD 0x17200000/GICR 0x17260000, splash FB
+  0xb8000000+0x2b00000, UFS 0x1d84000, **VTIMER INTID 30** (parrot uses STANDARD PPIs
+  13/14, unlike topaz's remapped PPI 3 → 19!), 8 cpu nodes (reg = core<<8), default RAM
+  window 0xa8000000+0x38000000 (between global_sync end 0xa7000000 and cpusys_vm
+  0xe0600000), `--highmem` = 0x900000000+0x180000000, panel 1080x2392.
+- `shim/`: GICD/GICR bases, VTIMER 30 / PTIMER 29, IMEM restart reason 0x146aa65c,
+  FB 0xb8000000 (console.h + mmu.h), UFS 0x1d84000 (ufs.c), **no pshold write** (parrot
+  has none; khaje's 0x440b000 is unmapped here - removed as a hazard), and the GIC prep
+  (test_gic + gold_gicr_prepare) now runs on the DIRECT boot path too (topaz proved xnu
+  hangs after initCPU without redistributor wake + Group-1 SGIs/PPIs).
+- `xnu/patches/0127-kunzite-armv8.2-restore.patch`: inverse of 0081's downgrade hunks
+  (flags back to `-march=armv8.2-a+crypto`, commpage CASA, PAN on; 0081's emulation
+  stays as dead code).
+- `xnu/patches/0128-kunzite-cpu-topology-boot.patch`: inverse of 0080's SweetCPU hunk +
+  all of 0082 (sweet topology check, boot MPIDR 0, startCPU guard). Generated
+  programmatically from 0080/0081/0082 - context is byte-exact, hunk counts verified.
+  0080's `sweethw=1` gating of the unported SM7150 key/touch/USB drivers stays.
+
+Risks / unverified (GUESSES - first boot decides):
+- UFS: 4096-byte logical blocks on ALL LUNs; GPT header understates entry count
+  (sda claims 32, has 49; userdata = sda21). Kernel UFS driver untested here: keep the
+  GPT fence, compare GPT before/after (baseline: temp/ios-m8/phone-facts/gpt-sd?-*.bin).
+- What ABL leaves lit in the splash region 0xb8000000 at `fastboot boot` time is
+  unverified (topaz's ABL lit its splash; assume yes until seen).
+- Boot A55 core clock at handoff unknown; no EPSS boost on the direct path yet (domains
+  0x17d91000 A55 / 0x17d92000 A78; add if first boots are slow).
+- 0127/0128 apply AFTER the series reaches 0126; line numbers are the inverted
+  originals - check the CI log applies them cleanly.
+
+NEXT (in order):
+1. Push `kunzite`, run the `xnu` workflow: expect 0127/0128 to apply and build green;
+   artifact = the kunzite kernel.
+2. Extract the D22AP tree for /product (mkadt warns without it):
+   `tools/remotezip.py <iPhone10,3 20H392 IPSW URL> DeviceTree.d22ap.im4p research/ipsw-x/dt`
+   then `ipsw img4 im4p extract ... -o research/ipsw-x/d22ap.adt`.
+3. Build the shim on Linux (aarch64-linux-gnu-gcc + mkbootimg; override build.sh's
+   MKBOOTIMG default). **FIRST BOOT = diagnostics image, NO payload**: `./build.sh`
+   without arguments → `fastboot boot shim/out/shim-boot.img` should paint
+   MMFR0/MIDR/GIC windows/UFS probe on the panel. Photograph everything; Power+VolDown
+   back to fastboot. [This validates tg16=1, INTID 30, the splash FB and the UFS probe
+   before any XNU attempt.]
+4. Payload boots: `mkadt.py shim/out/kunzite.adt --highmem`, mkpayload with `cpus=1`,
+   console ON (no sweetfb_noconsole) until SpringBoard.
+- Phone: LineageOS 24 (2026-09-16 unofficial) installed, `adb root` = "ADB only"
+  enabled; the user runs fastboot/GitHub personally. Never `fastboot getvar` (sweet
+  ABL lesson); do not unplug during flashes.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

@@ -1,0 +1,58 @@
+kunzite (SM6475 parrot): MPIDR Aff1 = core index with Aff0 = 0, exactly
+sweet's encoding (kunzite live FDT: 4x A55 at 0x000-0x300, 4x A78 at
+0x400-0x700; every core has the 16K granule, xnu boots on ABL's core 0x000 and
+PSCI-starts the rest). Inverse of 0080's SweetCPU hunk and of 0082; 0080's
+sweethw=1 gating of the unported SM7150 key/touch/USB drivers stays.
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,8 +73,8 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++	/* kunzite: MPIDR Aff1 = core idx, 0x000-0x300 A55, 0x400-0x700 A78 */
++	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	/* topaz (SM6225): MPIDR Aff1 = cluster, Aff0 = core: 0x0-0x3 A53, 0x100-0x103 A73 */
+-	if ((cpu->phys_id >> 8) > 1 || (cpu->phys_id & 0xff) > 3 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -82,7 +82,7 @@ SweetCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++	cpuName = OSSymbol::withCStringNoCopy("Kryo (SM6475)");
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 260");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -144,13 +144,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
++	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
++		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+-	/*
+-	 * topaz: the ADT lists only the A73 (gold) cores and the shim boots xnu
+-	 * on gold CPU 0x100 (the silver cluster has no 16K granule).
+-	 */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0x100) {
+-		panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u",
+-		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+@@ -238,7 +234,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
++	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu == ml_get_topology_info()->boot_cpu ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+

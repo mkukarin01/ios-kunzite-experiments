@@ -12,12 +12,13 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem@146aa000 restart_reason@65c (live FDT) */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0440b000UL
+/* kunzite (parrot) has no pshold node in the FDT; reset is PSCI-only. The
+ * topaz fallback wrote 0x0440b000, which is NOT mapped here: never write it. */
 
-#define GICD_BASE		0x0f200000UL
-#define GICR_BASE		0x0f300000UL
+#define GICD_BASE		0x17200000UL
+#define GICR_BASE		0x17260000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -30,8 +31,8 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
+#define VTIMER_INTID		30	/* parrot: standard PPI 14, not topaz's remapped PPI 3 */
+#define PTIMER_INTID		29	/* parrot: standard PPI 13 */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -59,8 +60,8 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-/* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
-static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
+/* kunzite: MPIDR Aff1 = core index (0x000-0x300 A55, 0x400-0x700 A78) */
+static inline uint64_t cpu_mpidr(int i) { return (uint64_t)i << 8; }
 
 static volatile uint64_t sec_mpidr[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
@@ -112,7 +113,7 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-	wr32(PSHOLD, 0);
+	/* no pshold on kunzite; if PSCI reset fails, park (user: Power+VolDown) */
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -185,7 +186,7 @@ static void test_gic(void);
  */
 static void gold_gicr_prepare(void)
 {
-	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
+	for (uint32_t aff = 0x100; aff <= 0x700; aff += 0x100) {
 		uintptr_t r = 0;
 		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
 			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
@@ -241,12 +242,14 @@ static uint64_t speed_ticks(void)
 }
 
 /*
- * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
- * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
+ * Cluster to its top cpufreq-epss level before xnu (which has no cpufreq
+ * driver): kunzite freq-domain1 (the A78 cluster) 0x17d92000, LUT +0x110
+ * (32-byte rows), PERF_STATE +0x920 - same EPSS IP as topaz used. Only called
+ * on the no-16K-granule handoff path, which kunzite never takes.
  */
 static void gold_cpufreq_max(void)
 {
-	uintptr_t b = 0x0f523000;
+	uintptr_t b = 0x17d92000;
 	uint32_t best = 0, best_khz = 0, prev = 0;
 	for (uint32_t i = 0; i < 12; i++) {
 		uint32_t v = rd32(b + 0x110 + i * 0x20);
@@ -514,7 +517,7 @@ void shim_main(uint64_t dtb)
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
 	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 	if (((mmfr0 >> 20) & 0xf) == 0) {
-		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
+		con_str("SILVER", "no 16K granule: unexpected on kunzite, trying core 0x100");
 		con_skip();
 		silver_ticks = speed_ticks();
 		gold_dtb = dtb;
@@ -528,6 +531,16 @@ void shim_main(uint64_t dtb)
 		con_hex("CPU_ON", (uint64_t)r);
 	}
 	con_skip();
+	/*
+	 * kunzite: every core has the 16K granule, so xnu boots right here on
+	 * the ABL boot core. topaz proved xnu hangs after initCPU unless the
+	 * GIC is prepared first (GICD groups, redistributor wake, SGIs/PPIs in
+	 * Group 1, timers/SGI1 enabled), so do that on this core and pre-prepare
+	 * the other seven redistributors before the jump. The VTIMER/SGI windows
+	 * double as the boot #1 diagnostics for INTID 30.
+	 */
+	test_gic();
+	gold_gicr_prepare();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
