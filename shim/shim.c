@@ -403,7 +403,11 @@ static void irq_window(const char *label, uintptr_t r, int src)
 		}
 	__asm__ volatile("msr daifset, #2" ::: "memory");
 	wsr("cntv_ctl_el0", 0);
-	wsr("cntp_ctl_el0", 0);
+	/* kunzite: CNTP_CTL_EL0 at EL1 is UNDEFINED under the EL2 monitor (boots
+	 * #4/#8/#9 all hit it); only the PTIMER window ever enables the physical
+	 * timer, so only that window may disable it. */
+	if (src == PTIMER_INTID)
+		wsr("cntp_ctl_el0", 0);
 	isb();
 
 	con_hex2(label, "irqs=", irq_count, "other=", irq_other);
@@ -504,6 +508,57 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+/*
+ * kunzite boot #7 follow-up: xnu hangs after the first sleep-able point, so
+ * the vtimer IRQ is the prime suspect (INTID 30 = parrot PPI14). Minimal GIC
+ * test using ONLY the register subset proven safe on this SoC: boot #1
+ * aborted at the GICR_IPRIORITYR write, so nothing here touches priorities.
+ */
+static void test_gic_kunzite(void)
+{
+	stage = "gic sre";
+	uint64_t sre = rsr("icc_sre_el1");
+	if (!(sre & 1)) {
+		wsr("icc_sre_el1", sre | 1);
+		isb();
+	}
+	if (!(rsr("icc_sre_el1") & 1)) {
+		con_str("GIC", "no sysreg iface, skip");
+		return;
+	}
+	stage = "gic dist";
+	uint32_t dctlr = rd32(GICD_BASE);
+	wr32(GICD_BASE, dctlr | 0x13);
+	gicd_wait_rwp();
+	con_hex2("GICD", "was=", dctlr, "now=", rd32(GICD_BASE));
+	stage = "gic redist";
+	uintptr_t r = find_gicr();
+	if (!r) {
+		con_str("GICR", "not found");
+		return;
+	}
+	uint32_t waker = rd32(r + GICR_WAKER);
+	if (waker & 2) {
+		wr32(r + GICR_WAKER, waker & ~2U);
+		for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
+			;
+	}
+	wr32(r + GICR_IGROUPR0, 0xffffffff);
+	wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << SGI_INTID));
+	uint64_t ctlr = rsr("icc_ctlr_el1");
+	wsr("icc_ctlr_el1", ctlr & ~2ULL);
+	wsr("icc_pmr_el1", 0xf0);
+	wsr("icc_bpr1_el1", 0);
+	wsr("icc_igrpen1_el1", 1);
+	isb();
+	stage = "gic vtimer30";
+	irq_window("VT30", r, VTIMER_INTID);
+	/* No PTIMER window: CNTP_* at EL1 is UNDEFINED under this EL2 monitor
+	 * (boot #4's xnu panic, boot #8's shim panic - do not touch it). */
+	wr32(r + GICR_ICENABLER0, 0xffffffff);
+	isb();
+}
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
@@ -544,7 +599,9 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
+	/* No payload: kunzite GIC/timer diagnostics, then the UFS probe. */
+	test_gic_kunzite();
+	con_skip();
 	stage = "ufs";
 	test_ufs();
 	con_skip();
