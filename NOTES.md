@@ -129,6 +129,36 @@ direct scanout off until the parrot SDE catalog is mined; DSI writes no-op witho
 <4GiB DSI DMA buffer, which the highmem-only window cannot provide — remember this for
 the direct-scanout milestone: it needs a lowmem window in the ADT).
 
+**BOOTS #7-#12 (2026-10-20 00:55-01:30): M3 ACHIEVED — xnu boots to the root-mount panic.**
+- #7 (+0131): DSI0 read works (ctrl 0x1f7), AppleCLCD on the splash 0xb8000000, full VM
+  bootstrap on the 12G bank, then a HANG after gPanicBase lines (no panic, no progress).
+- Diagnosis in the shim (#8-#10): a vtimer IRQ window (GICD/GICR subset only, no
+  IPRIORITYR - that aborts, boot #1). **CNTP_* at EL1 is UNDEFINED under the EL2
+  monitor — third strike after boots #4/#8; never touch it from EL1.**
+- #10 verdict: CNTV asserts (tctl ISTATUS), pend bit 27 lit, bit 30 enabled -> nothing
+  delivered (hppi/last 3FF). **The DT's virt=PPI14/INTID30 claim describes the EL2 view;
+  for EL1 the vtimer lands on INTID 27.** #11 with bit 27: 30/30 IRQs taken (hppi/last
+  0x1B). Fix: mkadt VTIMER_INTID 30 -> 27 (commit 8f2368d; xnu reads it from the ADT).
+- #12 (payload + new ADT): the hang is GONE. AMFI/Sandbox/HFS/mcache/dlil/ifnet all
+  init (threads that were sleeping on the timer now wake), SWEET UFS runs its kernel-side
+  init and reports the device refusing commands (`upiu 0x21 response 0x1 status 0x2`,
+  same UPIU-Fail class as the shim probe), then the expected end state:
+  **`panic IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable; 5`** — the kernel is
+  complete and waiting for an iOS root image.
+
+OPEN, in order:
+1. iOS root image: Linux (VM or docker): apfs-fuse + hfsprogs + tools/mkiosroot.sh +
+   sweet-root-tweaks.py from the iPhone10,3 20H392 IPSW; then the userdata flash
+   (DESTRUCTIVE: GPT fence + fresh dumps + explicit user go).
+2. UFS: even the kernel driver's commands fail (UPIU Fail, empty sense). Read
+   bsd/dev/sweet_ufs.c's init (does it HCE-reset?), check LUN enumeration vs the
+   shim probe's all-LUN Fail; the 4096-byte logical blocks and the GPT-fence (0088)
+   apply the moment writes work.
+3. Quick wins after root: cpus=8 (homogeneous PSCI path), console.c W/H -> 2392
+   (cosmetic), sweetfb_hz tuning; then touch (Goodix GT9916 over SPI SE9 0xa8c000)
+   and the display-quality milestones (need parrot SDE catalog + a lowmem ADT window
+   for <4GiB DMA).
+
 NEXT (in order):
 1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
 2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`
