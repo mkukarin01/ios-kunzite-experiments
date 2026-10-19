@@ -176,6 +176,29 @@ OPEN, in order:
   after, do not unplug, expect ABL fastboot to hang afterwards (re-enter by hand).
 - Parallel: UFS root-cause workflow (sweet_ufs.c anatomy vs Linux ufshcd vs spec) running.
 
+**OVERNIGHT part 2: UFS root-cause workflow + experiment matrix built and staged.**
+Workflow wf_0fae6dbf-4b9 (4 agents) verdict, key corrections to earlier conclusions:
+- The shim's "empty sense" was a DECODE ARTIFACT: the sense lives at resp[32:33] (BE16
+  length) + data from 34 (key 36, ASC/ASCQ 46/47); the old print read the reserved 18-31.
+- Doorbell-clear polarity bug: UTRLCLR is write-1-to-clear (shim + kernel both wrote ~1).
+- Ranked cause: missing post-handoff device handshake (NOP OUT + fDeviceInit + descriptor
+  reads) in BOTH contexts (ufs_take_over_host never HCE-resets); one-line alternative:
+  REG_UFS_CFG1 (0x1d84000+0xDC) BIT(31) UTP_SCSI_CHECK_DIS may synthesize the failures.
+- Escalation (ufsfull=1): HCE 0->1 + UIC DME_LINKSTARTUP x2, then the handshake.
+IMPLEMENTED (commit f376828, image at shim/out/shim-boot.img, NOT yet booted - the
+phone froze on boot #12's panic screen overnight): shim ufs_matrix() runs the whole
+ladder (CFG1 probe+fix, TUR with correct sense, NOP OUT, device/LUN descriptors raw
+dump, fDeviceInit set/poll, TUR+READ verdict) and HOLDS THE SCREEN (no reset).
+
+MORNING (in order):
+1. Hold Power+VolDown to get the phone to fastboot (it is frozen on the xnu panic).
+2. `fastboot boot shim/out/shim-boot.img` -> the matrix screen prints and holds.
+3. Photograph it; the verdict block (TUR/TUR2/READ r/s + sense + NOP + QDEV) picks the
+   fix: CFG1 bit31 alone (one-line kernel fix), handshake (kernel patch 0132), or
+   escalation (ufsfull prototype).
+4. Then the M4 flash decision: `fastboot -S 512M flash userdata ios16-root-20H392.simg`
+   (image ready; DESTRUCTIVE - only after UFS reads work and with explicit go).
+
 NEXT (in order):
 1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
 2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`
