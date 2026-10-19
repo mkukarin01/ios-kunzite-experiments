@@ -103,16 +103,29 @@ virtual timer — GIC PPI via ADT `virtual-timer-intid`), dry-run verified again
 buildtree. Open: whether `pe_init_fiq()` (GICR SGI-frame writes from EL1!) ran before
 the panic — check the boot photos for the `SWEET GIC: virtual timer INTID 30` kprintf.
 
+**BOOT #5 (2026-10-20 ~00:30, kernel with 0129): 0129 works — XNU reached IOKit.**
+Console scrolled through memory init, AMFI/security policy, platform expert,
+AppleKeyStore, IOWatchdog, **IOSurface (IOCoreSurfaceRoot)**, HID buttons + touch
+service registration — then `Kernel data abort` at `pc=0xfffffe00074fdc20`
+(`_sweet_cpufreq_max+0x88`), `far=VA+0x110` = the **LUT offset**: the kernel-side
+topaz cpufreq boost (`bsd/dev/sweet_cpufreq.c`) maps khaje's `0x0f523000` EPSS domain
+and faults on the first LUT read. Caller: `SweetBattery::start` (topaz battery, which
+would next touch topaz I2C1/SPMI gauge MMIO). Fix: **patch 0130** (commit 5aaaed1) —
+kunzite EPSS domains 0x17d91000/0x17d92000, READ-ONLY (PERF_STATE offset unverified on
+parrot), SweetBattery static fallback by default (`sweetbattery=1` to experiment).
+pe_init_fiq evidently ran (HID/IOSurface registration comes after it): **the GICR
+SGI-frame writes work from EL1 inside xnu** — boot #1's shim abort was a shim-context
+effect, not a general block.
+
 NEXT (in order):
-1. Push 0129 (kunzite branch), run the `xnu` workflow, fetch the new kernel artifact.
-2. Rebuild the payload with the SAME kunzite.adt + cmdline (mkpayload; note build-mac.sh
-   takes the payload path relative to shim/) and boot #5. Expected: kernel console
-   scrolls far past fiq init (pe_init_fiq, scheduler, threads) — success for this stage
-   is reaching a root-mount complaint (`rd=ufsroot0` with no iOS image flashed) or a
-   sweet_ufs.c report; any panic, symbolicate against the artifact's nm the same way.
-3. If the root path is the wall: build the iOS root image (Linux box: apfs-fuse +
-   hfsprogs + tools/mkiosroot.sh + sweet-root-tweaks.py from the IPSW) and flash
-   userdata (destructive — GPT fence + fresh GPT dumps first).
+1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
+2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`
+   lines (first parrot EPSS readout), how far IOKit gets, and the eventual stop —
+   expected the root-mount complaint (`rd=ufsroot0`, no image flashed) or a
+   sweet_ufs.c report (the Samsung device "Fail" state gets its kernel-side test).
+3. Then the iOS root image (Linux: apfs-fuse + hfsprogs + mkiosroot.sh +
+   sweet-root-tweaks.py from the IPSW; flash userdata = destructive: GPT fence,
+   fresh dumps, user confirms).
 - Phone: LineageOS 24 (2026-09-16 unofficial) installed, `adb root` = "ADB only"
   enabled; the user runs fastboot/GitHub personally. Never `fastboot getvar` (sweet
   ABL lesson); do not unplug during flashes.
