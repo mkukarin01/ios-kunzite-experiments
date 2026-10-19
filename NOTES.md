@@ -117,6 +117,18 @@ pe_init_fiq evidently ran (HID/IOSurface registration comes after it): **the GIC
 SGI-frame writes work from EL1 inside xnu** — boot #1's shim abort was a shim-context
 effect, not a general block.
 
+**BOOT #6 (2026-10-20 ~00:55, kernel with 0129+0130): through CPU init into IOKit display.**
+EPSS read-only LUTs printed: **A55 best=1804 MHz, A78 best=2400 MHz** (LUT offsets read-
+validated). Battery static fallback line clean. **SWEET CPU: cpu=0 mpidr=0x0 came alive;
+SGI1 OK; 1/1 CPUs initialized** — MAC Framework + buffer headers up, then a kernel data
+abort at `AppleCLCD::start+0x2f4`: reading DSI0 ctrl at `0x05e94000+4` — sweet's SM7150
+display MMIO (VIG0 0x5e05000, CTL0 0x5e02000, INTF1 0x5e6b000 in the same function) that
+topaz never retargeted. khaje's fabric tolerated the read; kunzite's aborts. Fix: patch
+**0131** — parrot DSI0 ctrl 0xae94000 (live FDT), VIG0/CTL0/INTF1 NULL (all uses guarded;
+direct scanout off until the parrot SDE catalog is mined; DSI writes no-op without the
+<4GiB DSI DMA buffer, which the highmem-only window cannot provide — remember this for
+the direct-scanout milestone: it needs a lowmem window in the ADT).
+
 NEXT (in order):
 1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
 2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`
