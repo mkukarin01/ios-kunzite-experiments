@@ -61,20 +61,33 @@ reg 0x000-0x700 (2-cell) — frame math was right; this is an access-permission 
 addressing. Phone recovered (PSCI reset) and booted LOS. CI on kunzite: run 39302653336
 GREEN (0127/0128 apply + build).
 
+**BOOT #2 (2026-10-19 ~23:50, shim 27b02c3, no GIC prep, no payload): M2 ACHIEVED.**
+Full diagnostics screen, clean run, phone auto-reset afterwards:
+- `MMFR0 tg16=1` — 16K granule CONFIRMED on hardware; boot core = Cortex-A55 r2p0
+  (MIDR 0x412FD050), MPIDR 0x81000000 (U+MT, Aff all 0) = CPU0.
+- ABL PASSES the v4 boot ramdisk (INITRD 0xb6d6e000..0xb7ffef78, ~19 MB = our gzip
+  cpio) — kunzite's ABL does NOT drop it, unlike topaz's.
+- `LOADER no SWEETXNU payload` — payload scanner OK.
+- UFS host @0x1d84000 ALIVE: UFSHCI **3.0.0**, CAP=0x1587031F (32 slots, 64-bit
+  addressing), HCS=0x10F (DP=1: Samsung device present, queues ready). ABL's UTRP
+  was at 0xFE934000, ours at 0xA8016000 → the shim image loads at ~0xA8000000, so the
+  default mkadt window (PHYS_BASE 0xa8000000) overlaps the live image: FIRST PAYLOAD
+  BOOT MUST USE `--highmem` (0x900000000).
+- ALL commands fail: TUR/CAP/READ rc=4 ocs=2 — Linux OCS 0x2 = INVALID_PRDT_ATTR:
+  our UTRP/PRDT is rejected by the v3.0 controller. Root-cause in shim/ufs.c (suspects:
+  PRDT/UTRP format deltas for UFSHCI 3.0, 4096-byte logical blocks, UTRLBA swap
+  procedure while the queue runs).
+
 NEXT (in order):
-1. Push `kunzite`, run the `xnu` workflow: expect 0127/0128 to apply and build green;
-   artifact = the kunzite kernel.
-2. Extract the D22AP tree for /product (mkadt warns without it):
-   `tools/remotezip.py <iPhone10,3 20H392 IPSW URL> DeviceTree.d22ap.im4p research/ipsw-x/dt`
-   then `ipsw img4 im4p extract ... -o research/ipsw-x/d22ap.adt`.
-3. Build the shim on Linux (aarch64-linux-gnu-gcc + mkbootimg; override build.sh's
-   MKBOOTIMG default). **FIRST BOOT = diagnostics image, NO payload**: `./build.sh`
-   without arguments → `fastboot boot shim/out/shim-boot.img` should paint
-   MMFR0/MIDR/GIC windows/UFS probe on the panel. Photograph everything; Power+VolDown
-   back to fastboot. [This validates tg16=1, INTID 30, the splash FB and the UFS probe
-   before any XNU attempt.]
-4. Payload boots: `mkadt.py shim/out/kunzite.adt --highmem`, mkpayload with `cpus=1`,
-   console ON (no sweetfb_noconsole) until SpringBoard.
+1. Root-cause the UFS OCS=2 (INVALID_PRDT_ATTR): read shim/ufs.c, compare the UTRP/PRDT
+   construction against Linux ufshcd on UFSHCI 3.0 + 4096-byte logical blocks.
+2. Fetch the kunzite kernel artifact from the fork's green CI run 39302653336.
+3. Extract `research/ipsw-x/d22ap.adt` (`ipsw` is installed via brew; get the
+   iPhone10,3 20H392 IPSW URL from api.ipsw.me, then tools/remotezip.py + `ipsw img4
+   im4p extract`).
+4. `mkadt.py shim/out/kunzite.adt --highmem` + mkpayload (`cpus=1`, console ON) +
+   `build-mac.sh payload.bin` → first XNU boot attempt (watch for the GIC init: the
+   SGI-frame access question gets its real test inside xnu).
 - Phone: LineageOS 24 (2026-09-16 unofficial) installed, `adb root` = "ADB only"
   enabled; the user runs fastboot/GitHub personally. Never `fastboot getvar` (sweet
   ABL lesson); do not unplug during flashes.
