@@ -1,0 +1,101 @@
+kunzite (SM6475 parrot): the kernel-side topaz hardware defaults are unsafe here.
+sweet_cpufreq_max() mapped khaje's 0xf523000 EPSS domain and faulted on the
+first LUT read at boot #5 (Kernel data abort, pc _sweet_cpufreq_max+0x88,
+far=VA+0x110 - the LUT offset), called from SweetBattery::start. Point it at
+kunzite's two cpufreq-epss domains (0x17d91000 A55, 0x17d92000 A78, live
+FDT) and make it READ-ONLY (print the LUTs; the PERF_STATE +0x920 write
+offset is unverified on parrot - topaz's RCG lesson). SweetBattery defaults
+to the static fallback (topaz I2C1/SPMI gauge MMIO not ported);
+sweetbattery=1 re-enables the real poll for experiments.
+
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1,8 +1,9 @@
+ /*
+- * topaz: run the Gold cluster at its top frequency. SM6225 cpufreq-hw
+- * (qcom,cpufreq-hw, freq-domain1 at 0xf523000; msm-4.19 qcom-cpufreq-hw.c
+- * layout): LUT at +0x110, 32-byte rows, PERF_STATE at +0x920.
+- * Nothing scales it down again: there is no XNU cpufreq driver yet.
++ * kunzite (SM6475 parrot): both cpufreq-epss domains (0: A55, 1: A78) from
++ * the live FDT. Same EPSS IP as topaz's SM6225 (LUT +0x110, 32-byte rows).
++ * READ-ONLY for now: the PERF_STATE (+0x920) write offset is not yet
++ * verified against a parrot kernel source (topaz's RCG lesson), so print
++ * the LUTs and change nothing until then.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -12,7 +13,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_cpufreq_max(void);
+ 
+-#define CPUFREQ_GOLD_PA         0x0f523000u
++#define CPUFREQ_DOM0_PA         0x17d91000u
++#define CPUFREQ_DOM1_PA         0x17d92000u
+ #define CPUFREQ_FREQ_LUT        0x110u
+ #define CPUFREQ_LUT_ROW         0x20u
+ #define CPUFREQ_PERF_STATE      0x920u
+@@ -26,29 +28,31 @@
+ 	if (!on) {
+ 		return 0;
+ 	}
+-	vm_offset_t b = ml_io_map(CPUFREQ_GOLD_PA, 0x1000);
+-	if (b == 0) {
+-		return -1;
++	static const struct { const char *name; uint32_t pa; } dom[2] = {
++		{ "A55", CPUFREQ_DOM0_PA }, { "A78", CPUFREQ_DOM1_PA },
++	};
++	for (unsigned d = 0; d < 2; d++) {
++		vm_offset_t b = ml_io_map(dom[d].pa, 0x1000);
++		if (b == 0) {
++			continue;
++		}
++		uint32_t best = 0, bestKHz = 0, prevKHz = 0;
++		for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
++			uint32_t v = *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
++			uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
++			uint32_t khz = src ? 19200u * lval : 300000u;
++			if (i > 0 && khz == prevKHz) {
++				break;  /* the LUT repeats its last entry */
++			}
++			prevKHz = khz;
++			if (khz > bestKHz) {
++				bestKHz = khz;
++				best = i;
++			}
++		}
++		printf("SWEET CPUFREQ: %s LUT best %u (%u MHz) - perf state NOT set (kunzite, unverified offset)\n",
++		    dom[d].name, best, bestKHz / 1000);
+ 	}
+-	uint32_t best = 0, bestKHz = 0, prevKHz = 0;
+-	for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
+-		uint32_t v = *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
+-		uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
+-		uint32_t khz = src ? 19200u * lval : 300000u;
+-		if (i > 0 && khz == prevKHz) {
+-			break;          /* the LUT repeats its last entry */
+-		}
+-		prevKHz = khz;
+-		if (khz > bestKHz) {
+-			bestKHz = khz;
+-			best = i;
+-		}
+-	}
+-	uint32_t old = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = best;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	printf("SWEET CPUFREQ: gold perf state %u -> %u (%u MHz)\n", old, best, bestKHz / 1000);
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -324,7 +324,7 @@
+ 		return false;
+ 	}
+ 	(void)sweet_cpufreq_max();
+-	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
++	int real = 0;   /* kunzite: topaz I2C1/SPMI gauge MMIO not ported; sweetbattery=1 to try */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_i2c1_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
