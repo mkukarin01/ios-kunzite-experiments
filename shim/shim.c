@@ -31,8 +31,8 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		30	/* parrot: standard PPI 14, not topaz's remapped PPI 3 */
-#define PTIMER_INTID		29	/* parrot: standard PPI 13 */
+#define VTIMER_INTID		27	/* parrot: CNTV empirically pends here (boot #10), not the DT's PPI14/30 */
+#define PTIMER_INTID		29	/* parrot: PPI 13; EL1 access to CNTP_* is EL2-trapped anyway */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL

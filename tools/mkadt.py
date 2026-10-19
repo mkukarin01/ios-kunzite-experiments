@@ -32,9 +32,10 @@ FB_W, FB_H, FB_STRIDE = 1080, 2392, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
-# parrot arch_timer uses the standard PPIs (phys 13, virt 14), unlike topaz's
-# remapped PPI 3: GICv3 INTID = 16 + PPI -> vtimer 30 (live FDT timer node).
-VTIMER_INTID = 30
+# parrot: the DT's arch_timer claims virt = PPI14 (INTID 30), but that line
+# never delivers for EL1 under the XBL EL2 monitor - empirically (shim boot
+# #10, VT30 window) CNTV pends on INTID 27: enabled bit 27, not 30.
+VTIMER_INTID = 27
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
