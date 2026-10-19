@@ -1,0 +1,34 @@
+kunzite (SM6475 parrot): skip the precautionary physical-timer mask in
+_enable_virtual_timer() under SWEET. The EL2 monitor resident from XBL
+traps EL1 CNTP_CTL_EL0 (CNTHCTL_EL2.EL1PCEN=0) - the write faulted as
+"Undefined kernel instruction" at fiq_context_init+0x14 (instr 0xd51be228,
+MSR CNTP_CTL_EL0) on boot #4. XNU uses only the virtual timer here (GIC PPI
+from the ADT virtual-timer-intid); SM7150/SM6225 allowed the write.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2271,12 +2271,23 @@
+ _enable_virtual_timer(void)
+ {
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+ 
+ 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
++#if defined(SWEET)
++	/*
++	 * kunzite (SM6475): the EL2 monitor resident from XBL (QHEE) traps EL1
++	 * CNTP_CTL_EL0 accesses (CNTHCTL_EL2.EL1PCEN = 0): this precautionary
++	 * mask faults as an undefined instruction (sleh.c:1029) before the
++	 * scheduler ever runs. The kernel only uses the virtual timer, whose
++	 * GIC PPI the ADT supplies via virtual-timer-intid. SM7150/SM6225
++	 * handoffs allowed the write, so sweet/topaz never saw this.
++	 */
++#else
+ 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
+ 	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
++#endif
+ }
+ 
+ void
+ fiq_context_init(boolean_t enable_fiq __unused)
+ {

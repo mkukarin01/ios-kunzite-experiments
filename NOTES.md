@@ -89,17 +89,30 @@ Also done: `research/ipsw-x/d22ap.adt` extracted (remotezip + `ipsw img4 im4p ex
 186 KB); `tools/mkadt.py` now builds the full tree with /product (no warning):
 `shim/out/kunzite.adt` (--highmem), `kunzite-default.adt`, `kunzite-qemu.adt`.
 
+**BOOT #4 (2026-10-20 ~00:20, first XNU payload: kernel from CI run 39302653336 +
+kunzite.adt --highmem, cpus=1): XNU RUNS — killed by a QHEE timer trap.**
+Shim found the payload; XNU booted with console up and early init running, then:
+`panic(cpu 0): Undefined kernel instruction: pc=0xfffffe00074a2348 instr=0xd51be228 @sleh.c:1029`.
+Symbolized against the CI kernel (`nm`): faulting pc = **`_fiq_context_init+0x14`**;
+instr = `MSR CNTP_CTL_EL0, X8` — the *precautionary physical-timer mask* in
+`_enable_virtual_timer()` (osfmk/arm64/machine_routines.c:2277), the ONLY CNTP write in
+the tree. Cause: the EL2 monitor resident from XBL (QHEE) traps EL1 CNTP_CTL accesses
+(CNTHCTL_EL2.EL1PCEN=0) on this SoC; SM7150/SM6225 allowed the write, so sweet/topaz
+never saw it. Fix: **patch 0129** (under SWEET skip the mask; the kernel uses the
+virtual timer — GIC PPI via ADT `virtual-timer-intid`), dry-run verified against the CI
+buildtree. Open: whether `pe_init_fiq()` (GICR SGI-frame writes from EL1!) ran before
+the panic — check the boot photos for the `SWEET GIC: virtual timer INTID 30` kprintf.
+
 NEXT (in order):
-1. Kernel artifact from the fork's CI run 39302653336 (user fetches; needs GitHub auth)
-   → `xnu/out/kernel.development.sweet`.
-2. `python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/kunzite.adt
-   shim/out/payload.bin --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress
-   rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin
-   ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1'` (no sweetfb_noconsole: keep the
-   console; expect a root-mount panic — that is still M3: XNU on the panel).
-3. `shim/build-mac.sh shim/out/payload.bin` → `fastboot boot shim/out/shim-boot.img`.
-4. Watch: kernel banner + early console; the GIC init inside xnu is the live test of
-   the boot-#1 SGI-frame question; sweet_ufs.c init vs the device "Fail" state.
+1. Push 0129 (kunzite branch), run the `xnu` workflow, fetch the new kernel artifact.
+2. Rebuild the payload with the SAME kunzite.adt + cmdline (mkpayload; note build-mac.sh
+   takes the payload path relative to shim/) and boot #5. Expected: kernel console
+   scrolls far past fiq init (pe_init_fiq, scheduler, threads) — success for this stage
+   is reaching a root-mount complaint (`rd=ufsroot0` with no iOS image flashed) or a
+   sweet_ufs.c report; any panic, symbolicate against the artifact's nm the same way.
+3. If the root path is the wall: build the iOS root image (Linux box: apfs-fuse +
+   hfsprogs + tools/mkiosroot.sh + sweet-root-tweaks.py from the IPSW) and flash
+   userdata (destructive — GPT fence + fresh GPT dumps first).
 - Phone: LineageOS 24 (2026-09-16 unofficial) installed, `adb root` = "ADB only"
   enabled; the user runs fastboot/GitHub personally. Never `fastboot getvar` (sweet
   ABL lesson); do not unplug during flashes.
