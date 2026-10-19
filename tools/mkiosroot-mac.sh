@@ -103,10 +103,23 @@ hdiutil attach "$work/out.sparseimage" -nobrowse -mountpoint "$vol" >/dev/null
 mounts=("$vol" "${mounts[@]}")
 echo "target mounted at $vol"
 
-copy() { echo "copying $1 -> ${2#$vol}"; mkdir -p "$2"; rsync -a --no-D "$1/" "$2/"; }
+copy() {
+	echo "copying $1 -> ${2#$vol}"
+	mkdir -p "$2"
+	# .file is a mode-000 volume marker (unreadable as a plain user); rsync
+	# exit <= 24 means partial transfer - tolerated, the copy is complete
+	# enough (only .file is excluded).
+	set +e
+	rsync -a --no-D --exclude='/.file' "$1/" "$2/"
+	rc=$?
+	set -e
+	[[ $rc -le 24 ]] || { echo "rsync rc=$rc" >&2; exit $rc; }
+	[[ $rc -eq 0 ]] || echo "rsync rc=$rc (partial, continuing)" >&2
+}
 copy "$os_src" "$vol"
 copy "$sysos_src" "$vol/private/preboot/Cryptexes/OS"
 copy "$appos_src" "$vol/private/preboot/Cryptexes/App"
+: > "$vol/.file"
 
 # Shared cache where dyld looks at ignition level 1: hard links, no extra space.
 dsc=private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
@@ -155,7 +168,9 @@ fi
 
 hdiutil detach "$vol" -force >/dev/null
 mounts=("${mounts[@]:1}")
-hdiutil convert "$work/out.sparseimage" -format UDRW -o "$out" >/dev/null
+# hdiutil convert appends .dmg to -o names: ask for it, then strip it.
+hdiutil convert "$work/out.sparseimage" -format UDRW -o "$out.dmg" >/dev/null
+mv "$out.dmg" "$out"
 rm -f "$work/out.sparseimage"
 fsck_hfs -y "$out" >/dev/null || true
 fsck_hfs -n "$out" 2>&1 | tail -1

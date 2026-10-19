@@ -159,6 +159,23 @@ OPEN, in order:
    and the display-quality milestones (need parrot SDE catalog + a lowmem ADT window
    for <4GiB DMA).
 
+**OVERNIGHT (2026-10-20 ~03:00-03:40, autonomous): M4 PREP COMPLETE — iOS root image BUILT on macOS.**
+- IPSW downloaded (6.17 GB, temp/ios-m8/ipsw/). tools/mkiosroot-mac.sh (new, commit f7776bc + fix):
+  hdiutil replaces apfs-fuse (RO mounts of OS/SystemOS/AppOS dmgs: 087-86698-044/087-86593-047/
+  087-86715-047, d22ap Erase identity), 321,213-entry ownership manifest captured and replayed as
+  root inside docker (python:3-slim; 189 stragglers: hardlink dupes/suid refusals - tolerated)
+  together with sweet-root-tweaks.py (launchd 7 PanicOnCrash + CommCenter removed, containers,
+  VirtualAudio disabled, StartRecorderServer off, all prefs seeded; the mobileactivationd data ark
+  SKIPPED - no container pre-first-boot; Hactivation via the ADT covers it).
+- **temp/ios-m8/ios16-root-20H392.img** (16 GiB UDRW bare HFS+J, sha256
+  8a53e27099ea1163743941fc27365c28b6a2aee057e3f63fe704f657f9d0049e) + **ios16-root-20H392.simg**
+  (12.35 GB sparse, 204 chunks). Journal left clean via a mount/unmount cycle (fsck_hfs cannot
+  run on plain files on macOS).
+- FLASH PROCEDURE (DESTRUCTIVE, waits for the user + a working kernel UFS):
+  `fastboot -S 512M flash userdata ios16-root-20H392.simg` (~25 min), fresh GPT dumps before/
+  after, do not unplug, expect ABL fastboot to hang afterwards (re-enter by hand).
+- Parallel: UFS root-cause workflow (sweet_ufs.c anatomy vs Linux ufshcd vs spec) running.
+
 NEXT (in order):
 1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
 2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`

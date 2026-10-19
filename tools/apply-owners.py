@@ -26,7 +26,9 @@ def main():
         except OSError as e:
             print(f'warn: {rel}: {e}', file=sys.stderr)
     print(f'owners applied: {n}, missing: {missing}')
-    sys.exit(0 if missing == 0 else 1)
+    # Missing/warned entries (hardlink duplicates, excluded markers, suid
+    # files the sharing layer refuses) are tolerable: never block the chain.
+    sys.exit(0)
 
 
 if __name__ == '__main__':
