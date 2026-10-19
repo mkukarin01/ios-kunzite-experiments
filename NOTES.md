@@ -78,16 +78,28 @@ Full diagnostics screen, clean run, phone auto-reset afterwards:
   PRDT/UTRP format deltas for UFSHCI 3.0, 4096-byte logical blocks, UTRLBA swap
   procedure while the queue runs).
 
+**BOOT #3 (2026-10-20 ~00:00, ufs.c instrumented): the UFS "failure" decoded — parked.**
+Every command on every LUN 0-5: OCS=0 (controller SUCCESS), proper RESPONSE UPIU, but
+response code resp[6]=0x01 = **UPIU "Fail"** with SCSI status 2 and EMPTY sense. That is
+a device-side task-layer rejection (likely stale ABL task/nexus state after our list
+takeover — khaje/SM7150 handoffs tolerated it, this one does not), not a descriptor bug.
+The shim probe is diagnostics only: **parked**. The real UFS path is the kernel's
+sweet_ufs.c (own host reset + init) — it gets its test in the payload boot.
+Also done: `research/ipsw-x/d22ap.adt` extracted (remotezip + `ipsw img4 im4p extract`,
+186 KB); `tools/mkadt.py` now builds the full tree with /product (no warning):
+`shim/out/kunzite.adt` (--highmem), `kunzite-default.adt`, `kunzite-qemu.adt`.
+
 NEXT (in order):
-1. Root-cause the UFS OCS=2 (INVALID_PRDT_ATTR): read shim/ufs.c, compare the UTRP/PRDT
-   construction against Linux ufshcd on UFSHCI 3.0 + 4096-byte logical blocks.
-2. Fetch the kunzite kernel artifact from the fork's green CI run 39302653336.
-3. Extract `research/ipsw-x/d22ap.adt` (`ipsw` is installed via brew; get the
-   iPhone10,3 20H392 IPSW URL from api.ipsw.me, then tools/remotezip.py + `ipsw img4
-   im4p extract`).
-4. `mkadt.py shim/out/kunzite.adt --highmem` + mkpayload (`cpus=1`, console ON) +
-   `build-mac.sh payload.bin` → first XNU boot attempt (watch for the GIC init: the
-   SGI-frame access question gets its real test inside xnu).
+1. Kernel artifact from the fork's CI run 39302653336 (user fetches; needs GitHub auth)
+   → `xnu/out/kernel.development.sweet`.
+2. `python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/kunzite.adt
+   shim/out/payload.bin --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress
+   rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin
+   ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1'` (no sweetfb_noconsole: keep the
+   console; expect a root-mount panic — that is still M3: XNU on the panel).
+3. `shim/build-mac.sh shim/out/payload.bin` → `fastboot boot shim/out/shim-boot.img`.
+4. Watch: kernel banner + early console; the GIC init inside xnu is the live test of
+   the boot-#1 SGI-frame question; sweet_ufs.c init vs the device "Fail" state.
 - Phone: LineageOS 24 (2026-09-16 unofficial) installed, `adb root` = "ADB only"
   enabled; the user runs fastboot/GitHub personally. Never `fastboot getvar` (sweet
   ABL lesson); do not unplug during flashes.

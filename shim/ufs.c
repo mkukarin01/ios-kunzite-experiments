@@ -128,6 +128,17 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	__asm__ volatile("dsb sy" ::: "memory");
 	*ocs_out = utrl[0].dw2 & 0xff;
 	*status_out = ucd.resp[7];		/* SCSI status in the response UPIU */
+	/*
+	 * kunzite boot #2: every command completes (OCS 0, RESPONSE UPIU ok) with
+	 * SCSI status 2 = CHECK CONDITION. Dump the UPIU response code (byte 6)
+	 * and the sense data (starts at byte 18: key at +2, ASC/ASCQ at +12/+13)
+	 * so the screen says WHY the device refuses.
+	 */
+	if (*status_out) {
+		con_hex2("UFS SEN", "rc=", ucd.resp[6], "st=", *status_out);
+		con_hex2("UFS SEN", "key=", ucd.resp[20], "asc=",
+		    (uint32_t)ucd.resp[30] << 8 | ucd.resp[31]);
+	}
 	if (*ocs_out)
 		return 2;
 	if (ucd.resp[0] != 0x21)		/* RESPONSE UPIU */
@@ -239,6 +250,29 @@ void test_ufs(void)
 	}
 
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
+
+	/*
+	 * kunzite has 6 LUNs (sda..sdf) and the boot GPT with userdata is on one
+	 * of them: sweep LUN 0..5 with TUR so the screen names the live LUNs and
+	 * their sense codes (which LUN the kernel driver must use).
+	 */
+	static const uint8_t tur6[6] = { 0 };
+	uint8_t good_lun = 0xff;
+	for (uint8_t lun = 0; lun < 6; lun++) {
+		char label[] = "UFS LN0";
+		label[6] = '0' + lun;
+		rc = scsi(lun, tur6, sizeof(tur6), 0, 0, &ocs, &st);
+		con_hex2(label, "rc=", rc, "ocs/st=", ocs << 8 | st);
+		if (!rc && good_lun == 0xff)
+			good_lun = lun;
+	}
+	if (good_lun != 0xff) {
+		rc = scsi(good_lun, cap10, sizeof(cap10), data, 8, &ocs, &st);
+		con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
+		if (!rc)
+			con_hex2("UFS LUNx", "lun=", good_lun, "blk=", be32(data + 4));
+	}
+
 	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
 	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
 	if (!rc)
