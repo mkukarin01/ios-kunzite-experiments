@@ -121,7 +121,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	uint64_t start = ticks();
 	while (ufs_rd(REG_UTRLDBR) & 1) {
 		if (ticks() - start > 19200000) {	/* 1 s */
-			ufs_wr(REG_UTRLCLR, ~1u);	/* clear slot 0 (write 0 to the bit) */
+			ufs_wr(REG_UTRLCLR, 1);		/* doorbell bits are write-1-to-clear */
 			return 1;			/* timeout */
 		}
 	}
@@ -201,6 +201,132 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 		    !__builtin_strcmp(name, "cache"))
 			con_str(" fs", fs_type((uint32_t)first));
 	}
+}
+
+/* ================= kunzite UFS experiment matrix (2026-10-20) =================
+ * One boot answers the synthesis matrix: CFG1 SCSI-check bit, response-UPIU
+ * forensics with CORRECT sense offsets, NOP OUT, the query ladder (device
+ * descriptor, LUN descriptor, fDeviceInit), then TUR/READ again. The screen
+ * holds forever (no reset): photograph it in the morning.
+ * Layout notes (Linux ufshcd encodings): dev-manage UTRD DW0 CT=2<<28; query
+ * struct sits at UPIU byte 12 (opcode,idn,index,selector,res_osf,len,value..);
+ * NOP OUT is a bare 0x00 transaction header. SCSI response sense: length BE16
+ * at bytes [32:33], data from 34, key at 36, ASC/ASCQ at 46/47.
+ */
+#define REG_UFS_CFG1		0xDCu	/* 0x1d84000+0xDC: BIT31 UTP_SCSI_CHECK_DIS */
+#define CT_DEV_MANAGE		(2u << 28)
+
+static uint8_t dm_tag;
+
+/* One device-manage UPIU on slot 0 (no data buffers; responses stay in the
+ * 512-byte response area). Returns 0 on OCS=0 completion. */
+static uint32_t dm_upiu(uint8_t trans, uint8_t dd, const uint8_t q[16])
+{
+	zero(&utrl[0], sizeof(utrl[0]));
+	zero(&ucd, sizeof(ucd));
+	ucd.cmd[0] = trans;
+	ucd.cmd[3] = ++dm_tag;
+	if (q != 0) {
+		for (int i = 0; i < 16; i++)
+			ucd.cmd[12 + i] = q[i];
+	}
+	uintptr_t ucd_pa = (uintptr_t)&ucd;
+	utrl[0].dw0 = CT_DEV_MANAGE | ((uint32_t)dd << 25) | (1u << 24);
+	utrl[0].dw2 = 0x0f;
+	utrl[0].ucdba = (uint32_t)ucd_pa;
+	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
+	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+	__asm__ volatile("dsb sy" ::: "memory");
+	ufs_wr(REG_UTRLDBR, 1);
+	uint64_t start = ticks();
+	while (ufs_rd(REG_UTRLDBR) & 1) {
+		if (ticks() - start > 19200000) {
+			ufs_wr(REG_UTRLCLR, 1);	/* write-1-to-clear */
+			return 1;
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	return utrl[0].dw2 & 0xff;
+}
+
+/* The matrix. Order = cheapest disproof first. */
+void ufs_matrix(void)
+{
+	con_str("UFS MAT", "exp matrix v1 (holds)");
+	uint32_t cfg1 = ufs_rd(REG_UFS_CFG1);
+	con_hex2("UFS CFG", "1=", cfg1, "scsi=", cfg1 >> 31);
+	if (!(cfg1 & (1u << 31))) {
+		ufs_wr(REG_UFS_CFG1, cfg1 | (1u << 31));
+		uint32_t rb = ufs_rd(REG_UFS_CFG1);
+		con_hex2("UFS CFG", "w=", rb, "bit31=", rb >> 31);
+	}
+
+	/* take over the transfer list (validated path) */
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list) {
+		con_str("UFS", "list base not taken");
+		return;
+	}
+
+	/* E1: TUR with the CORRECT sense offsets (the old print read 18-31) */
+	static const uint8_t tur[6] = { 0 };
+	uint32_t ocs = 0, st = 0;
+	uint32_t rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+	con_hex2("UFS TUR", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+	con_hex2("UFS SEN", "dsl=", (uint32_t)ucd.resp[32] << 8 | ucd.resp[33],
+	    "key=", ucd.resp[36]);
+	con_hex2("UFS SEN", "asc=", (uint32_t)ucd.resp[46] << 8 | ucd.resp[47],
+	    "code=", ucd.resp[34]);
+
+	/* E2: NOP OUT x3 */
+	for (int i = 0; i < 3; i++) {
+		uint32_t n = dm_upiu(0x00, 0, 0);
+		con_hex2("UFS NOP", "ocs=", n, "r/t=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
+		if (n == 0 && ucd.resp[0] == 0x20 && ucd.resp[6] == 0)
+			break;
+	}
+
+	/* E3a: query read descriptors (dump the raw response window) */
+	static const uint8_t q_dev[16] = { 0x01, 0x00, 0, 0, 0, 0, 0, 64 };
+	uint32_t q = dm_upiu(0x16, 2, q_dev);
+	con_hex2("UFS QDEV", "ocs=", q, "r/i=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
+	for (int i = 0; i < 8; i++)
+		con_hex2("UFS QDMP", "a=", *(volatile uint32_t *)(ucd.resp + 28 + i * 4),
+		    "b=", *(volatile uint32_t *)(ucd.resp + 44 + i * 4));
+	static const uint8_t q_lu0[16] = { 0x01, 0x02, 0, 0, 0, 0, 0, 32 };
+	q = dm_upiu(0x16, 2, q_lu0);
+	con_hex2("UFS QLU0", "ocs=", q, "r/i=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
+
+	/* E3b: SET_FLAG fDeviceInit, then poll READ_FLAG until it clears */
+	static const uint8_t q_setfi[16] = { 0x06, 0x01, 0, 0, 0, 0 };
+	static const uint8_t q_getfi[16] = { 0x05, 0x01, 0, 0, 0, 0 };
+	q = dm_upiu(0x16, 0, q_setfi);
+	con_hex2("UFS SETFI", "ocs=", q, "r/i=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
+	for (int i = 0; i < 10; i++) {
+		uint32_t g = dm_upiu(0x16, 0, q_getfi);
+		uint32_t v = *(volatile uint32_t *)(ucd.resp + 20); /* query value */
+		con_hex2("UFS GETFI", "ocs=", g, "val=", v);
+		if (g == 0 && v == 0)
+			break;
+	}
+
+	/* the money shot: TUR + READ(10) LBA0 after the handshake attempt */
+	rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+	con_hex2("UFS TUR2", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
+	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
+	con_hex2("UFS READ", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+	if (!rc) {
+		const uint8_t *gpt = data + BLOCK;
+		con_hex2("UFS GPT", "mbr=", data[510] | data[511] << 8, "sig=", *(volatile uint32_t *)gpt);
+	}
+	con_str("UFS MAT", "done - hold");
+	for (;;)
+		__asm__ volatile("wfe");
 }
 
 void test_ufs(void)

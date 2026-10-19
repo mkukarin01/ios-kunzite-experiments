@@ -599,10 +599,12 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: kunzite GIC/timer diagnostics, then the UFS probe. */
+	/* No payload: kunzite GIC/timer diagnostics, then the UFS experiment
+	 * matrix (holds the screen; no reset - see ufs.c). */
 	test_gic_kunzite();
 	con_skip();
-	stage = "ufs";
+	stage = "ufs matrix";
+	ufs_matrix();
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
