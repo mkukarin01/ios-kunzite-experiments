@@ -1,0 +1,36 @@
+kunzite (SM6475 parrot): AppleCLCD::start mapped sweet's SM7150/SM6115
+display addresses and faulted reading DSI0 ctrl at 0x05e94000+4 (boot #6,
+AppleCLCD::start+0x2f4, kernel data abort). Map the verified parrot DSI0 ctrl
+(0xae94000, live FDT) and NULL the VIG0/CTL0/INTF1 direct-scanout maps - all
+their uses are NULL-guarded, so direct scanout is off until the parrot SDE
+catalog is mined from the kunzite kernel source; the DSI write paths no-op
+(their <4GiB DSI DMA buffer cannot be allocated from the highmem-only window).
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -289,11 +289,11 @@
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	fVig0 = NULL;    /* kunzite: SM7150 VIG0 is an unmapped hole; scanout off */
++	fCtl0 = NULL;    /* kunzite: SM7150 CTL0 likewise */
++	fDsi = (volatile uint8_t *)ml_io_map(0x0ae94000, 0x1000);    /* kunzite: parrot DSI0 ctrl, live FDT */
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+@@ -323,9 +323,9 @@
+ 		}
+ 		OSSafeReleaseNULL(bl);
+ 	}
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+-	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	fIntf1 = NULL;   /* kunzite: SM6115-catalog INTF1 unmapped here */
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+ 		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
