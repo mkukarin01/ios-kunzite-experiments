@@ -430,10 +430,11 @@ static int lv_starts(const char *pfx, int n)
 }
 
 #ifdef LV_ONLY_SWEET
-/* input bring-up view: only the key driver and the HID services */
+/* input bring-up view: only the key/touch drivers and the HID services */
 static int lv_is_noise(void)
 {
-	return !(lv_starts("SWEET KEY", 9) || lv_starts("SWEET HID", 9));
+	return !(lv_starts("SWEET KEY", 9) || lv_starts("SWEET HID", 9) ||
+	         lv_starts("SWEET TOU", 9));
 }
 #else
 /* exec relaunch loops, SMP stack samples, AppleKeyStore traces, blank lines */

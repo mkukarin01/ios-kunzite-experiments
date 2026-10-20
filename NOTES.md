@@ -424,8 +424,9 @@ pulses on power presses (unidentified, maybe colour-shifted by the P3/sRGB issue
 Next: boot #19 = same + ADT `artwork-display-gamut sRGB` (upstream topaz 3eacb48), for the black
 wallpaper / red clock.
 
-**TOUCH (2026-10-20 evening): patch 0134 written, NOT compiled yet** (no local compile check:
-usage limit). New bsd/dev/kunzite_touch.c: Goodix GT9916K (Berlin-D) on SPI QUP1 SE3 0xa8c000,
+**TOUCH (2026-10-20 evening): patch 0134 compiled first try (artifact sha256 18eea468...); boot #20
+(shim-boot-20.img = #18 cmdline minus sweettouch=0) RAM-booted 22:29.** Input log viewer:
+shim/out/shim-boot-loginput.img (SWEET KEY/HID/TOU lines only). New bsd/dev/kunzite_touch.c: Goodix GT9916K (Berlin-D) on SPI QUP1 SE3 0xa8c000,
 FIFO mode, polled every 8 ms; started from sweet_ufs.c instead of topaz's sweet_touch.c (SM6225
 I2C). Facts: SPI pins GPIO10-13 func 1; TLMM pin regs at 0xf100000 + 0x1000*N; IRQ 65, reset 131,
 IOVDD GPIO38; AVDD = PM6150L L7E 3.3 V via RPMh "ldoe7" (apps RSC DRV2 0x17a20000, TCS +0xd00, v3
