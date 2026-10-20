@@ -471,6 +471,18 @@ between apps/spaces SMOOTHER (the second swipe leaves no artifacts), power still
 press, volume fine. One regression-ish note: Settings > General > About opened immediately on #21,
 took a while on #22. Decision: keep the merge; `kunzite` fast-forwarded to it.
 
+**USB ACCESS (2026-10-21, patch 0909, not built yet):** sweet's USB device mode ported to parrot:
+CDC-ECM Ethernet `ue0` 192.168.7.2/24, live console as UDP to 192.168.7.1:5140 (starts with the last
+64 KiB). Changes vs sweet: GCC GDSC 0x49004 and clocks 0x49018/20/24/84/88 (gcc-parrot.c), femto PHY
+not read (sweet read QUSB2 at 0x88e2000), device mode only if GHWPARAMS0 AWIDTH ((v >> 24) & 0xff)
+== 64 (kernel RAM is above 4 GiB), no sweethw=1 needed (default read-only report; `sweetusb=2`
+starts it). Same DWC3 base/QSCRATCH VBUS override (Xiaomi dwc3-msm-core.c); UFS proves device DMA
+to high memory passes the SMMU untranslated. Mac: `tools/kunzite-usbnet-mac.sh` (finds the
+interface by host MAC 02:00:5e:77:ee:01, sets its network service to manual 192.168.7.1 once with
+sudo, then runs `tools/udp-log.py` -> temp/ios-m8/usblog/). Plan after it works: SSH into iOS
+(ad-hoc signed dropbear + LaunchDaemon in the root image; sweet_amfi accepts any valid signature on
+the root FS as a platform binary with its own entitlements, no sandbox), then an os_log streamer.
+
 **NEXT (candidates):** RTC/date (PMK8350 RTC + boot-time offset); real screen-off (a safe DCS path
 on the parrot DSI0, then drop sweetfb_stayon); black wallpaper (upstream topaz: check whether its
 lock screen has one; PosterBoard/wallpaper renderer logs); About-pane slowness on #22 (sweetbusy=N

@@ -1,0 +1,134 @@
+kunzite (SM6475 parrot): sweet's USB device mode (CDC-ECM Ethernet ue0 at
+192.168.7.2, live console as UDP to 192.168.7.1:5140) with parrot's GCC
+USB30_PRIM GDSC/clock offsets (gcc-parrot.c, live FDT gdsc@149004). Same DWC3
+base and QSCRATCH VBUS override (Xiaomi dwc3-msm-core.c); the femto PHY is not
+read. Kernel RAM is above 4 GiB, so device mode starts only when GHWPARAMS0
+says 64-bit AXI addressing. Runs without sweethw=1: read-only state report by
+default, device mode with sweetusb=2.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -844,11 +844,13 @@
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	kunzite_touch_init();   /* kunzite: GT9916K on SPI; topaz's sweet_touch.c is SM6225 I2C */
+ 	sweet_keys_init();
+-	if (hw == 1) {
+-		sweet_usb_probe();
+-	} else {
+-		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
+-	}
++	/*
++	 * kunzite: sweet_usb.c carries parrot's GCC offsets (0909); it reads
++	 * state by default and starts the CDC-ECM device only with sweetusb=2
++	 * (sweetusb=0: not at all). sweethw is no longer needed for it.
++	 */
++	(void)hw;
++	sweet_usb_probe();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -4,7 +4,10 @@
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+  * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+  * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
++ * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). kunzite (SM6475
++ * parrot): same DWC3 base and Qualcomm wrapper (QSCRATCH, Xiaomi
++ * dwc3-msm-core.c), GDSC/clocks from gcc-parrot.c and the live FDT
++ * (gdsc@149004), Synopsys femto PHY at 0x088e3000 (not read). ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+@@ -41,26 +44,22 @@
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++#define GCC_USB30_PRIM_GDSCR    0x49004         /* kunzite gdsc@149004; bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "master", 0x49018 },          /* gcc-parrot.c halt_reg values */
++	{ "sleep", 0x49020 },
++	{ "utmi", 0x49024 },
++	{ "cfg-noc-axi", 0x49084 },
++	{ "aggre-axi", 0x49088 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -113,22 +112,19 @@
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+-	if (enabled >= 2) {
++	/*
++	 * kunzite: all kernel RAM is above 4 GiB (0x900000000 window), so the
++	 * event buffer, TRBs and frames are 36-bit addresses. GHWPARAMS0 AWIDTH
++	 * must say 64-bit AXI addressing, or the controller would
++	 * truncate them and DMA into low memory (hypervisor/firmware carve-outs).
++	 * (Linux dwc3 core.h: DWC3_GHWPARAMS0_AWIDTH(n) = (n >> 24) & 0xff.)
++	 */
++	unsigned awidth = (usb_rd(dwc, 0xc140) >> 24) & 0xffu;
++	if (enabled >= 2 && awidth != 64) {
++		printf("SWEET USB: DWC3 address width %u, not 64: device mode NOT started\n", awidth);
++	} else if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
+ /*
+@@ -348,7 +344,7 @@
+ };
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+-	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
++	NULL, "ios-kunzite", "Kunzite iOS (USB Ethernet)", "0001", "02005E77EE01",
+ };
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+ 
+@@ -828,6 +824,12 @@
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	/* the area must be physically contiguous: check its last page too */
++	ppnum_t last = pmap_find_phys(kernel_pmap, (addr64_t)(ud.dma + UD_SIZE - 1));
++	if (ptoa_64(last) != ud.dma_pa + ((UD_SIZE - 1) & ~(uint64_t)PAGE_MASK)) {
++		printf("SWEET USB: DMA area not contiguous (0x%llx / 0x%llx)\n", ud.dma_pa, ptoa_64(last));
++		return;
++	}
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
