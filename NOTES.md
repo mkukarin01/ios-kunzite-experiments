@@ -44,12 +44,15 @@ DSI0 + scanout maps off, 0132 UFS wake (SSU Active to W-LUN 0xD0: ABL leaves UFS
 **NEXT - M5 buttons (start here):** port the SPMI read path to PMIC arbiter **v7** (Linux 6.6
 spmi-pmic-arb.c, copy in temp/ios-m8/): bases from the live FDT - cnfg 0xc42d000, core 0xc400000
 (VERSION at +0, expect >= 0x70000000), chnls 0xc500000, obsrvr 0xc440000, intr 0xc4c0000, ee 0.
-APID map: core + 0x2000 + 4*apid, ppid = (val >> 8) & 0xFFF, valid = bit 31. Observer channel:
+APID map: core + 0x2000 + 4*apid, ppid = (val >> 8) & 0xFFF, entry 0 = unused; owner = cnfg + 4*apid
+(v7; v5 was cnfg + 0x700 + 4n), count = core+4 & 0x7ff (<= 1024). Observer channel:
 obsrvr + 0x8000*ee + 0x20*apid; CMD +0x00 = (1 << 27) | ((addr & 0xff) << 4) | (bytes-1),
 poll STATUS +0x08 bit0, RDATA0 +0x18. ppid = (sid << 8) | (addr >> 8). Keys: power = SID0 0x1310
 bit7, vol-down (resin) = SID0 0x1310 bit6 (PMK8350 pon_hlos@1300), vol-up = SID1 0x8810 bit0
-(PM6450 GPIO1, pull-up, active LOW). Replace the topaz addresses in bsd/dev/sweet_keys.c (and
-sweet_spmi.c) behind the same `sweetkeys` switch; then drop sweetkeys=0. Then: PMK8350 RTC for the
+(PM6450 GPIO1, pull-up, active LOW). **DONE as patch 0133 (sweet_keys.c; dry-run clean, not yet
+CI-built): push -> CI -> boot with `sweetkeys=0` REMOVED** (keep sweettouch=0); expect `SWEET KEYS:
+arb=0x7... pon-apid=.. vol+-apid=..` and `SWEET KEYS: key=N down=1` on presses (0 power, 1 vol+,
+2 vol-). sweet_spmi.c (battery path, SM7150 addresses) stays unused (static battery). Then: PMK8350 RTC for the
 date; touch = Goodix GT9916K (brl-d) on SPI QUP1 SE9 0xa8c000, IRQ GPIO65, reset 131, IOVDD 38,
 firmware goodix_3rd_firmware.bin + goodix_3rd_cfg_group.bin (from the LOS vendor partition).
 
