@@ -226,7 +226,7 @@ static uint32_t dm_upiu(uint8_t trans, uint8_t fn, uint8_t dd, const uint8_t q[1
 	zero(&ucd, sizeof(ucd));
 	ucd.cmd[0] = trans;
 	ucd.cmd[3] = ++dm_tag;
-	ucd.cmd[4] = fn;
+	ucd.cmd[5] = fn;
 	if (q != 0) {
 		for (int i = 0; i < 16; i++)
 			ucd.cmd[12 + i] = q[i];
@@ -253,7 +253,7 @@ static uint32_t dm_upiu(uint8_t trans, uint8_t fn, uint8_t dd, const uint8_t q[1
 /* The matrix. Order = cheapest disproof first. */
 void ufs_matrix(void)
 {
-	con_str("UFS MAT", "exp matrix v1 (holds)");
+	con_str("UFS MAT", "exp matrix v3 (holds)");
 	uint32_t cfg1 = ufs_rd(REG_UFS_CFG1);
 	con_hex2("UFS CFG", "1=", cfg1, "scsi=", cfg1 >> 31);
 	if (!(cfg1 & (1u << 31))) {
@@ -298,7 +298,7 @@ void ufs_matrix(void)
 	 * (DMA_NONE; the response carries the data segment itself).
 	 */
 	zero(&ucd, sizeof(ucd));
-	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[4] = 0x01;
+	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x01;
 	ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x00;			/* READ_DESC, device */
 	ucd.cmd[18] = 0; ucd.cmd[19] = 64;			/* length */
 	{
@@ -325,7 +325,7 @@ void ufs_matrix(void)
 
 	/* E3b: SET_FLAG fDeviceInit (write function 0x81), poll READ_FLAG. */
 	zero(&ucd, sizeof(ucd));
-	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[4] = 0x81;
+	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x81;
 	ucd.cmd[12] = 0x06; ucd.cmd[13] = 0x01;			/* SET_FLAG, fDeviceInit */
 	{
 		uintptr_t ucd_pa = (uintptr_t)&ucd;
