@@ -13,7 +13,7 @@ diff --git a/bsd/dev/kunzite_touch.c b/bsd/dev/kunzite_touch.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/kunzite_touch.c
-@@ -0,0 +1,1096 @@
+@@ -0,0 +1,1107 @@
 +/*
 + * kunzite (POCO M8 5G, SM6475 parrot) touch: Goodix GT9916K ("Berlin-D") on
 + * SPI, QUP1 SE3 ("se9", 0xa8c000), FIFO mode, polled. Call once after the
@@ -132,7 +132,9 @@ new file mode 100644
 +#define SE_IRQ_EN        0xe1cu
 +#define SE_HW_PARAM0     0xe24u
 +#define SE_DMA_GEN_CFG   0xe30u
-+#define SPI_TX_RX        7u
++/* spi-msm-geni.c: 3 = full duplex; 7 (SPI_TX_RX) is TX *then* RX, which on
++ * boot #20 made reads land 16 bytes late and writes run on with zeros */
++#define SPI_FULL_DUPLEX  3u
 +#define M_DONE           (1u << 0)
 +#define M_CANCEL         (1u << 4)
 +#define M_ABORT          (1u << 5)
@@ -164,7 +166,7 @@ new file mode 100644
 +static struct {
 +	vm_offset_t gcc, tlmm, se, qup, rsc, db;
 +	bool started, dead;
-+	unsigned depth, div, logleft;
++	unsigned depth, div, logleft, stale_ms;
 +	int clk_idx;
 +	uint32_t touch_addr;
 +	uint32_t active;
@@ -496,7 +498,7 @@ new file mode 100644
 +}
 +
 +/* Read-only view of LDO7 on PM6150L: STATUS1 bit 7 = VREG_READY, EN_CTL bit 7. */
-+static bool
++static int
 +kt_l7e_dump(const char *when)
 +{
 +	uint8_t st1 = 0, en = 0, lb = 0, ub = 0, mode = 0;
@@ -507,13 +509,16 @@ new file mode 100644
 +	int e5 = sweet_spmi_peek(KT_L7E_SID, KT_L7E_BASE + 0x45u, &mode);
 +	printf("SWEET TOUCH: L7E %s: status1=%#x en=%#x vset=%u mV mode=%#x (spmi %d/%d/%d/%d/%d)\n",
 +	    when, st1, en, ((unsigned)ub << 8) | lb, mode, e1, e2, e3, e4, e5);
-+	return !e1 && !e2 && (st1 & 0x80u) && (en & 0x80u);
++	if (e1 || e2) {
++		return -1;      /* unreadable: boot #20 found no APID for SID 4 0x46 */
++	}
++	return (st1 & 0x80u) && (en & 0x80u);
 +}
 +
 +static int
 +kt_avdd(void)
 +{
-+	bool on = kt_l7e_dump("before");
++	int on = kt_l7e_dump("before");
 +	int power = 1;
 +	(void)PE_parse_boot_argn("sweettouchpower", &power, sizeof(power));
 +	if (!power) {
@@ -533,7 +538,8 @@ new file mode 100644
 +	}
 +	kt_wait(15);    /* vendor: 15 ms for AVDD to settle */
 +	on = kt_l7e_dump("after");
-+	printf("SWEET TOUCH: L7E ACTIVE vote error=%d rail-on=%d\n", error, on);
++	printf("SWEET TOUCH: L7E ACTIVE vote error=%d rail-on=%s\n", error,
++	    on < 0 ? "unreadable" : on ? "yes" : "no");
 +	return error;
 +}
 +
@@ -680,7 +686,7 @@ new file mode 100644
 +	kt_wr(kt.se, SE_M_IRQ_CLR, 0xffffffffu);
 +	kt_wr(kt.se, SE_SPI_TX_LEN, len);
 +	kt_wr(kt.se, SE_SPI_RX_LEN, len);
-+	kt_wr(kt.se, SE_M_CMD0, SPI_TX_RX << 27);   /* no FRAGMENTATION: CS rises at the end */
++	kt_wr(kt.se, SE_M_CMD0, SPI_FULL_DUPLEX << 27);   /* no FRAGMENTATION: CS rises at the end */
 +	unsigned ti = 0, ri = 0;
 +	uint32_t irq = 0;
 +	for (unsigned spin = 0; spin < 20000; ++spin) {
@@ -1049,7 +1055,10 @@ new file mode 100644
 +	printf("SWEET TOUCH: polling every 8 ms, 1080x2392, HID y offset %d\n", KT_HID_YOFF);
 +	unsigned errors = 0, polls = 0, stale_logs = 0;
 +	uint64_t stale;
-+	nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &stale);
++	/* Lift comes from the IC's zero-touch report; sweettouchstale=ms adds a
++	 * timeout for ICs that go quiet instead (off by default: it would break
++	 * long presses if the IC stops reporting a still finger). */
++	nanoseconds_to_absolutetime((uint64_t)kt.stale_ms * NSEC_PER_MSEC, &stale);
 +	while (!kt.dead) {
 +		int e = gb_poll();
 +		if (e) {
@@ -1064,9 +1073,9 @@ new file mode 100644
 +			errors = 0;
 +		}
 +		/* Berlin reports at the scan rate while touched; silence means lift. */
-+		if (kt.active && mach_absolute_time() - kt.last_event > stale) {
++		if (kt.stale_ms && kt.active && mach_absolute_time() - kt.last_event > stale) {
 +			if (stale_logs++ < 8) {
-+				printf("SWEET TOUCH: no report for 250 ms with fingers down; releasing\n");
++				printf("SWEET TOUCH: no report for %u ms with fingers down; releasing\n", kt.stale_ms);
 +			}
 +			kt_report(0, kt.x, kt.y);
 +		}
@@ -1086,7 +1095,7 @@ new file mode 100644
 +void
 +kunzite_touch_init(void)
 +{
-+	int enabled = 1, div = 4, logn = 24;
++	int enabled = 1, div = 4, logn = 24, stale_ms = 0;
 +	thread_t thread;
 +	if (kt.started) {
 +		return;
@@ -1095,6 +1104,7 @@ new file mode 100644
 +	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
 +	(void)PE_parse_boot_argn("sweettouchdiv", &div, sizeof(div));
 +	(void)PE_parse_boot_argn("sweettouchlog", &logn, sizeof(logn));
++	(void)PE_parse_boot_argn("sweettouchstale", &stale_ms, sizeof(stale_ms));
 +	if (!enabled) {
 +		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
 +		return;
@@ -1102,6 +1112,7 @@ new file mode 100644
 +	/* 19.2 MHz / div; the FDT allows up to 12 MHz (div >= 2) */
 +	kt.div = div >= 2 && div <= 64 ? (unsigned)div : 4u;
 +	kt.logleft = logn > 0 ? (unsigned)logn : 0u;
++	kt.stale_ms = stale_ms > 0 && stale_ms <= 5000 ? (unsigned)stale_ms : 0u;
 +	kern_return_t kr = kernel_thread_start(kt_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);

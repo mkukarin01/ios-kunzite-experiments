@@ -438,6 +438,18 @@ sweettouchpower (1; 0 = no RPMh vote), sweettouchdiv (4 -> 4.8 MHz), sweettouchl
 Next: push -> CI (fix compile errors if any) -> boot #20 = #18 cmdline WITHOUT sweettouch=0;
 read "SWEET TOUCH" lines with the log viewer (extend LV_ONLY_SWEET to "SWEET TOU").
 
+**BOOT #20 result (log viewer, user transcription): touch chain works up to the IC, SPI opcode
+wrong.** Clocks on (vote 0x4000a3c0 -> 0x423ca3c0, S3 DFS level 0 = XO/1), SE3 fw=0x102 proto=1
+FIFO depth 16 x 32 (QUP 0x300a0000), 4.8 MHz. RSC DRV2 id 0x20700 = v2.7 layout, TCS=8 ncpt=16,
+ldoe7 = VRM 0x42b00; ACTIVE TCS0 vote 3300 mV done (cmd-status 0x10101 x3). L7E status unreadable:
+SID 4 0x46 has no entry in the apps APID table (PM6150L is on bus 0; SPMI peek -> ENOENT). Pins as
+found: touch fully off (iovdd/reset low, SPI pins gpio). Device confirm read 00 00 00 00 00 45 52 4c
+three times. Cause: M_CMD opcode 7 (SPI_TX_RX) = TX then RX, so reads returned mem[addr+16..] and
+the 8 x AA write ran on with 13 zero bytes (0x10008-0x10014, clobbering the 'B' of the ROM PID
+"BERLIN" at 0x10014: hence 00 'E' 'R' 'L'). Fix in 0134 (regenerated): opcode 3 = SPI_FULL_DUPLEX
+(spi-msm-geni.c). Also: L7E log says "unreadable", the 250 ms stale-finger release is now opt-in
+(sweettouchstale=ms) so long presses survive an IC that stops reporting a still finger.
+
 **BOOT #19 (2026-10-20 ~19:15, shim-boot-19.img, user-typed fastboot): sRGB gamut - no visible
 change.** Same kernel as #18 (283b12cb; the later CI artifact 0da72d25 has no kernel source change),
 ADT P3 -> sRGB. Wallpaper still black. Observed (also likely on #18): the clock/date are RED after
