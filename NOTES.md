@@ -255,8 +255,12 @@ the runbook gave a path relative to the rtk-tablet root while the terminal was i
 ios-topaz-experiments, and the overnight `tools/img2simg.py` was broken (chunk total_sz without
 the 12-byte header, trailing raw run dropped, no seek past don't-care runs). Fixed and
 round-trip-tested (5 shapes byte-identical); the bad 12 GB file is renamed
-`*.simg.BROKEN-headers`. The flash uses the RAW image (fastboot -S re-sparses it with libsparse):
-`fastboot -S 512M flash userdata /Users/oxa1/Work/rtk-tablet/temp/ios-m8/ios16-root-20H392.img`
+`*.simg.BROKEN-headers`. Attempt 2 (raw image) failed the same way: fastboot 37's copy_avb_footer reads a whole NON-sparse
+image into memory to move its AVB footer and dies 'Failed reading from userdata' on 16 GiB; sparse
+images skip that step. Also fixed: zero runs were DONT_CARE (device keeps the partition's old bytes,
+corrupting zero ranges inside files) -> now FILL 0. Regenerated simg VERIFIED against the raw image
+(205 chunks: 191 raw + 14 fill, every check libsparse applies, byte-identical). Flash:
+`fastboot -S 512M flash userdata /Users/oxa1/Work/rtk-tablet/temp/ios-m8/ios16-root-20H392.simg`
 (volume checked: HFSX 'HX' v5, journaled, cleanly unmounted, 16 GiB). Then boot #14:
 `fastboot boot shim/out/shim-boot-14.img` (sweetkeys=0 sweettouch=0).
 
