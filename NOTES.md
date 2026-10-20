@@ -5,8 +5,8 @@
 **State:** POCO M8 5G (`kunzite`, SM6475 parrot, Gunyah hypervisor) boots this repo's xnu to the
 **iOS 16.7.16 lock screen in < 2 min on all 8 cores**, root = iPhone X HFS+ image flashed into
 `userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). **Buttons work (0133,
-boot #18): power, vol+, vol-**; touch still off. No GPU (CPU render), black wallpaper + red clock
-(boot #19 tries the sRGB gamut fix). Branch `kunzite`, forked
+boot #18): power, vol+, vol-**; touch still off. No GPU (CPU render), black wallpaper; the clock is
+red until the first power press, then white (sRGB gamut, boot #19, changed neither). Branch `kunzite`, forked
 from MakrSas/ios-topaz @ 590f001; our patches 0127-0132 (see below). Chronological log below.
 
 **Standard boot** (phone in the BOOTLOADER fastboot = Power+VolDown; recovery's "Enter fastboot" is
@@ -423,6 +423,19 @@ never switched off, so "locked" looks like an always-on display. A blue icon nea
 pulses on power presses (unidentified, maybe colour-shifted by the P3/sRGB issue).
 Next: boot #19 = same + ADT `artwork-display-gamut sRGB` (upstream topaz 3eacb48), for the black
 wallpaper / red clock.
+
+**BOOT #19 (2026-10-20 ~19:15, shim-boot-19.img, user-typed fastboot): sRGB gamut - no visible
+change.** Same kernel as #18 (283b12cb; the later CI artifact 0da72d25 has no kernel source change),
+ADT P3 -> sRGB. Wallpaper still black. Observed (also likely on #18): the clock/date are RED after
+boot until the first power press; after a sleep/wake they are WHITE (photo: rtk-tablet
+ios/photos/photo_2.jpeg). The date reads "Wednesday, December 31 4:13" = 1970-01-01 00:13 UTC in
+iOS's default Cupertino time zone, i.e. epoch + 13 min uptime (confirms: no RTC). The pulsing blue
+icon under the battery is the Control Center glyph (SF Symbol switch.2) - most likely SpringBoard's
+"teachable moment" hint (swipe down from the top-right for Control Center), shown on wake; not a
+fault. Volume presses gave no HUD this time - guess: iOS had gone to sleep (lock-screen idle
+timeout) and does not render while asleep, but stayon keeps the stale frame visible; to check:
+press power, then volume within a few seconds. sRGB stays in mkadt (harmless; upstream needs it for
+Safari).
 
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
