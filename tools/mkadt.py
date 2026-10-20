@@ -75,7 +75,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False):
+def build(seed=None, qemu=False, highmem=False, native=False, wlan=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -177,6 +177,15 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         # otherwise crashes trying to set the PMU boot stage (customer builds
         # ignore the -wdt_no_pmu boot-arg).
         node('wdt', [ph(), ('no-pmu', u32(1))]),
+        # launchd starts wifid only when the device tree has a "wlan" node
+        # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi).
+        # kunzite: opt-in (--wlan) until this phone has a WLAN driver;
+        # upstream topaz adds it unconditionally for its WCN3988.
+        ] + ([node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('topaz,wcn3988')),
+        ])] if wlan else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
@@ -250,7 +259,7 @@ def build(seed=None, qemu=False, highmem=False, native=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv)
+                 native='--native' in sys.argv, wlan='--wlan' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -7,7 +7,8 @@
 `userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). **Buttons work (0133,
 boot #18): power, vol+, vol-**; touch still off. No GPU (CPU render), black wallpaper; the clock is
 red until the first power press, then white (sRGB gamut, boot #19, changed neither). Branch `kunzite`, forked
-from MakrSas/ios-topaz @ 590f001; our patches 0127-0132 (see below). Chronological log below.
+from MakrSas/ios-topaz @ 590f001, merged with upstream d8c82d9 (0139) on branch
+kunzite-topaz-0139; our patches are 0901-0908 (see below). Chronological log below.
 
 **Standard boot** (phone in the BOOTLOADER fastboot = Power+VolDown; recovery's "Enter fastboot" is
 fastbootd, which rejects `boot` -> `fastboot reboot bootloader`):
@@ -39,9 +40,15 @@ owners.json` (REAL owners: dmgs attached with -owners on; docker chown is a no-o
 WITHOUT -S (ABL max-download 353 MiB; fastboot 37 needs sparse for big images). Current image:
 temp/ios-m8/ios16-root-20H392.{img,simg}, owners: temp/ios-m8/rootbuild.6iw7ol/owners-real.json.
 
-**Our patches:** 0127 ARMv8.2 back (inverse of 0081), 0128 sweet topology/boot CPU (inverse of
-0080/0082), 0129 skip CNTP mask (Gunyah), 0130 parrot EPSS read-only + static battery, 0131 parrot
-DSI0 + scanout maps off, 0132 UFS wake (SSU Active to W-LUN 0xD0: ABL leaves UFS in PowerDown).
+**Our patches (0901-0908 since the 0139 merge; were 0127-0134 - older notes below use those
+numbers):** 0901 ARMv8.2 back (inverse of 0081), 0902 sweet topology/boot CPU (inverse of
+0080/0082), 0903 skip CNTP mask (Gunyah), 0904 parrot EPSS read-only + static battery, 0905 parrot
+DSI0 + scanout maps off (regenerated over upstream 0138), 0906 UFS wake (SSU Active to W-LUN 0xD0:
+ABL leaves UFS in PowerDown), 0907 keys on SPMI v7, 0908 GT9916K touch on SPI. Upstream topaz keeps
+01xx; ours stay 09xx so CI's glob order applies them last. CI (blacktop build.sh) SKIPS any patch
+that does not apply and still builds: after every merge run `tools/check-patch-series.sh
+temp/ios-m8/series-check/xnu-pristine temp/ios-m8/series-check/dxb <scratch-tree>` (only the four
+blacktop patches for other macOS versions may be skipped).
 
 **M5 buttons - DONE (boot #18), reference:** port the SPMI read path to PMIC arbiter **v7** (Linux 6.6
 spmi-pmic-arb.c, copy in temp/ios-m8/): bases from the live FDT - cnfg 0xc42d000, core 0xc400000
@@ -59,12 +66,14 @@ shim/out/shim-boot-logkeys.img. sweet_spmi.c (battery path, SM7150 addresses) st
 battery). **NEXT:** PMK8350 RTC for the date; touch = Goodix GT9916K (brl-d) on SPI QUP1 SE9 0xa8c000, IRQ GPIO65, reset 131, IOVDD 38,
 firmware goodix_3rd_firmware.bin + goodix_3rd_cfg_group.bin (from the LOS vendor partition).
 
-**Upstream topaz since 590f001 (on the plate, not merged):** mkadt `artwork-display-gamut sRGB`
-(iOS draws P3 layers into 10-bit surfaces we lack - prime suspect for the RED clock; ADT-only:
-APPLIED to our tools/mkadt.py, boot #19 = first test); 0128 iokit-quiesce (generic, take); 0127 sweetbusy diagnostic (touches
-SweetFramebuffer.cpp: may need 0131 regenerated); 0129/0130 WLAN station on WCN3988 (reference
-only); mkadt `/arm-io/wlan` node (SKIP until Wi-Fi: wifid would crash-loop). Upstream numbers
-0127-0130 collide with ours: move kunzite patches to their own range (e.g. 0900+) before merging.
+**Upstream topaz merge (2026-10-20 night, branch kunzite-topaz-0139, NOT yet booted):** all of
+upstream through 0139 (d8c82d9): 0127 sweetbusy diagnostic, 0128 iokit-quiesce, 0129/0130 WLAN
+(inert: TopazModem runs only with boot-arg modem=1), 0131-0137/0139 SweetSurface (IOSurface
+emulation: client memory/wrapped surfaces, values/attachments CoreAnimation's GL renderer reads -
+upstream: "icons were blank under the GL renderer"), 0138 empty IOAcceleratorES (no 30 s wait at
+every backboardd start). mkadt: sRGB was already ours; upstream's `/arm-io/wlan` node is opt-in
+here (`--wlan`), default ADT unchanged. Test plan: boot it after the touch test on plain kunzite;
+expect a faster lock screen, maybe the wallpaper; then fast-forward kunzite to it.
 
 **Gotchas:** the fork's origin is mkukarin01/ios-topaz-experiments (user pushes + runs CI; artifacts
 need GitHub auth -> user downloads to xnu/out/xnu-kernel/). Boots that must not write userdata need

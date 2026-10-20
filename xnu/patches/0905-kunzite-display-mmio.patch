@@ -8,8 +8,7 @@ catalog is mined from the kunzite kernel source; the DSI write paths no-op
 
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -289,11 +289,11 @@
- 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+@@ -305,9 +305,9 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -22,15 +21,12 @@ catalog is mined from the kunzite kernel source; the DSI write paths no-op
  	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
  	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
  	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
- 	fBlLock = IOLockAlloc();
-@@ -323,9 +323,9 @@
- 		}
- 		OSSafeReleaseNULL(bl);
+@@ -350,7 +350,7 @@
  	}
+ 	OSSafeReleaseNULL(accel);
  	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
 -	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
 +	fIntf1 = NULL;   /* kunzite: SM6115-catalog INTF1 unmapped here */
  	if (fIntf1 != NULL) {
  		volatile uint32_t *r = fIntf1 + 0x800 / 4;
  		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
- 		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
