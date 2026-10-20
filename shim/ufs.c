@@ -128,17 +128,8 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	__asm__ volatile("dsb sy" ::: "memory");
 	*ocs_out = utrl[0].dw2 & 0xff;
 	*status_out = ucd.resp[7];		/* SCSI status in the response UPIU */
-	/*
-	 * kunzite boot #2: every command completes (OCS 0, RESPONSE UPIU ok) with
-	 * SCSI status 2 = CHECK CONDITION. Dump the UPIU response code (byte 6)
-	 * and the sense data (starts at byte 18: key at +2, ASC/ASCQ at +12/+13)
-	 * so the screen says WHY the device refuses.
-	 */
-	if (*status_out) {
-		con_hex2("UFS SEN", "rc=", ucd.resp[6], "st=", *status_out);
-		con_hex2("UFS SEN", "key=", ucd.resp[20], "asc=",
-		    (uint32_t)ucd.resp[30] << 8 | ucd.resp[31]);
-	}
+	/* Callers print: the sense is at resp[32..] (length BE16, then fixed
+	 * format data: key at 36, ASC/ASCQ at 46/47), see last_sense(). */
 	if (*ocs_out)
 		return 2;
 	if (ucd.resp[0] != 0x21)		/* RESPONSE UPIU */
@@ -250,17 +241,67 @@ static uint32_t dm_upiu(uint8_t trans, uint8_t fn, uint8_t dd, const uint8_t q[1
 	return utrl[0].dw2 & 0xff;
 }
 
-/* The matrix. Order = cheapest disproof first. */
+/* Sense of the last SCSI response: key<<16 | ASC<<8 | ASCQ (0 = none). */
+static uint32_t last_sense(void)
+{
+	if (((uint32_t)ucd.resp[32] << 8 | ucd.resp[33]) == 0)
+		return 0;
+	return (uint32_t)(ucd.resp[36] & 0xf) << 16 | (uint32_t)ucd.resp[46] << 8 | ucd.resp[47];
+}
+
+/* One SCSI command = one screen line: rc<<16 | UPIU response<<8 | status, sense. */
+static uint32_t scsi_line(const char *label, uint8_t lun, const uint8_t *cdb, unsigned cdb_len,
+    void *buf, uint32_t len)
+{
+	uint32_t ocs = 0, st = 0;
+	uint32_t rc = scsi(lun, cdb, cdb_len, buf, len, &ocs, &st);
+	con_hex2(label, "rc/rs=", rc << 16 | (uint32_t)ucd.resp[6] << 8 | ucd.resp[7],
+	    "k/a=", last_sense());
+	return rc;
+}
+
+/* One query request (function 0x01 read / 0x81 write). Returns 0 on success,
+ * else the query response code, or 0x100|OCS. *value = the BE32 value field
+ * (attributes, flags); descriptor data starts at resp+32. */
+static uint32_t query(uint8_t fn, uint8_t opcode, uint8_t idn, uint8_t index, uint16_t len,
+    uint32_t *value)
+{
+	uint8_t q[16] = { opcode, idn, index, 0, 0, 0, (uint8_t)(len >> 8), (uint8_t)len };
+	uint32_t ocs = dm_upiu(0x16, fn, 0, q);
+	if (value != 0)
+		*value = be32(ucd.resp + 20);
+	return ocs ? 0x100 | ocs : ucd.resp[6];
+}
+
+/* bCurrentPowerMode (attr 0x02: 0x11 Active, 0x22 Sleep, 0x33 PowerDown,
+ * 0x00 Idle) and bBootLunEn (attr 0x00: 1 = boot LU A, 2 = B). */
+static void attr_line(const char *label)
+{
+	uint32_t pwr = 0, boot = 0;
+	uint32_t qp = query(0x01, 0x03, 0x02, 0, 0, &pwr);
+	uint32_t qb = query(0x01, 0x03, 0x00, 0, 0, &boot);
+	con_hex2(label, "pwr=", qp << 16 | (pwr & 0xffff), "boot=", qb << 16 | (boot & 0xffff));
+}
+
+/*
+ * v6 (2026-10-20): every LU answers 02/04/02 "initializing command
+ * required", even INQUIRY and REPORT LUNS, while NOP and queries work and
+ * the device descriptor is sane (UFS 2.2, Samsung, 6 LUs). Hypothesis: ABL
+ * leaves the device in UFS-Sleep/PowerDown at handoff; Linux never sees it
+ * because ufs-qcom resets the device at probe. UFS sets the device power
+ * mode with START STOP UNIT to the UFS Device W-LUN (0xD0), POWER
+ * CONDITION in cdb[4] bits 7:4 (Linux ufshcd_set_dev_pwr_mode: Active =
+ * 0x10). v4 sent SSU to LUN 0 with the START bit instead. Also: the config
+ * descriptor is IDN 0x01 (v5 asked for 0x10 -> INVALID_IDN).
+ */
 void ufs_matrix(void)
 {
-	con_str("UFS MAT", "exp matrix v5 (holds)");
+	con_str("UFS MAT", "exp matrix v6 (holds)");
+	/* CFG1 BIT31 (SCSI check disable) stays set as in v1-v5: one variable at a time */
 	uint32_t cfg1 = ufs_rd(REG_UFS_CFG1);
-	con_hex2("UFS CFG", "1=", cfg1, "scsi=", cfg1 >> 31);
-	if (!(cfg1 & (1u << 31))) {
+	if (!(cfg1 & (1u << 31)))
 		ufs_wr(REG_UFS_CFG1, cfg1 | (1u << 31));
-		uint32_t rb = ufs_rd(REG_UFS_CFG1);
-		con_hex2("UFS CFG", "w=", rb, "bit31=", rb >> 31);
-	}
+	con_hex2("UFS CFG1", "was=", cfg1, "now=", ufs_rd(REG_UFS_CFG1));
 
 	/* take over the transfer list (validated path) */
 	ufs_wr(REG_UTRLRSR, 0);
@@ -273,183 +314,74 @@ void ufs_matrix(void)
 		return;
 	}
 
-	/* E1: TUR with the CORRECT sense offsets (the old print read 18-31) */
-	static const uint8_t tur[6] = { 0 };
+	static const uint8_t tur[6] = { 0x00 };
+	scsi_line("UFS TUR0", 0, tur, sizeof(tur), 0, 0);	/* baseline: expect 02/04/02 */
+	attr_line("UFS ATR0");
+
+	/* REQUEST SENSE on the device W-LUN (PRDT byte counts are dword-sized: 20) */
+	static const uint8_t rqs[6] = { 0x03, 0, 0, 0, 20, 0 };
 	uint32_t ocs = 0, st = 0;
-	uint32_t rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-	con_hex2("UFS TUR", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
-	con_hex2("UFS SEN", "dsl=", (uint32_t)ucd.resp[32] << 8 | ucd.resp[33],
-	    "key=", ucd.resp[36]);
-	con_hex2("UFS SEN", "asc=", (uint32_t)ucd.resp[46] << 8 | ucd.resp[47],
-	    "code=", ucd.resp[34]);
+	uint32_t rc = scsi(0xD0, rqs, sizeof(rqs), data, 20, &ocs, &st);
+	con_hex2("UFS RQSW", "rc/rs=", rc << 16 | (uint32_t)ucd.resp[6] << 8 | ucd.resp[7],
+	    "k/a=", rc ? last_sense() :
+	    (uint32_t)(data[2] & 0xf) << 16 | (uint32_t)data[12] << 8 | data[13]);
 
-	/* E2: NOP OUT x3 */
+	/* THE experiment: SSU to the device W-LUN, power condition Active */
+	static const uint8_t ssu_active[6] = { 0x1B, 0, 0, 0, 0x10, 0 };
 	for (int i = 0; i < 3; i++) {
-		uint32_t n = dm_upiu(0x00, 0, 0, 0);
-		con_hex2("UFS NOP", "ocs=", n, "r/t=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
-		if (n == 0 && ucd.resp[0] == 0x20 && ucd.resp[6] == 0)
+		char label[] = "UFS SSU1";
+		label[7] = '1' + i;
+		if (scsi_line(label, 0xD0, ssu_active, sizeof(ssu_active), 0, 0) == 0)
+			break;
+	}
+	attr_line("UFS ATR1");
+
+	for (int i = 0; i < 3; i++) {
+		char label[] = "UFS TUR1";
+		label[7] = '1' + i;
+		if (scsi_line(label, 0, tur, sizeof(tur), 0, 0) == 0)
 			break;
 	}
 
-	/*
-	 * E3a: query read descriptors. v2 fixes: the Query Function byte at UPIU
-	 * offset 4 (0x01 standard read / 0x81 standard write) - missing in v1,
-	 * the device answered QUERY_RESULT_INVALID_OPCODE (0xFE) - and DD=0
-	 * (DMA_NONE; the response carries the data segment itself).
-	 */
-	zero(&ucd, sizeof(ucd));
-	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x01;
-	ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x00;			/* READ_DESC, device */
-	ucd.cmd[18] = 0; ucd.cmd[19] = 64;			/* length */
-	{
-		uintptr_t ucd_pa = (uintptr_t)&ucd;
-		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
-		utrl[0].dw2 = 0x0f;
-		utrl[0].ucdba = (uint32_t)ucd_pa;
-		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
-		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
-		__asm__ volatile("dsb sy" ::: "memory");
-		ufs_wr(REG_UTRLDBR, 1);
-		uint64_t t0 = ticks();
-		while (ufs_rd(REG_UTRLDBR) & 1) {
-			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
-		}
-		__asm__ volatile("dsb sy" ::: "memory");
-		con_hex2("UFS QDEV", "ocs=", utrl[0].dw2 & 0xff,
-		    "f/6=", (uint32_t)ucd.resp[4] << 8 | ucd.resp[6]);
-		con_hex2("UFS QR12", "r12=", ucd.resp[12], "13=", ucd.resp[13]);
-		for (int i = 0; i < 3; i++)
-			con_hex2("UFS QDMP", "a=", *(volatile uint32_t *)(ucd.resp + 16 + i * 8),
-			    "b=", *(volatile uint32_t *)(ucd.resp + 20 + i * 8));
-	}
-
-	/* E3b: SET_FLAG fDeviceInit (write function 0x81), poll READ_FLAG. */
-	zero(&ucd, sizeof(ucd));
-	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x81;
-	ucd.cmd[12] = 0x06; ucd.cmd[13] = 0x01;			/* SET_FLAG, fDeviceInit */
-	{
-		uintptr_t ucd_pa = (uintptr_t)&ucd;
-		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
-		utrl[0].dw2 = 0x0f;
-		utrl[0].ucdba = (uint32_t)ucd_pa;
-		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
-		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
-		__asm__ volatile("dsb sy" ::: "memory");
-		ufs_wr(REG_UTRLDBR, 1);
-		uint64_t t0 = ticks();
-		while (ufs_rd(REG_UTRLDBR) & 1) {
-			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
-		}
-		__asm__ volatile("dsb sy" ::: "memory");
-		con_hex2("UFS SETFI", "ocs=", utrl[0].dw2 & 0xff,
-		    "f/6=", (uint32_t)ucd.resp[4] << 8 | ucd.resp[6]);
-	}
-	for (int i = 0; i < 10; i++) {
-		uint32_t g = dm_upiu(0x16, 0x01, 0, (const uint8_t[16]){ [0] = 0x05, [1] = 0x01 });
-		uint32_t v = *(volatile uint32_t *)(ucd.resp + 20);
-		con_hex2("UFS GETFI", "ocs=", g, "val=", v);
-		if (g == 0 && v == 0)
-			break;
-	}
-
-	/* ---- v5: enumeration forensics ---- */
-	/* full device-descriptor window (parse bNumberLU/bSpecVersion offline) */
-	zero(&ucd, sizeof(ucd));
-	{
-		uintptr_t ucd_pa = (uintptr_t)&ucd;
-		ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x01;
-		ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x00;
-		ucd.cmd[18] = 0; ucd.cmd[19] = 96;
-		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
-		utrl[0].dw2 = 0x0f;
-		utrl[0].ucdba = (uint32_t)ucd_pa;
-		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
-		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
-		__asm__ volatile("dsb sy" ::: "memory");
-		ufs_wr(REG_UTRLDBR, 1);
-		uint64_t t0 = ticks();
-		while (ufs_rd(REG_UTRLDBR) & 1) {
-			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
-		}
-		__asm__ volatile("dsb sy" ::: "memory");
-		con_hex2("UFS DSC1", "ocs=", utrl[0].dw2 & 0xff,
-		    "r6=", ucd.resp[6]);
-		for (int i = 0; i < 4; i++)
-			con_hex2("UFS DDMP", "a=", *(volatile uint32_t *)(ucd.resp + 32 + i * 8),
-			    "b=", *(volatile uint32_t *)(ucd.resp + 36 + i * 8));
-	}
-	/* configuration descriptor: bLUEnable per LUN at data[32 + i*8] */
-	zero(&ucd, sizeof(ucd));
-	{
-		uintptr_t ucd_pa = (uintptr_t)&ucd;
-		ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x01;
-		ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x10;		/* READ_DESC, config */
-		ucd.cmd[14] = 0; ucd.cmd[19] = 128;
-		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
-		utrl[0].dw2 = 0x0f;
-		utrl[0].ucdba = (uint32_t)ucd_pa;
-		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
-		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
-		__asm__ volatile("dsb sy" ::: "memory");
-		ufs_wr(REG_UTRLDBR, 1);
-		uint64_t t0 = ticks();
-		while (ufs_rd(REG_UTRLDBR) & 1) {
-			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
-		}
-		__asm__ volatile("dsb sy" ::: "memory");
-		con_hex2("UFS CFGD", "ocs=", utrl[0].dw2 & 0xff,
-		    "r6=", ucd.resp[6]);
-		for (int i = 0; i < 4; i++)
-			con_hex2("UFS CDMP", "a=", *(volatile uint32_t *)(ucd.resp + 32 + i * 8),
-			    "b=", *(volatile uint32_t *)(ucd.resp + 36 + i * 8));
-	}
-	/* INQUIRY LUN0 (36B): vendor/product if the LU answers at all */
 	static const uint8_t inq[6] = { 0x12, 0, 0, 0, 36, 0 };
-	rc = scsi(0, inq, sizeof(inq), data, 36, &ocs, &st);
-	con_hex2("UFS INQ", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
-	if (!rc) {
-		con_hex2("UFS INQD", "a=", *(volatile uint32_t *)(data + 8),
-		    "b=", *(volatile uint32_t *)(data + 12));
-		con_hex2("UFS INQD", "a=", *(volatile uint32_t *)(data + 16),
-		    "b=", *(volatile uint32_t *)(data + 20));
-	}
-	/* REPORT LUNS on the well-known LUN 0x81 */
-	static const uint8_t rl[12] = { 0xA0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0 };
-	rc = scsi(0x81, rl, sizeof(rl), data, 32, &ocs, &st);
-	con_hex2("UFS RLUN", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
-	if (!rc) {
-		con_hex2("UFS RLD1", "a=", *(volatile uint32_t *)(data),
-		    "b=", *(volatile uint32_t *)(data + 4));
-		con_hex2("UFS RLD2", "a=", *(volatile uint32_t *)(data + 8),
-		    "b=", *(volatile uint32_t *)(data + 12));
-	}
-	/* TUR sweep with correct sense per LUN */
-	for (uint8_t lun = 0; lun < 6; lun++) {
-		rc = scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st);
-		{
-			char label[] = "UFS LN0";
-			label[6] = '0' + lun;
-			con_hex2(label, "rc=", rc, "k/a=",
-			    (uint32_t)ucd.resp[36] << 16 | (uint32_t)ucd.resp[46] << 8 | ucd.resp[47]);
+	if (scsi_line("UFS INQ", 0, inq, sizeof(inq), data, 36) == 0) {
+		char id[25];
+		for (int i = 0; i < 24; i++) {
+			uint8_t ch = data[8 + i];
+			id[i] = (ch >= 32 && ch < 127) ? (char)ch : '.';
 		}
+		id[24] = 0;
+		con_str("UFS INQS", id);
 	}
-	/* SSU with the corrected sense print */
-	static const uint8_t ssu[6] = { 0x1B, 0, 0, 0, 0x01, 0 };
-	rc = scsi(0, ssu, sizeof(ssu), 0, 0, &ocs, &st);
-	con_hex2("UFS SSU", "rc=", rc, "k/a=",
-	    (uint32_t)ucd.resp[36] << 16 | (uint32_t)ucd.resp[46] << 8 | ucd.resp[47]);
 
-	/* the money shot: TUR + READ(10) LBA0 after the handshake attempt */
-	rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-	con_hex2("UFS TUR2", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
 	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
-	if (!rc) {
-		const uint8_t *gpt = data + BLOCK;
-		con_hex2("UFS GPT", "mbr=", data[510] | data[511] << 8, "sig=", *(volatile uint32_t *)gpt);
+	if (scsi_line("UFS READ", 0, rd10, sizeof(rd10), data, 2 * BLOCK) == 0) {
+		char sig[9];
+		for (int i = 0; i < 8; i++) {
+			uint8_t ch = data[BLOCK + i];
+			sig[i] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+		}
+		sig[8] = 0;
+		con_str("UFS GPT", sig);
 	}
-	con_str("UFS MAT", "done - hold");
+
+	/* unit descriptors (IDN 0x02): enable/boot-LU/write-protect + block count
+	 * low 32 bits (maps LUN -> sdX: sda has 0x07688000 4K blocks) */
+	for (uint8_t lun = 0; lun < 6; lun++) {
+		char label[] = "UFS LU0";
+		label[6] = '0' + lun;
+		uint32_t q = query(0x01, 0x01, 0x02, lun, 64, 0);
+		const volatile uint8_t *d = ucd.resp + 32;
+		con_hex2(label, "q/e/b/w=", q << 24 | (uint32_t)d[3] << 16 | (uint32_t)d[4] << 8 | d[5],
+		    "blk=", be32((const uint8_t *)(ucd.resp + 32 + 15)));
+	}
+
+	/* configuration descriptor, the right IDN this time (0x01) */
+	uint32_t q = query(0x01, 0x01, 0x01, 0, 255, 0);
+	con_hex2("UFS CFGD", "q/len=", q << 8 | ucd.resp[32],
+	    "boot/ipm=", (uint32_t)ucd.resp[35] << 8 | ucd.resp[37]);
+
+	con_str("UFS MAT", "v6 done - hold");
 	for (;;)
 		__asm__ volatile("wfe");
 }

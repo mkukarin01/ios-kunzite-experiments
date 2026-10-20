@@ -514,7 +514,7 @@ static uint32_t to_us(uint64_t ticks)
  * test using ONLY the register subset proven safe on this SoC: boot #1
  * aborted at the GICR_IPRIORITYR write, so nothing here touches priorities.
  */
-static void test_gic_kunzite(void)
+static void __attribute__((unused)) test_gic_kunzite(void)
 {
 	stage = "gic sre";
 	uint64_t sre = rsr("icc_sre_el1");
@@ -601,8 +601,8 @@ void shim_main(uint64_t dtb)
 
 	/* No payload: kunzite GIC/timer diagnostics, then the UFS experiment
 	 * matrix (holds the screen; no reset - see ufs.c). */
-	test_gic_kunzite();
-	con_skip();
+	/* test_gic_kunzite(): proven (boot #11: 30/30 IRQs on INTID 27); skipped
+	 * so the UFS matrix fits on one screen. */
 	stage = "ufs matrix";
 	ufs_matrix();
 	test_ufs();
