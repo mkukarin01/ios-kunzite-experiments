@@ -293,6 +293,18 @@ checks: dyld cache 0:80, launchd 0:0, mobile 501:501, diagnostics 272:272, syste
 springboard.plist 501:501. simg regenerated, `tools/verify-simg.py` VERIFIED (205 chunks).
 Reflash (no -S), then boot #15 with the same shim/out/shim-boot-14.img.
 
+**BOOT #15 (2026-10-20 ~15:35, ownership-fixed root): THE APPLE LOGO - iOS draws on kunzite.**
+The shared cache maps, launchd runs the system, **backboardd (pid 56) draws the Apple logo** through
+the kernel IOSurface/AppleCLCD path onto the ABL splash framebuffer; **SpringBoard (pid 26) is up**.
+The logo is then overwritten by the kernel console (console still on). bluetoothd/fairplayd.H2
+relaunch loops = missing hardware (as on sweet/topaz). Stack sampler, symbolicated against the
+image's shared cache (slide 0x2da14000, `ipsw dyld a2s`): SpringBoard t0 waits in
+`_LSCopyServerStore` <- `___LAUNCH_SERVICES_WAS_ASKED_TO_PERFORM_BLOCKING_IO_ON_THE_MAIN_QUEUE__`
+<- sync NSXPC to lsd: the first-boot LaunchServices database build (topaz's "3 minutes on the
+logo"), slow on cpus=1. The database persists on the root (rootrw=1): one-time cost.
+Next: boot #16 = same + `sweetfb_noconsole=1 sweetfb_hz=30` (shim/out/shim-boot-16.img) so the
+GUI stays visible; then cpus=8 as a separate experiment (secondary-core GICR setup untested here).
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
