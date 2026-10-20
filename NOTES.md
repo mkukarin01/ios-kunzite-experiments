@@ -492,6 +492,22 @@ sudo, then runs `tools/udp-log.py` -> temp/ios-m8/usblog/). Plan after it works:
 (ad-hoc signed dropbear + LaunchDaemon in the root image; sweet_amfi accepts any valid signature on
 the root FS as a platform binary with its own entitlements, no sandbox), then an os_log streamer.
 
+**AGENT (2026-10-21, agent/, not on the phone yet):** kunzite-agent.c - HTTP/1.0 debug service on
+tcp/8022 (peers: 192.168.7.0/24 + loopback only), runs as root from launchd with stdout/stderr to
+/dev/console (= the live USB log). Stock iOS has no shell, so the agent IS the remote side: ls/stat/
+get/put(chunked too)/rm/mv/mkdir/ps/kill/run (spawn with streamed stdout+stderr, bounded t)/exit
+(restart via KeepAlive). Build: `agent/build.sh` (arm64 iOS 16 + ldid -S entitlements.plist; also a
+macOS binary for local tests). Install into the root image: `sudo tools/root-add-agent-mac.sh`
+(copies to /usr/libexec/kunzite-agent, adds the launchd job to the launchd.plist cache + writes
+/System/Library/LaunchDaemons/com.kunzite.agent.plist; idempotent), then img2simg + flash userdata.
+Mac use: `curl -s 'http://192.168.7.2:8022/ls?p=/'`. Reviewed by a 3-lens adversarial workflow
+(23 findings, several verified live: /run could wedge the agent forever on client disconnect, bare
+query params crashed it, /kill pid wrapping could target launchd, chunked uploads were silently
+dropped) - all fixed and re-verified on the Mac build: socket timeouts (AGENT_RCV/SND_TIMEOUT_S),
+POSIX_SPAWN_CLOEXEC_DEFAULT + SIGPIPE reset in children, bounded reaping, range checks. NEXT:
+install + flash (user runs sudo + fastboot), then /ping from the Mac; then os_log streaming (the
+kernel console misses SpringBoard/os_log output - a /run helper reading the log stream).
+
 **NEXT (candidates):** RTC/date (PMK8350 RTC + boot-time offset); real screen-off (a safe DCS path
 on the parrot DSI0, then drop sweetfb_stayon); black wallpaper (upstream topaz: check whether its
 lock screen has one; PosterBoard/wallpaper renderer logs); About-pane slowness on #22 (sweetbusy=N
