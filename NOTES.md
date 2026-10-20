@@ -320,6 +320,19 @@ unproven. Boot #16 (shim/out/shim-boot-16.img): + sweetfb_stayon=1 (topaz's swit
 requests), ufslogsecs=1 (lose <=1 s of log on a reset), sweetfb_noconsole=1 sweetfb_hz=30 (see the GUI).
 Also for M5: the SPMI PMIC arbiter is at 0xc42d000 (dmesg), PON on PMK8350 pon_hlos@1300.
 
+**BOOT #16 (2026-10-20 16:25): THE iOS LOCK SCREEN on kunzite.** shim-boot-16.img (kernel 0132, cpus=1,
+sweetkeys=0 sweettouch=0 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1).
+Apple logo 16:25-~16:41 (first-boot LaunchServices database, continued from boot #15; persists on
+the root), then SpringBoard's lock screen at ~16:41; clock updating (:18 -> :20), still alive past
+the point where boot #15 reset. Black background, time/date drawn RED (not a channel swap: white
+is invariant under channel order -> iOS-side colours; guess: iOS 16 wallpaper/PosterBoard fails
+without a GPU, clock tint derived from it). Battery icon: SweetBattery static (100%, external).
+Boot #15's white screen + reset was most likely the display-off path (auto-lock -> AppleCLCD::
+setPanelOn(false) -> DSI DMA on the real parrot DSI0): KEEP sweetfb_stayon=1 until the DSI path is
+ported (also needed anyway: no buttons/touch to wake the panel).
+Next: boot #17 = same with cpus=8 (shim/out/shim-boot-17.img); then M5 input (SPMI keys via the
+arbiter at 0xc42d000 / PMK8350 PON 0x1300, Goodix GT9916K touch on SPI SE9 0xa8c000).
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
