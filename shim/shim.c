@@ -603,8 +603,9 @@ void shim_main(uint64_t dtb)
 	 * matrix (holds the screen; no reset - see ufs.c). */
 	/* test_gic_kunzite(): proven (boot #11: 30/30 IRQs on INTID 27); skipped
 	 * so the UFS matrix fits on one screen. */
-	stage = "ufs matrix";
-	ufs_matrix();
+	/* boot #15 follow-up: read the persistent kernel log (ufs_matrix() is done) */
+	stage = "ufs logview";
+	ufs_logview();
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */

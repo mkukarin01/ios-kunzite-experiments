@@ -386,6 +386,160 @@ void ufs_matrix(void)
 		__asm__ volatile("wfe");
 }
 
+/* ================= kunzite persistent-log viewer (2026-10-20) =================
+ * Boot #15 drew the Apple logo, then iOS rebooted the phone. The kernel's
+ * SWEETLOG ring (patch 0047: header + 4 MiB ring in the last 4 MiB + 4 KiB
+ * of userdata, flushed every 10 s) holds what happened, but recovery adb is
+ * unauthorized now that the Android data is gone. Read it straight from
+ * UFS and show the newest ~200 lines: two older pages for 40 s each, then
+ * the newest page holds. Read-only (READ(10) only).
+ */
+static uint8_t logbuf[6 * BLOCK] __attribute__((aligned(4096)));
+static uint8_t gptbuf[4 * BLOCK] __attribute__((aligned(4096)));
+static struct { const uint8_t *p; int n; } log_rows[3 * 80];
+
+static uint32_t le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void log_wait_s(unsigned s)
+{
+	uint64_t end = ticks() + (uint64_t)19200000 * s;
+	while (ticks() < end)
+		;
+}
+
+void ufs_logview(void)
+{
+	con_str("LOG", "kunzite log viewer (read-only)");
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list) {
+		con_str("LOG", "list base not taken");
+		return;
+	}
+	/* wake the device (matrix v6): SSU power condition Active to W-LUN 0xD0 */
+	static const uint8_t ssu_active[6] = { 0x1B, 0, 0, 0, 0x10, 0 };
+	static const uint8_t tur[6] = { 0x00 };
+	uint32_t ocs = 0, st = 0, rc = 1;
+	for (int i = 0; i < 3 && rc; i++)
+		rc = scsi(0xD0, ssu_active, sizeof(ssu_active), 0, 0, &ocs, &st);
+	for (int i = 0; i < 3 && (rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st)); i++)
+		;
+	if (rc) {
+		con_hex2("LOG UFS", "tur=", rc, "k/a=", last_sense());
+		return;
+	}
+
+	/* GPT on LUN 0: header at LBA 1, scan 128 entries (Xiaomi understates the count) */
+	if (read_blocks(1, 1, data)) {
+		con_str("LOG", "GPT header read failed");
+		return;
+	}
+	uint32_t elba = le32(data + 72);
+	if (read_blocks(elba, 4, gptbuf)) {
+		con_str("LOG", "GPT entries read failed");
+		return;
+	}
+	uint64_t last = 0;
+	for (int i = 0; i < 128 && !last; i++) {
+		const uint8_t *e = gptbuf + i * 128;
+		static const char want[] = "userdata";
+		int ok = 1;
+		for (int c = 0; c < 9 && ok; c++)	/* includes the terminating 0 */
+			ok = e[56 + 2 * c] == (uint8_t)want[c] && e[57 + 2 * c] == 0;
+		if (ok)
+			last = le64(e + 40);
+	}
+	if (!last) {
+		con_str("LOG", "no userdata in the GPT");
+		return;
+	}
+	uint32_t area = (uint32_t)(last + 1 - 1025);	/* 1 header + 1024 ring blocks */
+	if (read_blocks(area, 1, data)) {
+		con_str("LOG", "log header read failed");
+		return;
+	}
+	static const char magic[] = "SWEETLOG";
+	for (int i = 0; i < 8; i++) {
+		if (data[i] != (uint8_t)magic[i]) {
+			con_hex2("LOG", "no SWEETLOG at blk=", area, "b0=", le32(data));
+			return;
+		}
+	}
+	uint32_t size = le32(data + 12);
+	uint64_t total = le64(data + 16), seq = le64(data + 24);
+	con_hex2("LOG HDR", "ring=", size, "flush=", (uint32_t)seq);
+	con_hex2("LOG HDR", "total=", (uint32_t)total, "blk=", area);
+	if (total == 0 || size == 0 || size % BLOCK) {
+		con_str("LOG", "empty or odd ring");
+		return;
+	}
+
+	/* the last up to 6 ring blocks, in stream order */
+	uint32_t nring = size / BLOCK;
+	uint32_t lb = (uint32_t)((total - 1) % size), last_blk = lb / BLOCK;
+	uint32_t nblk = 6;
+	if (total <= size && last_blk + 1 < nblk)
+		nblk = last_blk + 1;
+	for (uint32_t k = 0; k < nblk; k++) {
+		uint32_t b = (last_blk + nring - (nblk - 1) + k) % nring;
+		if (read_blocks(area + 1 + b, 1, logbuf + k * BLOCK)) {
+			con_hex2("LOG", "ring read failed b=", b, "k=", k);
+			return;
+		}
+	}
+	int vend = (int)((nblk - 1) * BLOCK + lb % BLOCK + 1);
+
+	/* display rows, newest first, long lines wrapped */
+	int cols = con_text_cols(2), per = con_text_rows(2) - 1, maxrows = 3 * per;
+	if (maxrows > (int)(sizeof(log_rows) / sizeof(log_rows[0])))
+		maxrows = sizeof(log_rows) / sizeof(log_rows[0]);
+	int nrows = 0, end = vend;
+	if (end > 0 && logbuf[end - 1] == '\n')
+		end--;
+	while (end >= 0 && nrows < maxrows) {
+		int s0 = end;
+		while (s0 > 0 && logbuf[s0 - 1] != '\n')
+			s0--;
+		int len = end - s0, pieces = len ? (len + cols - 1) / cols : 1;
+		for (int k = pieces - 1; k >= 0 && nrows < maxrows; k--) {
+			int n = len - k * cols;
+			log_rows[nrows].p = logbuf + s0 + k * cols;
+			log_rows[nrows].n = n > cols ? cols : n;
+			nrows++;
+		}
+		if (s0 == 0)
+			break;
+		end = s0 - 1;
+	}
+	log_wait_s(5);
+
+	/* pages: oldest first (40 s each), the newest one holds */
+	int npages = (nrows + per - 1) / per;
+	for (int pg = npages - 1; pg >= 0; pg--) {
+		con_text_begin(0xff000000U);
+		/* literals per page: no copied char arrays (memcpy) or pointer tables (ABS64) */
+		if (pg == 0)
+			con_text_line("== SWEETLOG newest lines (held) ==", 34, 2, GREEN);
+		else if (pg == 1)
+			con_text_line("== SWEETLOG older lines (40 s) ==", 33, 2, GREEN);
+		else
+			con_text_line("== SWEETLOG oldest lines (40 s) ==", 34, 2, GREEN);
+		int top = (pg + 1) * per < nrows ? (pg + 1) * per : nrows;
+		for (int r = top - 1; r >= pg * per; r--)
+			con_text_line((const char *)log_rows[r].p, log_rows[r].n, 2, WHITE);
+		if (pg)
+			log_wait_s(40);
+	}
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
 void test_ufs(void)
 {
 	con_str("UFS", "milestone 5 probe (read-only)");

@@ -95,3 +95,45 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	}
 	row++;
 }
+
+/*
+ * Raw text at a smaller scale with its own pixel cursor, for log dumps
+ * (ufs_logview): scale 2 = 16x32 px cells, 64 columns x 73 rows.
+ */
+static int text_y = MARGIN;
+
+int con_text_cols(int scale) { return (FB_W - 2 * MARGIN) / (8 * scale); }
+int con_text_rows(int scale) { return (FB_H - 2 * MARGIN) / (16 * scale); }
+
+void con_text_begin(uint32_t bg)
+{
+	con_clear(bg);
+	text_y = MARGIN;
+}
+
+void con_text_line(const char *s, int n, int scale, uint32_t fg)
+{
+	int cw = 8 * scale, chh = 16 * scale;
+	if (text_y + chh > FB_H)
+		return;
+	for (int i = 0; i < n; i++) {
+		int x0 = MARGIN + i * cw;
+		if (x0 + cw > FB_W)
+			break;
+		char ch = s[i];
+		if (ch < 0x20 || ch > 0x7e)
+			ch = ' ';
+		const unsigned char *g = font8x16[ch - 0x20];
+		for (int gy = 0; gy < 16; gy++)
+			for (int gx = 0; gx < 8; gx++) {
+				uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
+				for (int sy = 0; sy < scale; sy++) {
+					volatile uint32_t *p = con_fb + (text_y + gy * scale + sy) * (FB_STRIDE / 4)
+							       + x0 + gx * scale;
+					for (int sx = 0; sx < scale; sx++)
+						p[sx] = c;
+				}
+			}
+	}
+	text_y += chh;
+}

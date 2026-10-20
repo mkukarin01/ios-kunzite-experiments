@@ -20,3 +20,9 @@ void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+
+/* raw text lines at a smaller scale (log viewer) */
+int con_text_cols(int scale);
+int con_text_rows(int scale);
+void con_text_begin(uint32_t bg);
+void con_text_line(const char *s, int n, int scale, uint32_t fg);
