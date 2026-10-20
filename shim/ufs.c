@@ -253,7 +253,7 @@ static uint32_t dm_upiu(uint8_t trans, uint8_t fn, uint8_t dd, const uint8_t q[1
 /* The matrix. Order = cheapest disproof first. */
 void ufs_matrix(void)
 {
-	con_str("UFS MAT", "exp matrix v3 (holds)");
+	con_str("UFS MAT", "exp matrix v4 (holds)");
 	uint32_t cfg1 = ufs_rd(REG_UFS_CFG1);
 	con_hex2("UFS CFG", "1=", cfg1, "scsi=", cfg1 >> 31);
 	if (!(cfg1 & (1u << 31))) {
@@ -350,6 +350,23 @@ void ufs_matrix(void)
 		con_hex2("UFS GETFI", "ocs=", g, "val=", v);
 		if (g == 0 && v == 0)
 			break;
+	}
+
+	/*
+	 * The missing SCSI step: sense 04/02 "initializing command required"
+	 * is the LU asking for START STOP UNIT (as Linux's SCSI layer issues
+	 * to every UFS LU during scan). Start LUN 0, give it a beat, retry.
+	 */
+	static const uint8_t ssu[6] = { 0x1B, 0, 0, 0, 0x01, 0 };
+	rc = scsi(0, ssu, sizeof(ssu), 0, 0, &ocs, &st);
+	con_hex2("UFS SSU", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+	if (rc == 0) {
+		for (int i = 0; i < 3; i++) {
+			rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+			con_hex2("UFS SSUT", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+			if (rc == 0)
+				break;
+		}
 	}
 
 	/* the money shot: TUR + READ(10) LBA0 after the handshake attempt */
