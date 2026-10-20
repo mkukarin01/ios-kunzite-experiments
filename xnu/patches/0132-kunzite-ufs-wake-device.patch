@@ -1,0 +1,61 @@
+kunzite (SM6475 parrot): wake the UFS device before the first LU command.
+ABL hands the Samsung UFS 2.2 device over in UFS-PowerDown (bCurrentPowerMode
+0x33, read with a query in shim matrix v6): every LU then answers 02/04/02
+"initializing command required" - boot #12's root-mount panic. Send START
+STOP UNIT with POWER CONDITION Active to the UFS Device W-LUN 0xD0, as Linux
+ufshcd_set_dev_pwr_mode does (matrix v6: Active 0x11, then TUR, INQUIRY
+"SAMSUNG KLUFG4M1JB-C0F1" and READ on LUN 0 succeed). Also: the timeout path
+cleared the doorbell with ~1u (UTRLCLR is write-1-to-clear), and failures
+now print the LUN and the sense key/ASC/ASCQ.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -219,7 +219,7 @@
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
++			ufs_wr(REG_UTRLCLR, 1);         /* write-1-to-clear (was ~1u) */
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+@@ -249,8 +249,12 @@
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+-		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		printf("SWEET UFS: command 0x%02x lun 0x%x failed: ocs 0x%x upiu 0x%x response 0x%x "
++		    "status 0x%x sense %x/%02x/%02x\n",
++		    cdb[0], su.lun, ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7],
++		    (ucd->resp[32] | ucd->resp[33]) ? ucd->resp[36] & 0xf : 0,
++		    (ucd->resp[32] | ucd->resp[33]) ? ucd->resp[46] : 0,
++		    (ucd->resp[32] | ucd->resp[33]) ? ucd->resp[47] : 0);
+ 		return EIO;
+ 	}
+ 	return 0;
+@@ -777,6 +781,23 @@
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
++		/*
++		 * kunzite: ABL hands the device over in UFS-PowerDown (bCurrentPowerMode
++		 * 0x33): every LU answers 02/04/02 "initializing command required",
++		 * even INQUIRY. Wake it as Linux ufshcd_set_dev_pwr_mode does: START
++		 * STOP UNIT to the UFS Device W-LUN (0xD0), POWER CONDITION Active
++		 * (cdb[4] bits 7:4 = 1). Shim matrix v6 proved it: Active (0x11), then
++		 * TUR/INQUIRY/READ on LUN 0 succeed. Harmless on an already active
++		 * device; the first try may report a unit attention.
++		 */
++		static const uint8_t ssu_active[6] = { 0x1B, 0, 0, 0, 0x10, 0 };
++		int wake = EIO;
++		su.lun = 0xD0;
++		for (int i = 0; i < 3 && (wake = ufs_scsi(ssu_active, sizeof(ssu_active), 0, false)); i++) {
++		}
++		su.lun = 0;
++		printf("SWEET UFS: device power mode Active (SSU to W-LUN 0xD0): %s\n",
++		    wake ? "FAILED" : "ok");
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {

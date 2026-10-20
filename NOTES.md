@@ -217,7 +217,35 @@ MORNING (in order):
 - Analysis workflow wf_fff9a73a-a61 (descriptor parse + driver lore + spec reasoning)
   running for the v6 design.
 
+**UFS SOLVED (matrix v6, 2026-10-20 ~14:30, commit bfaab83): ABL leaves the device in UFS-PowerDown.**
+- `bCurrentPowerMode` (query READ_ATTR idn 0x02) = **0x33 PowerDown** at handoff; bBootLunEn = 2 (boot LU B).
+  That is why every LU answered 02/04/02 "initializing command required", even INQUIRY.
+  Linux never sees it: ufs-qcom resets the device at probe; we take over without a reset.
+- Cure: START STOP UNIT to the **UFS Device W-LUN 0xD0** with POWER CONDITION Active
+  (cdb `1B 00 00 00 10 00`, as Linux ufshcd_set_dev_pwr_mode) -> power mode 0x11 Active,
+  then TUR, INQUIRY (`SAMSUNG KLUFG4M1JB-C0F1`), READ(10) on LUN 0 all succeed; LBA 1 = `EFI PART`.
+- Earlier "oddities" were shim bugs: config descriptor IDN is 0x01 (v5 sent 0x10); v4's SSU went
+  to LUN 0 with the START bit (wrong target, wrong field for UFS power).
+- Device descriptor (cross-checked with Linux sysfs): UFS 2.2 (0x0220), Samsung 0x01CE, 6 LUs,
+  bBootEnable 1, bInitPowerMode 1, bHighPriorityLUN 5. Config descriptor: 0xE6 bytes.
+- LUN map (unit descriptors; block counts match the sdX sizes from LineageOS):
+  LU0 = sda 0x07686000 x 4K = 474 GiB (super + **userdata**), not write-protected;
+  LU1/LU2 = sdb/sdc 8 MiB (xbl_a/xbl_b, boot LU A/B), LU3 = sdd 8 MiB (cdt, ddr),
+  LU4 = sde 2.5 GiB (boot, vendor_boot, modem, ...): **all power-on write-protected by ABL**
+  until the next power cycle; LU5 = sdf 64 MiB (modemst1/2, fsg), not write-protected.
+- Kernel fix: **patch 0132** (sweet_ufs.c): SSU Active to W-LUN 0xD0 right after
+  ufs_take_over_host(), before the first TUR; UTRLCLR timeout write fixed (write-1-to-clear,
+  was ~1u); failure prints now include the LUN and sense key/ASC/ASCQ. Dry-run applied clean.
+
 NEXT (in order):
+1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
+2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
+   `SWEET UFS: device power mode Active ... ok`, then userdata found on LUN 0 (GPT), then a
+   panic at the HFS root mount (userdata still holds LineageOS). Non-destructive.
+3. M4 flash (DESTRUCTIVE, needs the user's explicit go: erases LineageOS userdata):
+   `fastboot -S 512M flash userdata temp/ios-m8/ios16-root-20H392.simg`, then boot #14.
+
+NEXT (older list, superseded):
 1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
 2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`
    lines (first parrot EPSS readout), how far IOKit gets, and the eventual stop —

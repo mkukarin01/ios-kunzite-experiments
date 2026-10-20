@@ -366,7 +366,7 @@ void ufs_matrix(void)
 	}
 
 	/* unit descriptors (IDN 0x02): enable/boot-LU/write-protect + block count
-	 * low 32 bits (maps LUN -> sdX: sda has 0x07688000 4K blocks) */
+	 * low 32 bits (maps LUN -> sdX: sda has 0x07686000 4K blocks) */
 	for (uint8_t lun = 0; lun < 6; lun++) {
 		char label[] = "UFS LU0";
 		label[6] = '0' + lun;
