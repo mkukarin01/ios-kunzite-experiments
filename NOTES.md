@@ -4,8 +4,8 @@
 
 **State:** POCO M8 5G (`kunzite`, SM6475 parrot, Gunyah hypervisor) boots this repo's xnu to the
 **iOS 16.7.16 lock screen in < 2 min on all 8 cores**, root = iPhone X HFS+ image flashed into
-`userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). **Buttons work (0133,
-boot #18): power, vol+, vol-**; touch still off. No GPU (CPU render), black wallpaper; the clock is
+`userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). **Buttons work (0907,
+boot #18) and TOUCH WORKS (0908, boot #21): unlock, home screen, Settings/Messages/Photos open.** No GPU (CPU render), black wallpaper; the clock is
 red until the first power press, then white (sRGB gamut, boot #19, changed neither). Branch `kunzite`, forked
 from MakrSas/ios-topaz @ 590f001, merged with upstream d8c82d9 (0139) on branch
 kunzite-topaz-0139; our patches are 0901-0908 (see below). Chronological log below.
@@ -458,6 +458,14 @@ the 8 x AA write ran on with 13 zero bytes (0x10008-0x10014, clobbering the 'B' 
 "BERLIN" at 0x10014: hence 00 'E' 'R' 'L'). Fix in 0134 (regenerated): opcode 3 = SPI_FULL_DUPLEX
 (spi-msm-geni.c). Also: L7E log says "unreadable", the 250 ms stale-finger release is now opt-in
 (sweettouchstale=ms) so long presses survive an IC that stops reporting a still finger.
+
+**BOOT #21 (2026-10-20 23:05, shim-boot-21.img, kernel e3a9fd81..., kunzite 6d8fcd5): TOUCH
+WORKS.** #20's cmdline (touch on), 0134 with SPI opcode 3. User: unlocked the lock screen, opened
+Settings, Messages and Photos - all fine. Power button locks "on the 2nd press" (guess: iOS had
+already slept the display, stayon kept the frame visible, press 1 = wake). Some redraw artifacts
+when switching between apps/spaces (CPU rendering). No log read this time.
+**BOOT #22 (2026-10-20 23:33, shim-boot-22.img, kernel 4c641f3c..., branch kunzite-topaz-0139 @
+de778a9 = upstream 0139 merge + 0901-0908):** same cmdline and ADT as #21. Result pending.
 
 **BOOT #19 (2026-10-20 ~19:15, shim-boot-19.img, user-typed fastboot): sRGB gamut - no visible
 change.** Same kernel as #18 (283b12cb; the later CI artifact 0da72d25 has no kernel source change),
