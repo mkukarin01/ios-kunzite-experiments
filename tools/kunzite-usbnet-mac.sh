@@ -1,6 +1,6 @@
 #!/bin/bash
 # macOS host side of the phone's USB Ethernet (kernel sweetusb=2, patch 0909).
-#   tools/kunzite-usbnet-mac.sh [LOGFILE]
+#   tools/kunzite-usbnet-mac.sh [LOGFILE [udp-log.py options: --tail N, --no-replay]]
 # Waits for the phone's CDC-ECM interface (host MAC 02:00:5e:77:ee:01, macOS
 # drives CDC-ECM natively), makes sure it has 192.168.7.1/24 (the phone is
 # 192.168.7.2) - once, persistently, as the interface's network service set
@@ -35,4 +35,4 @@ if ! ifconfig "$ifname" | grep -q "inet 192.168.7.1 "; then
 fi
 ifconfig "$ifname" | grep "inet " >&2 || true
 echo "$ifname: 192.168.7.1 <-> phone 192.168.7.2 (ping 192.168.7.2); live log -> $log" >&2
-exec python3 "$here/udp-log.py" "$log" 5140
+exec python3 "$here/udp-log.py" "$log" "${@:2}"
