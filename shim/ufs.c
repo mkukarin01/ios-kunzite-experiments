@@ -394,7 +394,7 @@ void ufs_matrix(void)
  * UFS and show the newest ~200 lines: two older pages for 40 s each, then
  * the newest page holds. Read-only (READ(10) only).
  */
-static uint8_t logbuf[6 * BLOCK] __attribute__((aligned(4096)));
+static uint8_t logbuf[8 * BLOCK] __attribute__((aligned(4096)));
 static uint8_t gptbuf[4 * BLOCK] __attribute__((aligned(4096)));
 static struct { const uint8_t *p; int n; } log_rows[3 * 80];
 
@@ -408,6 +408,46 @@ static void log_wait_s(unsigned s)
 	uint64_t end = ticks() + (uint64_t)19200000 * s;
 	while (ticks() < end)
 		;
+}
+
+#define LV_KEEP		160
+#define LV_LEN		256
+static uint8_t lv_text[LV_KEEP][LV_LEN];
+static uint16_t lv_len[LV_KEEP];
+static uint32_t lv_count;		/* lines committed so far (ring index = count % LV_KEEP) */
+static uint16_t lv_cur_len;
+static uint8_t lv_head[12];
+static int lv_hn;
+
+static int lv_starts(const char *pfx, int n)
+{
+	if (lv_hn < n)
+		return 0;
+	for (int i = 0; i < n; i++)
+		if (lv_head[i] != (uint8_t)pfx[i])
+			return 0;
+	return 1;
+}
+
+/* exec relaunch loops, SMP stack samples, AppleKeyStore traces, blank lines */
+static int lv_is_noise(void)
+{
+	return lv_starts("exec ", 5) || lv_starts("SMP ", 4) || lv_starts("SWEET AKS: ", 11) ||
+	       (lv_hn == 1 && lv_head[0] == '\n');
+}
+
+static void lv_put(uint8_t ch)
+{
+	uint32_t slot = lv_count % LV_KEEP;
+	if (lv_cur_len < LV_LEN)
+		lv_text[slot][lv_cur_len++] = ch;
+}
+
+static void lv_commit(void)
+{
+	lv_len[lv_count % LV_KEEP] = lv_cur_len;
+	lv_count++;
+	lv_cur_len = 0;
 }
 
 void ufs_logview(void)
@@ -480,42 +520,79 @@ void ufs_logview(void)
 		return;
 	}
 
-	/* the last up to 6 ring blocks, in stream order */
+	/*
+	 * Whole ring, in stream order, 8 blocks per READ(10). Noise is dropped
+	 * (exec relaunch loops, SMP stack samples, AppleKeyStore traces); the
+	 * last LV_KEEP other lines are kept (truncated to LV_LEN) and paged.
+	 */
 	uint32_t nring = size / BLOCK;
-	uint32_t lb = (uint32_t)((total - 1) % size), last_blk = lb / BLOCK;
-	uint32_t nblk = 6;
-	if (total <= size && last_blk + 1 < nblk)
-		nblk = last_blk + 1;
-	for (uint32_t k = 0; k < nblk; k++) {
-		uint32_t b = (last_blk + nring - (nblk - 1) + k) % nring;
-		if (read_blocks(area + 1 + b, 1, logbuf + k * BLOCK)) {
-			con_hex2("LOG", "ring read failed b=", b, "k=", k);
+	uint64_t used = total < size ? total : size;
+	uint32_t start = total > size ? (uint32_t)(total % size) : 0;
+	uint32_t lines = 0, noise = 0, kept = 0;
+	int in_noise = -1;
+	for (uint64_t i = 0; i < used; ) {
+		uint32_t off = (uint32_t)((start + i) % size);
+		uint32_t b0 = off / BLOCK, nb = 8;
+		if (b0 + nb > nring)
+			nb = nring - b0;
+		if (read_blocks(area + 1 + b0, nb, logbuf)) {
+			con_hex2("LOG", "ring read failed b=", b0, "n=", nb);
 			return;
 		}
+		uint32_t avail = nb * BLOCK - off % BLOCK;
+		if (avail > used - i)
+			avail = (uint32_t)(used - i);
+		const uint8_t *p = logbuf + off % BLOCK;
+		for (uint32_t k = 0; k < avail; k++) {
+			uint8_t ch = p[k];
+			if (in_noise < 0) {	/* first byte(s) of a line decide */
+				lv_head[lv_hn++] = ch;
+				if (ch == '\n' || lv_hn == 11) {
+					in_noise = lv_is_noise();
+					if (!in_noise) {
+						for (int q = 0; q < lv_hn && ch != '\n'; q++)
+							lv_put(lv_head[q]);
+						if (ch == '\n')
+							for (int q = 0; q < lv_hn - 1; q++)
+								lv_put(lv_head[q]);
+					}
+				}
+			} else if (!in_noise && ch != '\n') {
+				lv_put(ch);
+			}
+			if (ch == '\n') {
+				lines++;
+				if (in_noise == 1)
+					noise++;
+				else {
+					lv_commit();
+					kept++;
+				}
+				in_noise = -1;
+				lv_hn = 0;
+			}
+		}
+		i += avail;
 	}
-	int vend = (int)((nblk - 1) * BLOCK + lb % BLOCK + 1);
 
-	/* display rows, newest first, long lines wrapped */
+	con_hex2("LOG", "lines=", lines, "noise=", noise);
+	con_hex2("LOG", "kept=", kept, "shown=", lv_count < LV_KEEP ? lv_count : LV_KEEP);
+
+	/* rows, newest first, each kept line wrapped at the screen width */
 	int cols = con_text_cols(2), per = con_text_rows(2) - 1, maxrows = 3 * per;
 	if (maxrows > (int)(sizeof(log_rows) / sizeof(log_rows[0])))
 		maxrows = sizeof(log_rows) / sizeof(log_rows[0]);
-	int nrows = 0, end = vend;
-	if (end > 0 && logbuf[end - 1] == '\n')
-		end--;
-	while (end >= 0 && nrows < maxrows) {
-		int s0 = end;
-		while (s0 > 0 && logbuf[s0 - 1] != '\n')
-			s0--;
-		int len = end - s0, pieces = len ? (len + cols - 1) / cols : 1;
+	int nrows = 0;
+	uint32_t have = lv_count < LV_KEEP ? lv_count : LV_KEEP;
+	for (uint32_t j = 0; j < have && nrows < maxrows; j++) {
+		uint32_t slot = (lv_count - 1 - j) % LV_KEEP;
+		int len = lv_len[slot], pieces = len ? (len + cols - 1) / cols : 1;
 		for (int k = pieces - 1; k >= 0 && nrows < maxrows; k--) {
 			int n = len - k * cols;
-			log_rows[nrows].p = logbuf + s0 + k * cols;
+			log_rows[nrows].p = lv_text[slot] + k * cols;
 			log_rows[nrows].n = n > cols ? cols : n;
 			nrows++;
 		}
-		if (s0 == 0)
-			break;
-		end = s0 - 1;
 	}
 	log_wait_s(5);
 
@@ -525,11 +602,11 @@ void ufs_logview(void)
 		con_text_begin(0xff000000U);
 		/* literals per page: no copied char arrays (memcpy) or pointer tables (ABS64) */
 		if (pg == 0)
-			con_text_line("== SWEETLOG newest lines (held) ==", 34, 2, GREEN);
+			con_text_line("== SWEETLOG filtered: newest (held) ==", 38, 2, GREEN);
 		else if (pg == 1)
-			con_text_line("== SWEETLOG older lines (40 s) ==", 33, 2, GREEN);
+			con_text_line("== SWEETLOG filtered: older (40 s) ==", 37, 2, GREEN);
 		else
-			con_text_line("== SWEETLOG oldest lines (40 s) ==", 34, 2, GREEN);
+			con_text_line("== SWEETLOG filtered: oldest (40 s) ==", 38, 2, GREEN);
 		int top = (pg + 1) * per < nrows ? (pg + 1) * per : nrows;
 		for (int r = top - 1; r >= pg * per; r--)
 			con_text_line((const char *)log_rows[r].p, log_rows[r].n, 2, WHITE);
