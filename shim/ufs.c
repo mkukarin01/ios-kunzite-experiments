@@ -253,7 +253,7 @@ static uint32_t dm_upiu(uint8_t trans, uint8_t fn, uint8_t dd, const uint8_t q[1
 /* The matrix. Order = cheapest disproof first. */
 void ufs_matrix(void)
 {
-	con_str("UFS MAT", "exp matrix v4 (holds)");
+	con_str("UFS MAT", "exp matrix v5 (holds)");
 	uint32_t cfg1 = ufs_rd(REG_UFS_CFG1);
 	con_hex2("UFS CFG", "1=", cfg1, "scsi=", cfg1 >> 31);
 	if (!(cfg1 & (1u << 31))) {
@@ -368,6 +368,93 @@ void ufs_matrix(void)
 				break;
 		}
 	}
+
+	/* ---- v5: enumeration forensics ---- */
+	/* full device-descriptor window (parse bNumberLU/bSpecVersion offline) */
+	zero(&ucd, sizeof(ucd));
+	{
+		uintptr_t ucd_pa = (uintptr_t)&ucd;
+		ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x01;
+		ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x00;
+		ucd.cmd[18] = 0; ucd.cmd[19] = 96;
+		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
+		utrl[0].dw2 = 0x0f;
+		utrl[0].ucdba = (uint32_t)ucd_pa;
+		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
+		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+		__asm__ volatile("dsb sy" ::: "memory");
+		ufs_wr(REG_UTRLDBR, 1);
+		uint64_t t0 = ticks();
+		while (ufs_rd(REG_UTRLDBR) & 1) {
+			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2("UFS DSC1", "ocs=", utrl[0].dw2 & 0xff,
+		    "r6=", ucd.resp[6]);
+		for (int i = 0; i < 4; i++)
+			con_hex2("UFS DDMP", "a=", *(volatile uint32_t *)(ucd.resp + 32 + i * 8),
+			    "b=", *(volatile uint32_t *)(ucd.resp + 36 + i * 8));
+	}
+	/* configuration descriptor: bLUEnable per LUN at data[32 + i*8] */
+	zero(&ucd, sizeof(ucd));
+	{
+		uintptr_t ucd_pa = (uintptr_t)&ucd;
+		ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[5] = 0x01;
+		ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x10;		/* READ_DESC, config */
+		ucd.cmd[14] = 0; ucd.cmd[19] = 128;
+		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
+		utrl[0].dw2 = 0x0f;
+		utrl[0].ucdba = (uint32_t)ucd_pa;
+		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
+		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+		__asm__ volatile("dsb sy" ::: "memory");
+		ufs_wr(REG_UTRLDBR, 1);
+		uint64_t t0 = ticks();
+		while (ufs_rd(REG_UTRLDBR) & 1) {
+			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2("UFS CFGD", "ocs=", utrl[0].dw2 & 0xff,
+		    "r6=", ucd.resp[6]);
+		for (int i = 0; i < 4; i++)
+			con_hex2("UFS CDMP", "a=", *(volatile uint32_t *)(ucd.resp + 32 + i * 8),
+			    "b=", *(volatile uint32_t *)(ucd.resp + 36 + i * 8));
+	}
+	/* INQUIRY LUN0 (36B): vendor/product if the LU answers at all */
+	static const uint8_t inq[6] = { 0x12, 0, 0, 0, 36, 0 };
+	rc = scsi(0, inq, sizeof(inq), data, 36, &ocs, &st);
+	con_hex2("UFS INQ", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+	if (!rc) {
+		con_hex2("UFS INQD", "a=", *(volatile uint32_t *)(data + 8),
+		    "b=", *(volatile uint32_t *)(data + 12));
+		con_hex2("UFS INQD", "a=", *(volatile uint32_t *)(data + 16),
+		    "b=", *(volatile uint32_t *)(data + 20));
+	}
+	/* REPORT LUNS on the well-known LUN 0x81 */
+	static const uint8_t rl[12] = { 0xA0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0 };
+	rc = scsi(0x81, rl, sizeof(rl), data, 32, &ocs, &st);
+	con_hex2("UFS RLUN", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
+	if (!rc) {
+		con_hex2("UFS RLD1", "a=", *(volatile uint32_t *)(data),
+		    "b=", *(volatile uint32_t *)(data + 4));
+		con_hex2("UFS RLD2", "a=", *(volatile uint32_t *)(data + 8),
+		    "b=", *(volatile uint32_t *)(data + 12));
+	}
+	/* TUR sweep with correct sense per LUN */
+	for (uint8_t lun = 0; lun < 6; lun++) {
+		rc = scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st);
+		{
+			char label[] = "UFS LN0";
+			label[6] = '0' + lun;
+			con_hex2(label, "rc=", rc, "k/a=",
+			    (uint32_t)ucd.resp[36] << 16 | (uint32_t)ucd.resp[46] << 8 | ucd.resp[47]);
+		}
+	}
+	/* SSU with the corrected sense print */
+	static const uint8_t ssu[6] = { 0x1B, 0, 0, 0, 0x01, 0 };
+	rc = scsi(0, ssu, sizeof(ssu), 0, 0, &ocs, &st);
+	con_hex2("UFS SSU", "rc=", rc, "k/a=",
+	    (uint32_t)ucd.resp[36] << 16 | (uint32_t)ucd.resp[46] << 8 | ucd.resp[47]);
 
 	/* the money shot: TUR + READ(10) LBA0 after the handshake attempt */
 	rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
