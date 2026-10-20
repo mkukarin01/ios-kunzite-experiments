@@ -264,6 +264,15 @@ corrupting zero ranges inside files) -> now FILL 0. Regenerated simg VERIFIED ag
 (volume checked: HFSX 'HX' v5, journaled, cleanly unmounted, 16 GiB). Then boot #14:
 `fastboot boot shim/out/shim-boot-14.img` (sweetkeys=0 sweettouch=0).
 
+**M4 FLASH DONE (2026-10-20 ~15:30): userdata = iOS 16.7.16 root (HFSX, 16 GiB at its start).**
+Attempt 3 with `-S 512M` was refused: kunzite ABL max-download-size = 370147328 (353 MiB). Without -S
+fastboot sizes the pieces itself: `fastboot flash userdata .../temp/ios-m8/ios16-root-20H392.simg`
+-> 37/37 OKAY in 321 s. ABL writes asynchronously ("Writing OKAY" in ms, the wait shows up on the
+next transfer; the following `fastboot boot` took 67 s). LineageOS userdata is gone (user OK'd it:
+no user data); Android needs `fastboot -w` / recovery format to boot again.
+Boot #14 started right after: shim/out/shim-boot-14.img (kernel 0132, kunzite.adt --highmem,
+cpus=1, sweetkeys=0 sweettouch=0, console on).
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
