@@ -333,6 +333,17 @@ ported (also needed anyway: no buttons/touch to wake the panel).
 Next: boot #17 = same with cpus=8 (shim/out/shim-boot-17.img); then M5 input (SPMI keys via the
 arbiter at 0xc42d000 / PMK8350 PON 0x1300, Goodix GT9916K touch on SPI SE9 0xa8c000).
 
+**BOOT #17 (2026-10-20 17:58:22, shim-boot-17.img): cpus=8 WORKS - lock screen in under 2 minutes**
+(user report before 18:00; boot #16 on one core: 16 min). All 8 cores (4x A55 + 4x A78) start through
+sweet's PSCI path with 0128's topology; each core's pe_init_fiq sets up its own redistributor and
+the INTID 27 vtimer - no shim-side GICR prep needed (topaz needed gold_gicr_prepare).
+Standard boot args now: `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1
+launchd_unsecure_cache=1 wdt=-1 sweetkeys=0 sweettouch=0 sweetfb_noconsole=1 sweetfb_hz=30
+sweetfb_stayon=1 ufslogsecs=1`. Log viewer v2 (whole ring, noise filtered): shim-boot-logview2.img.
+Next: stability soak, then M5 input (keys via SPMI 0xc42d000 / PMK8350 PON 0x1300; Goodix GT9916K
+touch on SPI SE9 0xa8c000), RTC from the PMIC, wallpaper/red-clock question.
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
