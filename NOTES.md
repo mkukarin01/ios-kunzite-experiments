@@ -13,8 +13,9 @@ MakrSas/ios-topaz @ 590f001, merged with upstream d8c82d9 (0139, boot #22, kept)
 
 **Standard boot** (phone in the BOOTLOADER fastboot = Power+VolDown; recovery's "Enter fastboot" is
 fastbootd, which rejects `boot` -> `fastboot reboot bootloader`):
-`fastboot boot shim/out/shim-boot-22.img` = kernel artifact 4c641f3c (kunzite = upstream 0139 +
-0901-0908) + `shim/out/kunzite.adt`
+`fastboot boot shim/out/shim-boot-23.img` = kernel artifact d5f0c370 (kunzite = upstream 0139 +
+0901-0909) + `shim/out/kunzite.adt`, cmdline below + `sweetusb=2` (USB Ethernet + live log: run
+`tools/kunzite-usbnet-mac.sh` on the Mac)
 (`tools/mkadt.py OUT --highmem`: RAM 0x900000000 + 6 GiB, vtimer INTID 27) + cmdline
 `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1
 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
@@ -471,7 +472,15 @@ between apps/spaces SMOOTHER (the second swipe leaves no artifacts), power still
 press, volume fine. One regression-ish note: Settings > General > About opened immediately on #21,
 took a while on #22. Decision: keep the merge; `kunzite` fast-forwarded to it.
 
-**USB ACCESS (2026-10-21, patch 0909, not built yet):** sweet's USB device mode ported to parrot:
+**BOOT #23 (2026-10-21 00:15, shim-boot-23.img = #22 + `sweetusb=2`, kernel d5f0c370...): USB
+ETHERNET + LIVE LOG WORK, first try.** The Mac sees "Kunzite iOS (USB Ethernet)" as en7 34 s after
+`fastboot boot` (link active); after `tools/kunzite-usbnet-mac.sh` (sudo once: network service set
+to manual 192.168.7.1/24, persistent) `ping 192.168.7.2` = 2 ms, 0 % loss, and the console streams
+into temp/ios-m8/usblog/live-*.txt. Gap: the first 64 KiB were sent before the Mac had its address
+and were lost (the log thread advances its position even when sending fails) - fix: replay on
+request (0910). Seen live: touch confirm `aa x8`, fw BERLIN / 9916K, touch_data_addr 0x10308.
+
+**USB ACCESS (2026-10-21, patch 0909):** sweet's USB device mode ported to parrot:
 CDC-ECM Ethernet `ue0` 192.168.7.2/24, live console as UDP to 192.168.7.1:5140 (starts with the last
 64 KiB). Changes vs sweet: GCC GDSC 0x49004 and clocks 0x49018/20/24/84/88 (gcc-parrot.c), femto PHY
 not read (sweet read QUSB2 at 0x88e2000), device mode only if GHWPARAMS0 AWIDTH ((v >> 24) & 0xff)
