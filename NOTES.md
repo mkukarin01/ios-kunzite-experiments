@@ -424,6 +424,19 @@ pulses on power presses (unidentified, maybe colour-shifted by the P3/sRGB issue
 Next: boot #19 = same + ADT `artwork-display-gamut sRGB` (upstream topaz 3eacb48), for the black
 wallpaper / red clock.
 
+**TOUCH (2026-10-20 evening): patch 0134 written, NOT compiled yet** (no local compile check:
+usage limit). New bsd/dev/kunzite_touch.c: Goodix GT9916K (Berlin-D) on SPI QUP1 SE3 0xa8c000,
+FIFO mode, polled every 8 ms; started from sweet_ufs.c instead of topaz's sweet_touch.c (SM6225
+I2C). Facts: SPI pins GPIO10-13 func 1; TLMM pin regs at 0xf100000 + 0x1000*N; IRQ 65, reset 131,
+IOVDD GPIO38; AVDD = PM6150L L7E 3.3 V via RPMh "ldoe7" (apps RSC DRV2 0x17a20000, TCS +0xd00, v3
+layout, ACTIVE TCS 0-2, cmd-db 0x80860000); GCC vote 0x62008 bits 18-21,25, S3 RCG 0x283b0 (DFS);
+Android log proves FIFO mode ("tx_fifo 16"). Protocol from Linux goodix_berlin_{core,spi}.c.
+sweet_keys.c exports sweet_spmi_peek() so the driver logs L7E status before/after the vote.
+Sources in temp/ios-m8/touch-research/src/. Boot-args: sweettouch (1), sweettouchdelay (45 s),
+sweettouchpower (1; 0 = no RPMh vote), sweettouchdiv (4 -> 4.8 MHz), sweettouchlog (24).
+Next: push -> CI (fix compile errors if any) -> boot #20 = #18 cmdline WITHOUT sweettouch=0;
+read "SWEET TOUCH" lines with the log viewer (extend LV_ONLY_SWEET to "SWEET TOU").
+
 **BOOT #19 (2026-10-20 ~19:15, shim-boot-19.img, user-typed fastboot): sRGB gamut - no visible
 change.** Same kernel as #18 (283b12cb; the later CI artifact 0da72d25 has no kernel source change),
 ADT P3 -> sRGB. Wallpaper still black. Observed (also likely on #18): the clock/date are RED after
