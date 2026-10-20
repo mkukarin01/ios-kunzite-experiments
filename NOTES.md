@@ -1,5 +1,70 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> KUNZITE HANDOFF (2026-10-20 evening) - READ THIS FIRST <<<
+
+**State:** POCO M8 5G (`kunzite`, SM6475 parrot, Gunyah hypervisor) boots this repo's xnu to the
+**iOS 16.7.16 lock screen in < 2 min on all 8 cores**, root = iPhone X HFS+ image flashed into
+`userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). No input (keys/touch off),
+no GPU (CPU render), black wallpaper + red clock (see "colours" below). Branch `kunzite`, forked
+from MakrSas/ios-topaz @ 590f001; our patches 0127-0132 (see below). Chronological log below.
+
+**Standard boot** (phone in the BOOTLOADER fastboot = Power+VolDown; recovery's "Enter fastboot" is
+fastbootd, which rejects `boot` -> `fastboot reboot bootloader`):
+`fastboot boot shim/out/shim-boot-17.img` = kernel artifact with 0132 + `shim/out/kunzite.adt`
+(`tools/mkadt.py OUT --highmem`: RAM 0x900000000 + 6 GiB, vtimer INTID 27) + cmdline
+`debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1
+ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
+sweetkeys=0 sweettouch=0 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1`.
+Build: `python3 tools/mkpayload.py xnu/out/xnu-kernel/kernel.development.sweet shim/out/kunzite.adt
+shim/out/payload.bin --cmdline '...'` then `shim/build-mac.sh out/payload.bin` (payload path is
+relative to shim/; macOS build: brew aarch64-elf-gcc + temp/ios-m8/tools/mkbootimg.py).
+
+**Must-keep switches and why:** `sweetkeys=0 sweettouch=0` (topaz key/touch drivers map SM6225
+addresses -> data abort, boot #13); `sweetfb_stayon=1` (display-off = topaz DCS via the real parrot
+DSI0 -> white screen + SoC reset, boot #15); vtimer INTID 27 (the DT's PPI14/30 never delivers to
+EL1, boots #10/#11); never touch CNTP_* at EL1 (Gunyah traps it: undefined instruction).
+
+**Debug loop:** panic on screen -> `nm -n` / `xcrun llvm-objdump -d --start-address=` against the CI
+artifact; kernel sources with all patches = the artifact's buildtree (temp/ios-m8/buildtree/xnu/).
+User-space addresses: `ipsw dyld a2s <root image>/System/Library/Caches/com.apple.dyld/
+dyld_shared_cache_arm64 <addr - slide>`. Persistent log (last 4 MiB of userdata): boot
+`shim/out/shim-boot-logview2.img` (shim reads it from UFS, noise filtered, 3 pages; recovery adb is
+unauthorized now). Patches: edit a pristine copy, difflib -> xnu/patches/NNNN, `patch -p1 --dry-run`.
+
+**Root image:** `tools/mkiosroot-mac.sh IPSW OUT.img` -> `sudo tools/fix-owners-mac.sh OUT.img
+owners.json` (REAL owners: dmgs attached with -owners on; docker chown is a no-op) ->
+`tools/img2simg.py` (FILL for zeros) -> `tools/verify-simg.py` -> `fastboot flash userdata X.simg`
+WITHOUT -S (ABL max-download 353 MiB; fastboot 37 needs sparse for big images). Current image:
+temp/ios-m8/ios16-root-20H392.{img,simg}, owners: temp/ios-m8/rootbuild.6iw7ol/owners-real.json.
+
+**Our patches:** 0127 ARMv8.2 back (inverse of 0081), 0128 sweet topology/boot CPU (inverse of
+0080/0082), 0129 skip CNTP mask (Gunyah), 0130 parrot EPSS read-only + static battery, 0131 parrot
+DSI0 + scanout maps off, 0132 UFS wake (SSU Active to W-LUN 0xD0: ABL leaves UFS in PowerDown).
+
+**NEXT - M5 buttons (start here):** port the SPMI read path to PMIC arbiter **v7** (Linux 6.6
+spmi-pmic-arb.c, copy in temp/ios-m8/): bases from the live FDT - cnfg 0xc42d000, core 0xc400000
+(VERSION at +0, expect >= 0x70000000), chnls 0xc500000, obsrvr 0xc440000, intr 0xc4c0000, ee 0.
+APID map: core + 0x2000 + 4*apid, ppid = (val >> 8) & 0xFFF, valid = bit 31. Observer channel:
+obsrvr + 0x8000*ee + 0x20*apid; CMD +0x00 = (1 << 27) | ((addr & 0xff) << 4) | (bytes-1),
+poll STATUS +0x08 bit0, RDATA0 +0x18. ppid = (sid << 8) | (addr >> 8). Keys: power = SID0 0x1310
+bit7, vol-down (resin) = SID0 0x1310 bit6 (PMK8350 pon_hlos@1300), vol-up = SID1 0x8810 bit0
+(PM6450 GPIO1, pull-up, active LOW). Replace the topaz addresses in bsd/dev/sweet_keys.c (and
+sweet_spmi.c) behind the same `sweetkeys` switch; then drop sweetkeys=0. Then: PMK8350 RTC for the
+date; touch = Goodix GT9916K (brl-d) on SPI QUP1 SE9 0xa8c000, IRQ GPIO65, reset 131, IOVDD 38,
+firmware goodix_3rd_firmware.bin + goodix_3rd_cfg_group.bin (from the LOS vendor partition).
+
+**Upstream topaz since 590f001 (on the plate, not merged):** mkadt `artwork-display-gamut sRGB`
+(iOS draws P3 layers into 10-bit surfaces we lack - prime suspect for the RED clock; ADT-only,
+try first); 0128 iokit-quiesce (generic, take); 0127 sweetbusy diagnostic (touches
+SweetFramebuffer.cpp: may need 0131 regenerated); 0129/0130 WLAN station on WCN3988 (reference
+only); mkadt `/arm-io/wlan` node (SKIP until Wi-Fi: wifid would crash-loop). Upstream numbers
+0127-0130 collide with ours: move kunzite patches to their own range (e.g. 0900+) before merging.
+
+**Gotchas:** the fork's origin is mkukarin01/ios-topaz-experiments (user pushes + runs CI; artifacts
+need GitHub auth -> user downloads to xnu/out/xnu-kernel/). Boots that must not write userdata need
+`sweetlog=0` (the log flushes into userdata's last 4 MiB). LU1-LU4 are power-on write-protected by
+ABL. Android no longer boots (userdata is HFS): restore with `fastboot -w` or recovery format.
+
 ## >>> KUNZITE PORT (2026-10-19, read this first) <<<
 
 Port #3: **POCO M8 5G** (`kunzite`, Qualcomm SM6475 `parrot`, = Redmi Note 15 5G, model
