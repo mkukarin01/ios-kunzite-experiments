@@ -220,12 +220,13 @@ static uint8_t dm_tag;
 
 /* One device-manage UPIU on slot 0 (no data buffers; responses stay in the
  * 512-byte response area). Returns 0 on OCS=0 completion. */
-static uint32_t dm_upiu(uint8_t trans, uint8_t dd, const uint8_t q[16])
+static uint32_t dm_upiu(uint8_t trans, uint8_t fn, uint8_t dd, const uint8_t q[16])
 {
 	zero(&utrl[0], sizeof(utrl[0]));
 	zero(&ucd, sizeof(ucd));
 	ucd.cmd[0] = trans;
 	ucd.cmd[3] = ++dm_tag;
+	ucd.cmd[4] = fn;
 	if (q != 0) {
 		for (int i = 0; i < 16; i++)
 			ucd.cmd[12 + i] = q[i];
@@ -284,31 +285,68 @@ void ufs_matrix(void)
 
 	/* E2: NOP OUT x3 */
 	for (int i = 0; i < 3; i++) {
-		uint32_t n = dm_upiu(0x00, 0, 0);
+		uint32_t n = dm_upiu(0x00, 0, 0, 0);
 		con_hex2("UFS NOP", "ocs=", n, "r/t=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
 		if (n == 0 && ucd.resp[0] == 0x20 && ucd.resp[6] == 0)
 			break;
 	}
 
-	/* E3a: query read descriptors (dump the raw response window) */
-	static const uint8_t q_dev[16] = { 0x01, 0x00, 0, 0, 0, 0, 0, 64 };
-	uint32_t q = dm_upiu(0x16, 2, q_dev);
-	con_hex2("UFS QDEV", "ocs=", q, "r/i=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
-	for (int i = 0; i < 8; i++)
-		con_hex2("UFS QDMP", "a=", *(volatile uint32_t *)(ucd.resp + 28 + i * 4),
-		    "b=", *(volatile uint32_t *)(ucd.resp + 44 + i * 4));
-	static const uint8_t q_lu0[16] = { 0x01, 0x02, 0, 0, 0, 0, 0, 32 };
-	q = dm_upiu(0x16, 2, q_lu0);
-	con_hex2("UFS QLU0", "ocs=", q, "r/i=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
+	/*
+	 * E3a: query read descriptors. v2 fixes: the Query Function byte at UPIU
+	 * offset 4 (0x01 standard read / 0x81 standard write) - missing in v1,
+	 * the device answered QUERY_RESULT_INVALID_OPCODE (0xFE) - and DD=0
+	 * (DMA_NONE; the response carries the data segment itself).
+	 */
+	zero(&ucd, sizeof(ucd));
+	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[4] = 0x01;
+	ucd.cmd[12] = 0x01; ucd.cmd[13] = 0x00;			/* READ_DESC, device */
+	ucd.cmd[18] = 0; ucd.cmd[19] = 64;			/* length */
+	{
+		uintptr_t ucd_pa = (uintptr_t)&ucd;
+		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
+		utrl[0].dw2 = 0x0f;
+		utrl[0].ucdba = (uint32_t)ucd_pa;
+		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
+		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+		__asm__ volatile("dsb sy" ::: "memory");
+		ufs_wr(REG_UTRLDBR, 1);
+		uint64_t t0 = ticks();
+		while (ufs_rd(REG_UTRLDBR) & 1) {
+			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2("UFS QDEV", "ocs=", utrl[0].dw2 & 0xff,
+		    "f/6=", (uint32_t)ucd.resp[4] << 8 | ucd.resp[6]);
+		con_hex2("UFS QR12", "r12=", ucd.resp[12], "13=", ucd.resp[13]);
+		for (int i = 0; i < 3; i++)
+			con_hex2("UFS QDMP", "a=", *(volatile uint32_t *)(ucd.resp + 16 + i * 8),
+			    "b=", *(volatile uint32_t *)(ucd.resp + 20 + i * 8));
+	}
 
-	/* E3b: SET_FLAG fDeviceInit, then poll READ_FLAG until it clears */
-	static const uint8_t q_setfi[16] = { 0x06, 0x01, 0, 0, 0, 0 };
-	static const uint8_t q_getfi[16] = { 0x05, 0x01, 0, 0, 0, 0 };
-	q = dm_upiu(0x16, 0, q_setfi);
-	con_hex2("UFS SETFI", "ocs=", q, "r/i=", (uint32_t)ucd.resp[0] << 8 | ucd.resp[6]);
+	/* E3b: SET_FLAG fDeviceInit (write function 0x81), poll READ_FLAG. */
+	zero(&ucd, sizeof(ucd));
+	ucd.cmd[0] = 0x16; ucd.cmd[3] = ++dm_tag; ucd.cmd[4] = 0x81;
+	ucd.cmd[12] = 0x06; ucd.cmd[13] = 0x01;			/* SET_FLAG, fDeviceInit */
+	{
+		uintptr_t ucd_pa = (uintptr_t)&ucd;
+		utrl[0].dw0 = CT_DEV_MANAGE | (1u << 24);
+		utrl[0].dw2 = 0x0f;
+		utrl[0].ucdba = (uint32_t)ucd_pa;
+		utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
+		utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+		__asm__ volatile("dsb sy" ::: "memory");
+		ufs_wr(REG_UTRLDBR, 1);
+		uint64_t t0 = ticks();
+		while (ufs_rd(REG_UTRLDBR) & 1) {
+			if (ticks() - t0 > 19200000) { ufs_wr(REG_UTRLCLR, 1); break; }
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2("UFS SETFI", "ocs=", utrl[0].dw2 & 0xff,
+		    "f/6=", (uint32_t)ucd.resp[4] << 8 | ucd.resp[6]);
+	}
 	for (int i = 0; i < 10; i++) {
-		uint32_t g = dm_upiu(0x16, 0, q_getfi);
-		uint32_t v = *(volatile uint32_t *)(ucd.resp + 20); /* query value */
+		uint32_t g = dm_upiu(0x16, 0x01, 0, (const uint8_t[16]){ [0] = 0x05, [1] = 0x01 });
+		uint32_t v = *(volatile uint32_t *)(ucd.resp + 20);
 		con_hex2("UFS GETFI", "ocs=", g, "val=", v);
 		if (g == 0 && v == 0)
 			break;
