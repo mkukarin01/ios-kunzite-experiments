@@ -1,5 +1,52 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> MORNING HANDOFF (2026-10-21, 02:30) - kunzite-agent open issues - READ FIRST <<<
+
+**Where things stand:** boot #23 proved USB Ethernet + live console (0909). 0910 (log replay on
+request, paced sends) is committed but NOT yet CI-built: the last kernel artifact is d5f0c370
+(0909 only). The agent (agent/kunzite-agent.c, doc: rtk-tablet `ios/kunzite-agent.md`) is built
+but NOT installed in the root image yet (checked 2026-10-21: no /usr/libexec/kunzite-agent, no
+com.kunzite.agent in the launchd.plist cache).
+
+**Fixed tonight (commit c68e324):** `/get` on a FIFO wedged the single-threaded agent forever
+(open() blocked waiting for a writer; SO_RCVTIMEO/SO_SNDTIMEO do not help there). Now /get opens
+O_NONBLOCK and serves regular files only, /ls requires a directory, /put's temp file must be a
+plain file (O_NOFOLLOW). Verified on the Mac build: /get and /ls on a FIFO answer ERR, /ping
+answers afterwards, plain files download as before.
+
+**Open issues (all in h_run unless noted; reproduce with agent/build.sh mac, then run
+agent/out/kunzite-agent.mac and curl 127.0.0.1:8022):**
+1. **t= timeout does not stop the program.** `curl 'http://127.0.0.1:8022/run?a=/bin/sleep&a=20&t=2'`
+   prints `[timeout]` but returns after 20 s: when the poll loop times out, the reaping loop only
+   waits (its kill path is skipped once timed_out is already set). A program that never exits
+   wedges the agent for good. Expected: back after ~2 s, the program gone.
+2. **A vanished client is noticed only when the program writes.** Start
+   `curl '.../run?a=/bin/sleep&a=15&t=0'`, kill that curl after 1 s, then `curl .../ping`: it
+   answers only when sleep ends (14 s). The poll set has only the two pipes, not the client
+   socket. Expected: /ping answers within ~1 s.
+3. **No background mode** for long-running helpers (the planned os_log streamer would hold the
+   agent for the whole stream through /run). Design question for the morning: how such a helper
+   should be started and stopped, and where its output goes (the console = live USB log is the
+   natural sink).
+4. Minor: uploads over 1 MiB pause ~1 s (curl sends `Expect: 100-continue`, the agent never
+   answers it; workaround `curl -H 'Expect:' -T ...`).
+5. Minor: request log lines print a double slash (`GET //ping`): logf_ format "%s /%s" with a path
+   that already starts with '/'.
+6. Kernel, cosmetic: 0910-kunzite-usb-log-replay.patch has its main comment block pasted twice in
+   sweet_usb.c (comment only; fix whenever 0910 is regenerated).
+
+**Plan once the agent is settled (the user runs sudo/fastboot/GitHub):** push the fork + run CI
+(0910) -> `agent/build.sh` -> `sudo tools/root-add-agent-mac.sh` -> `tools/img2simg.py` ->
+`fastboot flash userdata` (DESTRUCTIVE: resets everything iOS saved on the phone since the last
+flash) -> boot #24 = #23 cmdline (sweetusb=2) with the new kernel -> `tools/kunzite-usbnet-mac.sh`
+-> `curl -s http://192.168.7.2:8022/ping`. Review notes from 2026-10-21: the binary is plain arm64,
+minos 16.0, libSystem only, cryptid 0, ldid XML entitlements (sweet_amfi accepts it on the root
+FS); the launchd job's keys all occur in real cached daemons except StandardOutPath (no cached
+daemon uses it - if the agent's lines never show in the USB log, that is why); syslogd is disabled
+on iOS 16, so the os_log helper should talk to diagnosticd (com.apple.os_trace_relay); stock tools
+the agent can /run: /bin/ps, /bin/df, /usr/sbin/ioreg, nvram, hidutil, vm_stat, zprint, footprint,
+spindump, sysdiagnose.
+
 ## >>> KUNZITE HANDOFF (2026-10-20 night) - READ THIS FIRST <<<
 
 **State:** POCO M8 5G (`kunzite`, SM6475 parrot, Gunyah hypervisor) boots this repo's xnu to the
