@@ -532,6 +532,16 @@ h_ls(struct req *r)
 		out(r, "ERR no p\n");
 		return;
 	}
+	/* never open() a non-directory here: a FIFO would block the agent */
+	struct stat st;
+	if (stat(p, &st) != 0) {
+		out(r, "ERR stat %s: %s\n", p, strerror(errno));
+		return;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		out(r, "ERR %s: not a directory (use /stat)\n", p);
+		return;
+	}
 	DIR *d = opendir(p);
 	if (!d) {
 		out(r, "ERR opendir %s: %s\n", p, strerror(errno));
@@ -566,11 +576,23 @@ h_get(struct req *r)
 		out(r, "ERR no p\n");
 		return;
 	}
-	int fd = open(p, O_RDONLY);
+	/*
+	 * Regular files only. O_NONBLOCK keeps open() itself from waiting (a FIFO
+	 * without a writer would block the single-threaded agent for good, and a
+	 * device could stream forever); programs that read devices go via /run.
+	 */
+	int fd = open(p, O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
 		out(r, "ERR open %s: %s\n", p, strerror(errno));
 		return;
 	}
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		out(r, "ERR %s: not a regular file\n", p);
+		close(fd);
+		return;
+	}
+	(void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
 	char buf[65536];
 	ssize_t n;
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
@@ -629,11 +651,19 @@ h_put(struct req *r)
 		out(r, "ERR mkdir parents: %s\n", strerror(errno));
 		return;
 	}
-	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+	/* the temp name must be (or become) a plain file: no FIFO, no symlink */
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK | O_NOFOLLOW, mode);
 	if (fd < 0) {
 		out(r, "ERR open %s: %s\n", tmp, strerror(errno));
 		return;
 	}
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		close(fd);
+		out(r, "ERR %s: not a regular file\n", tmp);
+		return;
+	}
+	(void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
 	int bad = write_all(fd, r->body, r->body_have) != 0;
 	if (close(fd) != 0) {
 		bad = 1;
