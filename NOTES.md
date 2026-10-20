@@ -287,6 +287,12 @@ tools/apply-owners.py (lchown + chmod, symlink-safe), tools/fix-owners-mac.sh (s
 root:wheel, manifest, builder-made paths, tweaks again, checks), mkiosroot-mac.sh fixed
 (-owners on, no docker). Then regenerate the simg, verify, reflash (5 min), boot #15.
 
+**Ownership fixed (2026-10-20 ~15:20):** `sudo tools/fix-owners-mac.sh ...img .../owners-real.json`
+-> owners applied 321,162, missing 47 (moved VirtualAudio plugin, excluded .file), errors 0;
+checks: dyld cache 0:80, launchd 0:0, mobile 501:501, diagnostics 272:272, systembag.kb 0:0,
+springboard.plist 501:501. simg regenerated, `tools/verify-simg.py` VERIFIED (205 chunks).
+Reflash (no -S), then boot #15 with the same shim/out/shim-boot-14.img.
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
