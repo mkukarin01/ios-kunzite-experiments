@@ -305,6 +305,21 @@ logo"), slow on cpus=1. The database persists on the root (rootrw=1): one-time c
 Next: boot #16 = same + `sweetfb_noconsole=1 sweetfb_hz=30` (shim/out/shim-boot-16.img) so the
 GUI stays visible; then cpus=8 as a separate experiment (secondary-core GICR setup untested here).
 
+**Boot #15 aftermath (2026-10-20 ~16:00): ~12 min in, a white screen, then the phone RESET** (into
+Android -> recovery "Can't load Android System": expected, userdata is HFS now). The shim log viewer
+(shim-boot-logview.img, commit cfad71f: reads SWEETLOG straight from UFS, 2x text pages) shows the
+last ~200 console lines: sample 6, SpringBoard + backboardd t11 still in the LaunchServices wait,
+then only the bluetoothd/fairplayd relaunch loop - no CRASH, no panic, no reboot message.
+Analysis: our kernel CANNOT reset the SoC (PE_halt_restart is NULL, no PSCI SYSTEM_RESET anywhere):
+a reboot request from iOS would panic on screen. So the reset came from below the kernel.
+kunzite runs **Gunyah** (dmesg: gh-watchdog bark 20 s / pet 15 s, enabled by Linux's driver; boot
+#12 held a panic overnight -> not armed at handoff). Suspect: the display path - the white screen came
+first, and topaz's display-off (DCS 0x28 via DSI DMA, AppleCLCD::setPanelOn) now hits the REAL parrot
+DSI0 (0131); it is guarded by fDsiBuf (<4 GiB alloc, likely NULL in the highmem-only window) but
+unproven. Boot #16 (shim/out/shim-boot-16.img): + sweetfb_stayon=1 (topaz's switch: ignore display-off
+requests), ufslogsecs=1 (lose <=1 s of log on a reset), sweetfb_noconsole=1 sweetfb_hz=30 (see the GUI).
+Also for M5: the SPMI PMIC arbiter is at 0xc42d000 (dmesg), PON on PMK8350 pon_hlos@1300.
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
