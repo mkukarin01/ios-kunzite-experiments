@@ -199,6 +199,24 @@ MORNING (in order):
 4. Then the M4 flash decision: `fastboot -S 512M flash userdata ios16-root-20H392.simg`
    (image ready; DESTRUCTIVE - only after UFS reads work and with explicit go).
 
+**UFS MATRIX v1-v5 (2026-10-20 morning, shim-side, no CI): the protocol is alive; the LUs refuse.**
+- v1: correct sense offsets revealed the real verdict: **04/02 "Logical Unit Not Ready,
+  initializing command required"** on every command to every LUN (the earlier "UPIU Fail
+  with empty sense" was our decode artifact). NOP OUT->NOP IN success. Queries failed 0xFE.
+- v2: (query function byte at offset 4 - wrong). v3: **query_func is UPIU byte 5** (QEMU/
+  Linux UtpUpiuHeader: iid_cmd_set_type=4, query_func=5) -> **READ_DESC device descriptor
+  SUCCESS** (raw bytes incl. the Samsung 0x01CE marker at resp+56); SET_FLAG fDeviceInit
+  -> 0xFF GENERAL_FAILURE; READ_FLAG fDeviceInit -> clear (val 0).
+- v4: START STOP UNIT also rejected (04/02 class).
+- v5: config descriptor read (idn 0x10) -> **0xFD INVALID_IDN**; INQUIRY, REPORT LUNS
+  (W-LUN 0x81), TUR on all LUNs: all 04/02. Device descriptor raw (resp[32..63]):
+  `00 00 00 59 04 06 00 00 05 01 00 01 00 04 01 00 25 10 20 02 03 02 01 00 1A 16 CE 01 03 00 00 02`.
+  CFG1 BIT31 set+stuck (no effect). Full UPIU field layout now proven against QEMU structs
+  (header 12B: trans/flags/lun/tag/iid_cst/query_func/resp/scsi_st/ehs/dev_inf/DSL;
+  query struct 12-31; data 32+).
+- Analysis workflow wf_fff9a73a-a61 (descriptor parse + driver lore + spec reasoning)
+  running for the v6 design.
+
 NEXT (in order):
 1. Push 0130 (commit 5aaaed1), run the `xnu` workflow, fetch the artifact.
 2. Boot #6 (same mkpayload cmdline). Watch for: `SWEET CPUFREQ: A55/A78 LUT best …`
