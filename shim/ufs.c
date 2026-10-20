@@ -352,23 +352,6 @@ void ufs_matrix(void)
 			break;
 	}
 
-	/*
-	 * The missing SCSI step: sense 04/02 "initializing command required"
-	 * is the LU asking for START STOP UNIT (as Linux's SCSI layer issues
-	 * to every UFS LU during scan). Start LUN 0, give it a beat, retry.
-	 */
-	static const uint8_t ssu[6] = { 0x1B, 0, 0, 0, 0x01, 0 };
-	rc = scsi(0, ssu, sizeof(ssu), 0, 0, &ocs, &st);
-	con_hex2("UFS SSU", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
-	if (rc == 0) {
-		for (int i = 0; i < 3; i++) {
-			rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-			con_hex2("UFS SSUT", "rc=", rc, "r/s=", (uint32_t)ucd.resp[6] << 8 | ucd.resp[7]);
-			if (rc == 0)
-				break;
-		}
-	}
-
 	/* ---- v5: enumeration forensics ---- */
 	/* full device-descriptor window (parse bNumberLU/bSpecVersion offline) */
 	zero(&ucd, sizeof(ucd));
