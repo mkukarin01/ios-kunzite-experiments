@@ -4,11 +4,13 @@
 # use), BSD cpio, and AOSP mkbootimg.py fetched to temp/ios-m8/tools/.
 # Diagnostics image when called with no argument; with a payload file as $1 it
 # is appended behind the 4K-aligned image end exactly like build.sh does.
+# SHIM_EXTRA adds compiler flags (e.g. -DLV_ONLY_SWEET: log viewer shows only
+# SWEET KEYS / SWEET HID lines).
 set -euo pipefail
 cd "$(dirname "$0")"
 PREFIX=aarch64-elf
 CC=$PREFIX-gcc
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra ${SHIM_EXTRA:-}"
 MKBOOTIMG=${MKBOOTIMG:-$HOME/Work/rtk-tablet/temp/ios-m8/tools/mkbootimg.py}
 [ -f "$MKBOOTIMG" ] || { echo "error: mkbootimg.py not found (set MKBOOTIMG)" >&2; exit 1; }
 mkdir -p out

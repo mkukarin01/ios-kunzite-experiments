@@ -4,24 +4,26 @@
 
 **State:** POCO M8 5G (`kunzite`, SM6475 parrot, Gunyah hypervisor) boots this repo's xnu to the
 **iOS 16.7.16 lock screen in < 2 min on all 8 cores**, root = iPhone X HFS+ image flashed into
-`userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). No input (keys/touch off),
-no GPU (CPU render), black wallpaper + red clock (see "colours" below). Branch `kunzite`, forked
+`userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). **Buttons work (0133,
+boot #18): power, vol+, vol-**; touch still off. No GPU (CPU render), black wallpaper + red clock
+(boot #19 tries the sRGB gamut fix). Branch `kunzite`, forked
 from MakrSas/ios-topaz @ 590f001; our patches 0127-0132 (see below). Chronological log below.
 
 **Standard boot** (phone in the BOOTLOADER fastboot = Power+VolDown; recovery's "Enter fastboot" is
 fastbootd, which rejects `boot` -> `fastboot reboot bootloader`):
-`fastboot boot shim/out/shim-boot-17.img` = kernel artifact with 0132 + `shim/out/kunzite.adt`
+`fastboot boot shim/out/shim-boot-18.img` = kernel artifact with 0133 + `shim/out/kunzite.adt`
 (`tools/mkadt.py OUT --highmem`: RAM 0x900000000 + 6 GiB, vtimer INTID 27) + cmdline
 `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1
 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
-sweetkeys=0 sweettouch=0 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1`.
-Build: `python3 tools/mkpayload.py xnu/out/xnu-kernel/kernel.development.sweet shim/out/kunzite.adt
+sweettouch=0 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1` (boot #17 had
+`sweetkeys=0` too; #19 = #18 with the sRGB ADT). Build: `python3 tools/mkpayload.py xnu/out/xnu-kernel/kernel.development.sweet shim/out/kunzite.adt
 shim/out/payload.bin --cmdline '...'` then `shim/build-mac.sh out/payload.bin` (payload path is
 relative to shim/; macOS build: brew aarch64-elf-gcc + temp/ios-m8/tools/mkbootimg.py).
 
-**Must-keep switches and why:** `sweetkeys=0 sweettouch=0` (topaz key/touch drivers map SM6225
-addresses -> data abort, boot #13); `sweetfb_stayon=1` (display-off = topaz DCS via the real parrot
-DSI0 -> white screen + SoC reset, boot #15); vtimer INTID 27 (the DT's PPI14/30 never delivers to
+**Must-keep switches and why:** `sweettouch=0` (topaz's touch driver maps SM6225 addresses -> data
+abort, boot #13; the key driver was the same until 0133); `sweetfb_stayon=1` (display-off = topaz DCS via the real parrot
+DSI0 -> white screen + SoC reset, boot #15; side effect: power-to-lock leaves the last frame on the panel, like an always-on display,
+and the next press wakes iOS and redraws it - real screen-off needs a safe parrot DSI path); vtimer INTID 27 (the DT's PPI14/30 never delivers to
 EL1, boots #10/#11); never touch CNTP_* at EL1 (Gunyah traps it: undefined instruction).
 
 **Debug loop:** panic on screen -> `nm -n` / `xcrun llvm-objdump -d --start-address=` against the CI
@@ -41,7 +43,7 @@ temp/ios-m8/ios16-root-20H392.{img,simg}, owners: temp/ios-m8/rootbuild.6iw7ol/o
 0080/0082), 0129 skip CNTP mask (Gunyah), 0130 parrot EPSS read-only + static battery, 0131 parrot
 DSI0 + scanout maps off, 0132 UFS wake (SSU Active to W-LUN 0xD0: ABL leaves UFS in PowerDown).
 
-**NEXT - M5 buttons (start here):** port the SPMI read path to PMIC arbiter **v7** (Linux 6.6
+**M5 buttons - DONE (boot #18), reference:** port the SPMI read path to PMIC arbiter **v7** (Linux 6.6
 spmi-pmic-arb.c, copy in temp/ios-m8/): bases from the live FDT - cnfg 0xc42d000, core 0xc400000
 (VERSION at +0, expect >= 0x70000000), chnls 0xc500000, obsrvr 0xc440000, intr 0xc4c0000, ee 0.
 APID map: core + 0x2000 + 4*apid, ppid = (val >> 8) & 0xFFF, entry 0 = unused; owner = cnfg + 4*apid
@@ -49,16 +51,17 @@ APID map: core + 0x2000 + 4*apid, ppid = (val >> 8) & 0xFFF, entry 0 = unused; o
 obsrvr + 0x8000*ee + 0x20*apid; CMD +0x00 = (1 << 27) | ((addr & 0xff) << 4) | (bytes-1),
 poll STATUS +0x08 bit0, RDATA0 +0x18. ppid = (sid << 8) | (addr >> 8). Keys: power = SID0 0x1310
 bit7, vol-down (resin) = SID0 0x1310 bit6 (PMK8350 pon_hlos@1300), vol-up = SID1 0x8810 bit0
-(PM6450 GPIO1, pull-up, active LOW). **DONE as patch 0133 (sweet_keys.c; dry-run clean, not yet
-CI-built): push -> CI -> boot with `sweetkeys=0` REMOVED** (keep sweettouch=0); expect `SWEET KEYS:
-arb=0x7... pon-apid=.. vol+-apid=..` and `SWEET KEYS: key=N down=1` on presses (0 power, 1 vol+,
-2 vol-). sweet_spmi.c (battery path, SM7150 addresses) stays unused (static battery). Then: PMK8350 RTC for the
-date; touch = Goodix GT9916K (brl-d) on SPI QUP1 SE9 0xa8c000, IRQ GPIO65, reset 131, IOVDD 38,
+(PM6450 GPIO1, pull-up, active LOW). **Patch 0133 (sweet_keys.c), proven on boot #18**: all
+three keys reach iOS (volume HUD, power locks/wakes). Log lines `SWEET KEYS: arb=0x7... pon-apid=..
+vol+-apid=..`, `SWEET KEYS: key=N down=D` (0 power, 1 vol+, 2 vol-), `SWEET HID: key 0x.. (N
+clients)`; keys-only log viewer: `SHIM_EXTRA=-DLV_ONLY_SWEET shim/build-mac.sh` ->
+shim/out/shim-boot-logkeys.img. sweet_spmi.c (battery path, SM7150 addresses) stays unused (static
+battery). **NEXT:** PMK8350 RTC for the date; touch = Goodix GT9916K (brl-d) on SPI QUP1 SE9 0xa8c000, IRQ GPIO65, reset 131, IOVDD 38,
 firmware goodix_3rd_firmware.bin + goodix_3rd_cfg_group.bin (from the LOS vendor partition).
 
 **Upstream topaz since 590f001 (on the plate, not merged):** mkadt `artwork-display-gamut sRGB`
-(iOS draws P3 layers into 10-bit surfaces we lack - prime suspect for the RED clock; ADT-only,
-try first); 0128 iokit-quiesce (generic, take); 0127 sweetbusy diagnostic (touches
+(iOS draws P3 layers into 10-bit surfaces we lack - prime suspect for the RED clock; ADT-only:
+APPLIED to our tools/mkadt.py, boot #19 = first test); 0128 iokit-quiesce (generic, take); 0127 sweetbusy diagnostic (touches
 SweetFramebuffer.cpp: may need 0131 regenerated); 0129/0130 WLAN station on WCN3988 (reference
 only); mkadt `/arm-io/wlan` node (SKIP until Wi-Fi: wifid would crash-loop). Upstream numbers
 0127-0130 collide with ours: move kunzite patches to their own range (e.g. 0900+) before merging.
@@ -411,6 +414,15 @@ launchd_unsecure_cache=1 wdt=-1 sweetkeys=0 sweettouch=0 sweetfb_noconsole=1 swe
 sweetfb_stayon=1 ufslogsecs=1`. Log viewer v2 (whole ring, noise filtered): shim-boot-logview2.img.
 Next: stability soak, then M5 input (keys via SPMI 0xc42d000 / PMK8350 PON 0x1300; Goodix GT9916K
 touch on SPI SE9 0xa8c000), RTC from the PMIC, wallpaper/red-clock question.
+
+**BOOT #18 (2026-10-20 18:31, shim-boot-18.img): BUTTONS WORK** - kernel from the fork tip (0133,
+artifact sha256 283b12cb...), boot #17's cmdline minus `sweetkeys=0`. After a 20-minute lock-screen
+soak on boot #17 with no issues. User report: volume up and down work; power works (wakes and
+redraws the lock screen: the date/clock update on each press). With `sweetfb_stayon=1` the panel is
+never switched off, so "locked" looks like an always-on display. A blue icon near the battery
+pulses on power presses (unidentified, maybe colour-shifted by the P3/sRGB issue).
+Next: boot #19 = same + ADT `artwork-display-gamut sRGB` (upstream topaz 3eacb48), for the black
+wallpaper / red clock.
 
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
