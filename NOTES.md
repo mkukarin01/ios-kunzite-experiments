@@ -237,6 +237,19 @@ MORNING (in order):
   ufs_take_over_host(), before the first TUR; UTRLCLR timeout write fixed (write-1-to-clear,
   was ~1u); failure prints now include the LUN and sense key/ASC/ASCQ. Dry-run applied clean.
 
+**BOOT #13 (2026-10-20 ~14:50, kernel with 0132): the kernel reads the UFS.**
+`SWEET UFS: device power mode Active (SSU to W-LUN 0xD0): ok`, GPT on LUN 0 read with valid CRCs,
+`"userdata" on LUN 0: first block 0x305b28, 473092 MiB, read-write` (matches the GPT dump: 3,169,064).
+NOTE: with ufsrw=1 the persistent log then writes the last 4 MiB + 4 KiB of userdata every 10 s
+(sweet_log_start) - boots that must not touch userdata need `sweetlog=0` (or ufsrw=0).
+Then a kernel data abort in `sweet_keys_init+0xac`: topaz's PM6125 SPMI key driver maps topaz
+addresses (core 0x01c40000, obs 0x03e00000, cnfg 0x01c0a000) that do not exist on parrot; the
+topaz FT5452 touch driver (sweet_touch_init, right before it) is also wrong hardware for kunzite
+(Goodix GT9916K on SPI SE9). Both have boot-arg switches: boot #14 adds `sweetkeys=0 sweettouch=0`
+(image shim/out/shim-boot-14.img, no CI needed). Porting the keys to kunzite (PMK8350 PON + SPMI
+GPIO, real SPMI arbiter base from the live FDT) is M5 work.
+User (2026-10-20): LineageOS holds no user data and may be wiped -> M4 flash is next.
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
