@@ -273,6 +273,20 @@ no user data); Android needs `fastboot -w` / recovery format to boot again.
 Boot #14 started right after: shim/out/shim-boot-14.img (kernel 0132, kunzite.adt --highmem,
 cpus=1, sweetkeys=0 sweettouch=0, console on).
 
+**BOOT #14 (2026-10-20 ~15:40, flashed root): M4 ACHIEVED - xnu mounted the iOS root from UFS.**
+launchd (pid 1) ran libignition (`hello from launchd.1`, dylib_cache found
+/System/Library/Caches/com.apple.dyld), then the kernel refused to map the shared cache:
+`not in trust cache` (expected; lp-sip0 relaxes it) and **`owned by uid=501 instead of 0`** ->
+launchd: `Library not loaded: /usr/lib/libSystem.B.dylib` -> panic `initproc failed to start`.
+Cause: EVERY file in the macOS-built image is 501:20. The IPSW dmgs were attached without
+`-owners on`, so the ownership manifest recorded the Mac user for all 321,213 paths, and the
+docker replay could not have helped anyway (Docker Desktop bind mounts drop chown).
+Fix: tools/capture-owners.py (real manifest, temp/ios-m8/rootbuild.6iw7ol/owners-real.json:
+311,912 root, 9,270 mobile, _logd 272 ...; refuses a one-owner manifest),
+tools/apply-owners.py (lchown + chmod, symlink-safe), tools/fix-owners-mac.sh (sudo: all
+root:wheel, manifest, builder-made paths, tweaks again, checks), mkiosroot-mac.sh fixed
+(-owners on, no docker). Then regenerate the simg, verify, reflash (5 min), boot #15.
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect

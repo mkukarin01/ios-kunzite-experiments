@@ -9,13 +9,14 @@
 #   apfs-fuse            -> hdiutil attach (macOS mounts APFS/UDIF natively)
 #   truncate + mkfs.hfs  -> hdiutil create -type SPARSE -layout NONE -fs HFS+J
 #   rsync -aH (root)     -> rsync -a --no-D (user; no device nodes - devfs makes
-#                           them) + an ownership manifest replayed as root inside
-#                           a docker container (tools/apply-owners.py)
+#                           them) + an ownership manifest (tools/capture-owners.py,
+#                           dmgs attached with -owners on) replayed afterwards by
+#                           `sudo tools/fix-owners-mac.sh` (not docker: Docker
+#                           Desktop bind mounts silently drop chown)
 #   fsck.hfsplus         -> fsck_hfs (both are Apple's)
 #   img2simg             -> tools/img2simg.py
-# Ownership matters (mobile=501, _logd=272, appuidd=33...): captured from the
-# read-only IPSW mounts, replayed after the copy together with
-# tools/sweet-root-tweaks.py in the container. Bash 3.2 compatible.
+# Ownership matters (root, mobile=501, _logd=272, ...). The tweaks
+# (tools/sweet-root-tweaks.py) run inside fix-owners-mac.sh. Bash 3.2 compatible.
 set -euo pipefail
 
 [[ $# -ge 2 ]] || { sed -n '2,17p' "$0"; exit 2; }
@@ -23,7 +24,7 @@ ipsw=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 out=$2; size=${3:-16G}
 [[ ! -e $out && ! -e $out.sparseimage ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-# Under the repo (temp/): inside /Users, so the docker bind mounts always work.
+# Under the repo (temp/), next to the other kunzite artifacts.
 work=$(mktemp -d /Users/oxa1/Work/rtk-tablet/temp/ios-m8/rootbuild.XXXXXX)
 vol="$work/root"
 mkdir -p "$vol"
@@ -67,7 +68,7 @@ srcbase() {
 }
 attach_ro() {
 	mkdir -p "$3"
-	hdiutil attach "$work/$2.dmg" -readonly -nobrowse -mountpoint "$3" >/dev/null
+	hdiutil attach "$work/$2.dmg" -readonly -owners on -nobrowse -mountpoint "$3" >/dev/null
 	mounts+=("$3")
 }
 attach_ro "${dmgs[0]}" os "$work/os"
@@ -76,25 +77,9 @@ attach_ro "${dmgs[2]}" appos "$work/appos"
 os_src=$(srcbase "$work/os"); sysos_src=$(srcbase "$work/sysos"); appos_src=$(srcbase "$work/appos")
 echo "sources: $os_src | $sysos_src | $appos_src"
 
-# --- ownership manifest from the read-only mounts ---
-python3 - "$os_src" '' "$sysos_src" 'private/preboot/Cryptexes/OS' "$appos_src" 'private/preboot/Cryptexes/App' "$work/owners.json" <<'PYEOF'
-import json, os, sys
-manifest = {}
-pairs = [(sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4]), (sys.argv[5], sys.argv[6])]
-for base, name in pairs:
-    for dirpath, dirs, files in os.walk(base):
-        rel = os.path.relpath(dirpath, base)
-        for entry in ('.',) + tuple(dirs) + tuple(files):
-            p = os.path.join(dirpath, entry)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            r = name if entry == '.' else os.path.normpath(os.path.join(name, rel, entry))
-            manifest[r.lstrip('/')] = [st.st_uid, st.st_gid, st.st_mode & 0o7777]
-json.dump(manifest, open(sys.argv[7], 'w'))
-print('manifest entries:', len(manifest))
-PYEOF
+# --- ownership manifest from the read-only mounts (-owners on, see header) ---
+python3 "$here/capture-owners.py" "$work/owners.json" "$os_src" '' \
+	"$sysos_src" private/preboot/Cryptexes/OS "$appos_src" private/preboot/Cryptexes/App
 
 # --- target: bare journaled case-sensitive HFS+, no partition map ---
 hdiutil create "$work/out.sparseimage" -type SPARSE -layout NONE \
@@ -156,24 +141,13 @@ chmod 0700 "$vol/private/var/keybags"
 
 df -h "$vol"
 
-# --- ownership replay + bring-up tweaks, as root inside docker ---
-if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
-	docker run --rm -v "$vol:/r" -v "$here:/tools" -v "$work:/w" python:3-slim \
-		sh -c 'python3 /tools/apply-owners.py /w/owners.json /r && python3 /tools/sweet-root-tweaks.py /r' || \
-		echo "WARNING: container pass failed - apply manually before flashing" >&2
-else
-	echo 'WARNING: docker unavailable - ownership and tweaks NOT applied.' >&2
-	echo "later, as root: python3 $here/apply-owners.py $work/owners.json $vol && python3 $here/sweet-root-tweaks.py $vol" >&2
-fi
-
 hdiutil detach "$vol" -force >/dev/null
 mounts=("${mounts[@]:1}")
 # hdiutil convert appends .dmg to -o names: ask for it, then strip it.
 hdiutil convert "$work/out.sparseimage" -format UDRW -o "$out.dmg" >/dev/null
 mv "$out.dmg" "$out"
 rm -f "$work/out.sparseimage"
-fsck_hfs -y "$out" >/dev/null || true
-fsck_hfs -n "$out" 2>&1 | tail -1
-python3 "$here/img2simg.py" "$out" "$out.simg"
-ls -l "$out" "$out.simg"
-shasum -a 256 "$out" | tee "$out.sha256"
+echo
+echo "image: $out (files still owned by you). Next:"
+echo "  sudo $here/fix-owners-mac.sh $out $work/owners.json"
+echo "  $here/img2simg.py $out ${out%.img}.simg"
