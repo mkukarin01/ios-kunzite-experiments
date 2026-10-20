@@ -20,39 +20,24 @@ MAX_RAW = 64 << 20      # cap per raw chunk
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     blk = int(sys.argv[3]) if len(sys.argv) > 3 else 4096
+    # Pass 1: runs of zero / non-zero SCAN-sized pieces; raw runs split at
+    # MAX_RAW. (The first version dropped a trailing raw run and wrote
+    # chunk sizes without the 12-byte header - both broke fastboot.)
     total_blks = 0
     chunks = []          # (type, length_bytes)
-
     with open(src, 'rb') as f:
-        zero = bytes(SCAN)
-        pending_raw = 0
         while True:
             buf = f.read(SCAN)
             if not buf:
                 break
-            if len(buf) < SCAN:
-                buf += b'\0' * (SCAN - len(buf))
-            if buf == zero:
-                if pending_raw:
-                    while pending_raw:
-                        take = min(pending_raw, MAX_RAW)
-                        chunks.append((CHUNK_TYPE_RAW, take))
-                        pending_raw -= take
-                if chunks and chunks[-1][0] == CHUNK_TYPE_DONT_CARE:
-                    chunks[-1] = (CHUNK_TYPE_DONT_CARE, chunks[-1][1] + len(buf))
-                else:
-                    chunks.append((CHUNK_TYPE_DONT_CARE, len(buf)))
+            if len(buf) % blk:
+                buf += b'\0' * (blk - len(buf) % blk)
+            ctype = CHUNK_TYPE_DONT_CARE if buf.count(0) == len(buf) else CHUNK_TYPE_RAW
+            if chunks and chunks[-1][0] == ctype and \
+                    (ctype == CHUNK_TYPE_DONT_CARE or chunks[-1][1] + len(buf) <= MAX_RAW):
+                chunks[-1] = (ctype, chunks[-1][1] + len(buf))
             else:
-                if pending_raw == 0 and chunks and chunks[-1][0] == CHUNK_TYPE_RAW \
-                        and chunks[-1][1] < MAX_RAW:
-                    room = MAX_RAW - chunks[-1][1]
-                    chunks[-1] = (CHUNK_TYPE_RAW, chunks[-1][1] + min(room, len(buf)))
-                    pending_raw = len(buf) - min(room, len(buf))
-                else:
-                    pending_raw += len(buf)
-                    while pending_raw >= MAX_RAW:
-                        chunks.append((CHUNK_TYPE_RAW, MAX_RAW))
-                        pending_raw -= MAX_RAW
+                chunks.append((ctype, len(buf)))
             total_blks += len(buf) // blk
 
     with open(src, 'rb') as f, open(dst, 'wb') as o:
@@ -60,7 +45,10 @@ def main():
                             total_blks, len(chunks), 0))
         for ctype, ln in chunks:
             nblk = ln // blk
-            o.write(struct.pack('<2H2I', ctype, 0, nblk, ln if ctype == CHUNK_TYPE_RAW else 0))
+            # total_sz counts the 12-byte chunk header too (libsparse checks it)
+            o.write(struct.pack('<2H2I', ctype, 0, nblk, 12 + (ln if ctype == CHUNK_TYPE_RAW else 0)))
+            if ctype == CHUNK_TYPE_DONT_CARE:
+                f.seek(ln, 1)       # keep the source in step with the chunks
             if ctype == CHUNK_TYPE_RAW:
                 left = ln
                 while left:

@@ -250,6 +250,16 @@ topaz FT5452 touch driver (sweet_touch_init, right before it) is also wrong hard
 GPIO, real SPMI arbiter base from the live FDT) is M5 work.
 User (2026-10-20): LineageOS holds no user data and may be wiped -> M4 flash is next.
 
+**M4 flash, attempt 1 (user, 2026-10-20 ~15:00): failed before sending anything.** Two causes:
+the runbook gave a path relative to the rtk-tablet root while the terminal was in
+ios-topaz-experiments, and the overnight `tools/img2simg.py` was broken (chunk total_sz without
+the 12-byte header, trailing raw run dropped, no seek past don't-care runs). Fixed and
+round-trip-tested (5 shapes byte-identical); the bad 12 GB file is renamed
+`*.simg.BROKEN-headers`. The flash uses the RAW image (fastboot -S re-sparses it with libsparse):
+`fastboot -S 512M flash userdata /Users/oxa1/Work/rtk-tablet/temp/ios-m8/ios16-root-20H392.img`
+(volume checked: HFSX 'HX' v5, journaled, cleanly unmounted, 16 GiB). Then boot #14:
+`fastboot boot shim/out/shim-boot-14.img` (sweetkeys=0 sweettouch=0).
+
 NEXT (in order):
 1. Push kunzite, run the `xnu` workflow, fetch the artifact (0132).
 2. Boot #13 (same payload cmdline, kunzite.adt --highmem): expect
