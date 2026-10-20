@@ -1,28 +1,29 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> KUNZITE HANDOFF (2026-10-20 evening) - READ THIS FIRST <<<
+## >>> KUNZITE HANDOFF (2026-10-20 night) - READ THIS FIRST <<<
 
 **State:** POCO M8 5G (`kunzite`, SM6475 parrot, Gunyah hypervisor) boots this repo's xnu to the
 **iOS 16.7.16 lock screen in < 2 min on all 8 cores**, root = iPhone X HFS+ image flashed into
 `userdata` (LU0 = sda). Clock runs (date = epoch + uptime: no RTC yet). **Buttons work (0907,
-boot #18) and TOUCH WORKS (0908, boot #21): unlock, home screen, Settings/Messages/Photos open.** No GPU (CPU render), black wallpaper; the clock is
-red until the first power press, then white (sRGB gamut, boot #19, changed neither). Branch `kunzite`, forked
-from MakrSas/ios-topaz @ 590f001, merged with upstream d8c82d9 (0139) on branch
-kunzite-topaz-0139; our patches are 0901-0908 (see below). Chronological log below.
+boot #18) and TOUCH WORKS (0908, boot #21): unlock, home screen, Settings/Messages/Photos open.**
+No GPU (CPU render, some redraw artifacts), black wallpaper; the clock is red until the first power
+press, then white (sRGB gamut, boot #19, changed neither). Branch `kunzite`, forked from
+MakrSas/ios-topaz @ 590f001, merged with upstream d8c82d9 (0139, boot #22, kept); our patches are
+0901-0908 (see below). Chronological log below.
 
 **Standard boot** (phone in the BOOTLOADER fastboot = Power+VolDown; recovery's "Enter fastboot" is
 fastbootd, which rejects `boot` -> `fastboot reboot bootloader`):
-`fastboot boot shim/out/shim-boot-18.img` = kernel artifact with 0133 + `shim/out/kunzite.adt`
+`fastboot boot shim/out/shim-boot-22.img` = kernel artifact 4c641f3c (kunzite = upstream 0139 +
+0901-0908) + `shim/out/kunzite.adt`
 (`tools/mkadt.py OUT --highmem`: RAM 0x900000000 + 6 GiB, vtimer INTID 27) + cmdline
 `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1
 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
-sweettouch=0 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1` (boot #17 had
-`sweetkeys=0` too; #19 = #18 with the sRGB ADT). Build: `python3 tools/mkpayload.py xnu/out/xnu-kernel/kernel.development.sweet shim/out/kunzite.adt
+sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1` (keys and touch on by default;
+`sweetkeys=0` / `sweettouch=0` switch them off). Build: `python3 tools/mkpayload.py xnu/out/xnu-kernel/kernel.development.sweet shim/out/kunzite.adt
 shim/out/payload.bin --cmdline '...'` then `shim/build-mac.sh out/payload.bin` (payload path is
 relative to shim/; macOS build: brew aarch64-elf-gcc + temp/ios-m8/tools/mkbootimg.py).
 
-**Must-keep switches and why:** `sweettouch=0` (topaz's touch driver maps SM6225 addresses -> data
-abort, boot #13; the key driver was the same until 0133); `sweetfb_stayon=1` (display-off = topaz DCS via the real parrot
+**Must-keep switches and why:** `sweetfb_stayon=1` (display-off = topaz DCS via the real parrot
 DSI0 -> white screen + SoC reset, boot #15; side effect: power-to-lock leaves the last frame on the panel, like an always-on display,
 and the next press wakes iOS and redraws it - real screen-off needs a safe parrot DSI path); vtimer INTID 27 (the DT's PPI14/30 never delivers to
 EL1, boots #10/#11); never touch CNTP_* at EL1 (Gunyah traps it: undefined instruction).
@@ -32,7 +33,7 @@ artifact; kernel sources with all patches = the artifact's buildtree (temp/ios-m
 User-space addresses: `ipsw dyld a2s <root image>/System/Library/Caches/com.apple.dyld/
 dyld_shared_cache_arm64 <addr - slide>`. Persistent log (last 4 MiB of userdata): boot
 `shim/out/shim-boot-logview2.img` (shim reads it from UFS, noise filtered, 3 pages; recovery adb is
-unauthorized now). Patches: edit a pristine copy, difflib -> xnu/patches/NNNN, `patch -p1 --dry-run`.
+unauthorized now); input-only view (SWEET KEY/HID/TOUCH lines): shim/out/shim-boot-loginput.img. Patches: edit a pristine copy, difflib -> xnu/patches/NNNN, `patch -p1 --dry-run`.
 
 **Root image:** `tools/mkiosroot-mac.sh IPSW OUT.img` -> `sudo tools/fix-owners-mac.sh OUT.img
 owners.json` (REAL owners: dmgs attached with -owners on; docker chown is a no-op) ->
@@ -66,14 +67,13 @@ shim/out/shim-boot-logkeys.img. sweet_spmi.c (battery path, SM7150 addresses) st
 battery). **NEXT:** PMK8350 RTC for the date; touch = Goodix GT9916K (brl-d) on SPI QUP1 SE9 0xa8c000, IRQ GPIO65, reset 131, IOVDD 38,
 firmware goodix_3rd_firmware.bin + goodix_3rd_cfg_group.bin (from the LOS vendor partition).
 
-**Upstream topaz merge (2026-10-20 night, branch kunzite-topaz-0139, NOT yet booted):** all of
+**Upstream topaz merge (2026-10-20 night; booted as #22 and KEPT, kunzite fast-forwarded):** all of
 upstream through 0139 (d8c82d9): 0127 sweetbusy diagnostic, 0128 iokit-quiesce, 0129/0130 WLAN
 (inert: TopazModem runs only with boot-arg modem=1), 0131-0137/0139 SweetSurface (IOSurface
 emulation: client memory/wrapped surfaces, values/attachments CoreAnimation's GL renderer reads -
 upstream: "icons were blank under the GL renderer"), 0138 empty IOAcceleratorES (no 30 s wait at
 every backboardd start). mkadt: sRGB was already ours; upstream's `/arm-io/wlan` node is opt-in
-here (`--wlan`), default ADT unchanged. Test plan: boot it after the touch test on plain kunzite;
-expect a faster lock screen, maybe the wallpaper; then fast-forward kunzite to it.
+here (`--wlan`), default ADT unchanged. Boot #22 result below.
 
 **Gotchas:** the fork's origin is mkukarin01/ios-topaz-experiments (user pushes + runs CI; artifacts
 need GitHub auth -> user downloads to xnu/out/xnu-kernel/). Boots that must not write userdata need
@@ -465,7 +465,17 @@ Settings, Messages and Photos - all fine. Power button locks "on the 2nd press" 
 already slept the display, stayon kept the frame visible, press 1 = wake). Some redraw artifacts
 when switching between apps/spaces (CPU rendering). No log read this time.
 **BOOT #22 (2026-10-20 23:33, shim-boot-22.img, kernel 4c641f3c..., branch kunzite-topaz-0139 @
-de778a9 = upstream 0139 merge + 0901-0908):** same cmdline and ADT as #21. Result pending.
+de778a9 = upstream 0139 merge + 0901-0908):** same cmdline and ADT as #21. User: boot time no
+visible difference (not timed), wallpaper still black, icons fine (were fine on #21 too), switching
+between apps/spaces SMOOTHER (the second swipe leaves no artifacts), power still locks on the 2nd
+press, volume fine. One regression-ish note: Settings > General > About opened immediately on #21,
+took a while on #22. Decision: keep the merge; `kunzite` fast-forwarded to it.
+
+**NEXT (candidates):** RTC/date (PMK8350 RTC + boot-time offset); real screen-off (a safe DCS path
+on the parrot DSI0, then drop sweetfb_stayon); black wallpaper (upstream topaz: check whether its
+lock screen has one; PosterBoard/wallpaper renderer logs); About-pane slowness on #22 (sweetbusy=N
+from upstream 0127 shows who keeps IOKit busy); Wi-Fi is a big separate job (parrot WCN, not
+topaz's WCN3988).
 
 **BOOT #19 (2026-10-20 ~19:15, shim-boot-19.img, user-typed fastboot): sRGB gamut - no visible
 change.** Same kernel as #18 (283b12cb; the later CI artifact 0da72d25 has no kernel source change),
