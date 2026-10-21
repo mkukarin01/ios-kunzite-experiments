@@ -13,6 +13,17 @@ crashes (user); afterwards 3 % left, charging before the agent flash (do not fla
 near-empty battery; whether our kernel charges at all is unknown - SweetBattery is static, so
 charge powered off or in the bootloader).
 
+**BOOT #24 (2026-10-22 02:37, shim-boot-23.img on the NEW userdata with the agent): AGENT WORKS.**
+Flash: `fastboot flash userdata temp/ios-m8/ios16-root-20H392-agent.simg`, 37 sparse pieces, 324 s,
+all OKAY. `fastboot boot` then took 102.7 s to say OKAY (usual 0.3 s; ABL busy after the big write?
+the boot itself was normal). USB link 28 s later; `curl http://192.168.7.2:8022/ping` ->
+`kunzite-agent 1 pid 90 uid 0` 4 s after that. launchd honours StandardOutPath=/dev/console: the
+agent's own lines ("on tcp/8022 ...", "GET /ping from 192.168.7.1") are in the live USB log
+(temp/ios-m8/usblog/live-boot24-*.txt). /ps: 156 processes incl. SpringBoard (uid 501),
+backboardd, logd; CrashReporter dir empty (fresh userdata); the live log shows only driverkitd
+crashes during boot. Live log listener: `tools/udp-log.py FILE --no-replay` (kernel d5f0c370 has no
+0910 replay yet).
+
 **Agent image ready (2026-10-22 02:10):** agent built from 8e4cb88 (sha256 12dbe7c7...), installed
 by `sudo tools/root-add-agent-mac.sh` into temp/ios-m8/ios16-root-20H392.img (checked read-only:
 /usr/libexec/kunzite-agent 0:0 0755 same hash, com.kunzite.agent in launchd.plist, 531 daemons);
