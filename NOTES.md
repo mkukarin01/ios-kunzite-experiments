@@ -24,6 +24,25 @@ backboardd, logd; CrashReporter dir empty (fresh userdata); the live log shows o
 crashes during boot. Live log listener: `tools/udp-log.py FILE --no-replay` (kernel d5f0c370 has no
 0910 replay yet).
 
+**GRAPHICS OVERNIGHT (2026-10-22, user asleep): three tier branches, none pushed/built.**
+Plan + rationale: main repo ios/gpu-plan.md (private). Branches off kunzite 69446d0, each +1 patch,
+series-verified (152 applied):
+- `t01-panel-diag` (3230b0d, 0911): read-only dump of the running display pipe (DSI0 ctrl,
+  SDE ctl0/vig0/lm0/intf_1/tear/pp0), sweetpaneldiag=1 default. **PUSH THIS FIRST** - its dump
+  picks the DCS registers (0912 sanity gate) and the flip register set (0913).
+- `t02-screenoff` (57e4e0e, 0912): topaz's DCS path made real - packet page at the splash tail
+  (fPhys + 0x2b00000 - 0x1000; kernel RAM is all >4 GiB so the <4G buffer never allocated and
+  every DCS write silently no-oped). Off/on 0x28/0x29 only with `sweetfb_off=1` (stayon stays the
+  outer gate; boot #15's reset was such a write). Brightness 0x51 behind sweetbl as before.
+- `t03-dpu-flip` (a79cc59, 0913): skeleton, `sweetfb_flip=1` maps the MDP window and read-only
+  probes SSPP0 during swaps; second scanout buffer = fPhys + 0x1000000. No MDP writes yet.
+Boot order: t01 first (any boot, default cmdline; read SWEET DIAG lines in the USB log), then t02
+(boot WITHOUT sweetfb_stayon, WITH sweetfb_off=1: expect panel off on lock; recovery = reboot),
+t03 after. T0.1 FINDING (agent, phone): **the "black wallpaper" is no wallpaper at all**
+(springboard.plist SBHome/LockScreenWallpapers = 'none', kSBProceduralWallpaperHomeUserSetKey
+False) - set one in Settings to close that mystery; the red-until-wake tint is still open.
+shim-boot-25.img (panic region) is unbuilt-by-CI but ready to boot any time.
+
 **ROADMAP FACTS (2026-10-22, live FDT/dmesg):** battery = `qcom,battery-charger` under
 `qcom,pmic_glink` (ADSP firmware owns gauge/charger; a proper driver needs ADSP PAS boot + GLINK +
 battmgr protocol; quick option = estimate from raw PMIC values over SPMI if readable; open: does
