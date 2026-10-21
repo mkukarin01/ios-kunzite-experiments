@@ -13,6 +13,14 @@ crashes (user); afterwards 3 % left, charging before the agent flash (do not fla
 near-empty battery; whether our kernel charges at all is unknown - SweetBattery is static, so
 charge powered off or in the bootloader).
 
+**Agent image ready (2026-10-22 02:10):** agent built from 8e4cb88 (sha256 12dbe7c7...), installed
+by `sudo tools/root-add-agent-mac.sh` into temp/ios-m8/ios16-root-20H392.img (checked read-only:
+/usr/libexec/kunzite-agent 0:0 0755 same hash, com.kunzite.agent in launchd.plist, 531 daemons);
+sparse image temp/ios-m8/ios16-root-20H392-agent.simg VERIFIED identical (205 chunks). The old
+ios16-root-20H392.simg (no agent) is the fallback. Flash: `fastboot flash userdata
+temp/ios-m8/ios16-root-20H392-agent.simg` (no -S), then boot #24 = shim-boot-23.img (kernel
+d5f0c370, sweetusb=2) and `curl http://192.168.7.2:8022/ping`. Mac disk is down to 8.5 GiB free.
+
 **Fixed tonight (commit c68e324):** `/get` on a FIFO wedged the single-threaded agent forever
 (open() blocked waiting for a writer; SO_RCVTIMEO/SO_SNDTIMEO do not help there). Now /get opens
 O_NONBLOCK and serves regular files only, /ls requires a directory, /put's temp file must be a
