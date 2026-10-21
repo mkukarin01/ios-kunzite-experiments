@@ -8,6 +8,11 @@ request, paced sends) is committed but NOT yet CI-built: the last kernel artifac
 but NOT installed in the root image yet (checked 2026-10-21: no /usr/libexec/kunzite-agent, no
 com.kunzite.agent in the launchd.plist cache).
 
+**2026-10-21/22:** the phone ran a whole day on battery on boot #23's kernel without visible
+crashes (user); afterwards 3 % left, charging before the agent flash (do not flash userdata on a
+near-empty battery; whether our kernel charges at all is unknown - SweetBattery is static, so
+charge powered off or in the bootloader).
+
 **Fixed tonight (commit c68e324):** `/get` on a FIFO wedged the single-threaded agent forever
 (open() blocked waiting for a writer; SO_RCVTIMEO/SO_SNDTIMEO do not help there). Now /get opens
 O_NONBLOCK and serves regular files only, /ls requires a directory, /put's temp file must be a
