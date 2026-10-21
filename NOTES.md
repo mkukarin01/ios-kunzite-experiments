@@ -1020,3 +1020,14 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+**AGENT review fixes (2026-10-21, user review c68e324 + this pass):** (1) /run t= deadline now
+SIGKILLs the program (regression from the workflow-fix pass - the reap loop skipped its kill when
+timed_out was already set; sleep 20 t=2 returns in 2.0 s, program gone); (2) /run polls the client
+socket too (recv MSG_PEEK): a vanished peer is noticed within one poll even while the program is
+silent (killed curl + sleep 15 t=0 -> /ping answers in 0.0 s, child killed); (3) background jobs:
+/start?name=N&a=...[&log=PATH|console], /jobs, /stop[&sig=9] - state is /tmp/kunzite-agent pid
+files (survives agent restarts; children hold only their log fd via CLOEXEC; console = live USB
+log); (4) Expect: 100-continue answered (4 MiB upload 0.009 s, was ~1 s stall); (5) request log
+no longer doubles the slash; (6) 0910 regenerated with the comment kept line-aligned (applies to
+exactly one comment block; series re-verified, 151).

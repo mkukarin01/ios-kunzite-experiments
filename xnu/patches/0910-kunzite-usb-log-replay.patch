@@ -8,22 +8,23 @@ whole 4 MiB ring, "tail N" = last N bytes; tools/udp-log.py sends it).
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -761,21 +761,55 @@
+@@ -761,21 +761,57 @@
  }
  
  /*
 - * Live console log over USB Ethernet: every 100 ms the new bytes of the
-- * console ring (bsd/dev/sweet_ufs.c) go as UDP datagrams to
++ * Live console log over USB Ethernet: the new bytes of the
+  * console ring (bsd/dev/sweet_ufs.c) go as UDP datagrams to
 - * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
 - * so the boot is included. Nothing here may print (it would feed itself).
 - * Boot-arg sweetusblog=0 disables it.
-+ * Live console log over USB Ethernet: the new bytes of the console ring
-+ * (bsd/dev/sweet_ufs.c) go as UDP datagrams to 192.168.7.1:5140 (on the
-+ * PC: tools/udp-log.py). Starts with the last 64 KiB so the boot is
-+ * included. Nothing here may print (it would feed itself). Boot-arg
++ * 192.168.7.1:5140 (on the PC: tools/udp-log.py).
++ * Nothing here may print (it would feed itself). Boot-arg
 + * sweetusblog=0 disables it.
 + *
-+ * kunzite: the PC may ask for a replay by sending a datagram to the
++ * kunzite: paced, retried and replayable - the first 64 KiB still go out
++ * unprompted so the boot is included. The PC may ask for a replay by
++ * sending a datagram to the
 + * phone's port 5140: "replay" = the whole ring (4 MiB), "tail N" = the last
 + * N bytes. Sending is paced (at most UD_LOG_BURST datagrams per 10 ms tick:
 + * the ECM transmit queue holds UD_TXQ frames and drops the rest silently),
@@ -70,7 +71,7 @@ diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
  	uint64_t pos = sweet_log_position();
  
  	pos = pos > 65536 ? pos - 65536 : 0;
-@@ -784,25 +818,39 @@
+@@ -784,25 +820,39 @@
  	to.sin_family = AF_INET;
  	to.sin_port = htons(5140);
  	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */

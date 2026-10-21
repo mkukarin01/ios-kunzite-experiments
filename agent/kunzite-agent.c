@@ -35,6 +35,7 @@
  * agent/entitlements.plist; also a macOS build for local tests).
  */
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -459,6 +460,13 @@ read_request(struct req *r)
 		goto bad;
 	}
 	size_t head = (size_t)(hdr_end - buf) + 4;      /* past \r\n\r\n */
+	/* curl waits ~1 s for this on bodies > 1 KiB before sending them */
+	if ((chunked || r->content_length > 0) && r->fd > 0) {
+		char *expect = header_value(buf, "Expect");
+		if (expect && strncasecmp(expect, "100-continue", 12) == 0) {
+			(void)write_all(r->fd, "HTTP/1.0 100 Continue\r\n\r\n", 25);
+		}
+	}
 	if (chunked) {
 		/* curl -T - streams stdin as chunked; decode it */
 		if (read_chunked(r, buf + head, have - head) != 0) {
@@ -859,9 +867,16 @@ h_run(struct req *r)
 	}
 	logf_("run %s pid %d", argvs[0], pid);
 
-	struct pollfd fds[2] = {
+	struct pollfd fds[3] = {
 		{ .fd = outp[0], .events = POLLIN, .revents = 0 },
 		{ .fd = errp[0], .events = POLLIN, .revents = 0 },
+		/* the client socket: notice a vanished peer even while the
+		 * program is silent (FIN arrives as readable, read() = 0) */
+		{ .fd = r->fd, .events = POLLIN
+#ifdef POLLRDHUP
+		    | POLLRDHUP
+#endif
+		    , .revents = 0 },
 	};
 	int open = 2;
 	struct timespec start, now;
@@ -880,7 +895,7 @@ h_run(struct req *r)
 			}
 			ms = (int)(left > INT_MAX ? INT_MAX : left);
 		}
-		int rdy = poll(fds, 2, ms);
+		int rdy = poll(fds, 3, ms);
 		if (rdy < 0 && errno == EINTR) {
 			continue;
 		}
@@ -890,6 +905,15 @@ h_run(struct req *r)
 		if (rdy == 0) {
 			timed_out = 1;
 			break;
+		}
+		if (fds[2].revents) {
+			char peek;
+			ssize_t pk = recv(r->fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+			if (pk == 0 || (pk < 0 && errno != EAGAIN)) {
+				client_gone = 1;
+				break;
+			}
+			/* pk > 0: stray request bytes; nothing to do with them */
 		}
 		for (int i = 0; i < 2; i++) {
 			if (fds[i].fd < 0 || !fds[i].revents) {
@@ -911,9 +935,10 @@ h_run(struct req *r)
 	}
 	/*
 	 * Close our pipe ends BEFORE reaping (a child blocked writing into a
-	 * full pipe gets EPIPE/SIGPIPE), and never wait unbounded: t=0 still
-	 * means one hour, and a client that walked away means SIGKILL now -
-	 * this loop is the whole agent.
+	 * full pipe gets EPIPE/SIGPIPE), and never wait unbounded: the t
+	 * deadline (t=0 still means one hour) SIGKILLs here - whether it was
+	 * hit by the poll loop or is only reached now - and a client that
+	 * walked away means SIGKILL now. This loop is the whole agent.
 	 */
 	for (int i = 0; i < 2; i++) {
 		if (fds[i].fd >= 0) {
@@ -921,8 +946,8 @@ h_run(struct req *r)
 			fds[i].fd = -1;
 		}
 	}
-	if (client_gone) {
-		kill(pid, SIGKILL);        /* the client walked away: reap fast */
+	if (client_gone || timed_out) {
+		kill(pid, SIGKILL);
 	}
 	long budget_ms = (t > 0 ? (long)t : 3600L) * 1000L;
 	int st = 0;
@@ -965,6 +990,258 @@ pipes_done:
 }
 
 
+/* --- background jobs ------------------------------------------------
+ * For helpers that outlive a request (an os_log streamer): state lives in
+ * /tmp/kunzite-agent (NAME.pid, NAME.cmd, NAME.log), not in this process,
+ * so an agent restarted by launchd (or replaced via /put + /exit) still
+ * sees and stops them. Children keep running if the agent dies; they hold
+ * only their log file descriptor (CLOEXEC spawn). Finished children are
+ * reaped opportunistically whenever /start or /jobs runs.
+ */
+#define JOBS_DIR        "/tmp/kunzite-agent"
+#define JOBS_MAX_NAME   32
+
+static void
+jobs_reap(void)
+{
+	int st;
+	while (waitpid(-1, &st, WNOHANG) > 0) {
+	}
+}
+
+static bool
+job_name_ok(const char *n)
+{
+	if (!*n || strlen(n) >= JOBS_MAX_NAME) {
+		return false;
+	}
+	for (; *n; n++) {
+		if (!isalnum((unsigned char)*n) && *n != '-' && *n != '_') {
+			return false;
+		}
+	}
+	return true;
+}
+
+static long
+job_pid(const char *name)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "%s/%s.pid", JOBS_DIR, name);
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return 0;
+	}
+	long pid = 0;
+	int got = fscanf(f, "%ld", &pid);
+	fclose(f);
+	return got == 1 && pid > 1 ? pid : 0;
+}
+
+/* /start?a=PROG&a=ARG...&name=NAME[&log=PATH|console][&m=644] */
+static void
+h_start(struct req *r)
+{
+	const char *name = param(r, "name");
+	if (!name || !job_name_ok(name)) {
+		out(r, "ERR need name (letters/digits/-/_ , < %d chars)\n", JOBS_MAX_NAME);
+		return;
+	}
+	char *argvs[MAX_ARGS + 2];
+	int argc = 0;
+	for (int i = 0; i < r->nparams && argc <= MAX_ARGS; i++) {
+		if (strcmp(r->key[i], "a") == 0) {
+			argvs[argc++] = r->val[i];
+		}
+	}
+	if (argc == 0) {
+		out(r, "ERR no a= program\n");
+		return;
+	}
+	argvs[argc] = NULL;
+	jobs_reap();
+	long old = job_pid(name);
+	if (old > 0 && kill((pid_t)old, 0) == 0) {
+		out(r, "ERR job %s already running (pid %ld; /stop?name=%s first)\n", name, old, name);
+		return;
+	}
+	mkdir(JOBS_DIR, 0755);
+	const char *logmode = param(r, "log");
+	bool console = logmode && strcmp(logmode, "console") == 0;
+	char logpath[PATH_MAX];
+	if (console) {
+		strlcpy(logpath, "/dev/console", sizeof(logpath));
+	} else if (logmode) {
+		if (strlcpy(logpath, logmode, sizeof(logpath)) >= sizeof(logpath)) {
+			out(r, "ERR log path too long\n");
+			return;
+		}
+	} else {
+		snprintf(logpath, sizeof(logpath), "%s/%s.log", JOBS_DIR, name);
+	}
+	mode_t mode = param_mode(r, "m", 0644);
+	int logfd = open(logpath, O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK | O_NOFOLLOW, mode);
+	struct stat st;
+	if (logfd < 0 || fstat(logfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		if (console && logfd >= 0) {
+			/* /dev/console is a character device - allowed */
+		} else {
+			if (logfd >= 0) {
+				close(logfd);
+			}
+			out(r, "ERR log %s: not a writable regular file\n", logpath);
+			return;
+		}
+	}
+	(void)fcntl(logfd, F_SETFL, fcntl(logfd, F_GETFL) & ~O_NONBLOCK);
+	int devnull = open("/dev/null", O_RDONLY);
+
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	if (devnull >= 0) {
+		posix_spawn_file_actions_adddup2(&fa, devnull, 0);
+	}
+	posix_spawn_file_actions_adddup2(&fa, logfd, 1);
+	posix_spawn_file_actions_adddup2(&fa, logfd, 2);
+	posix_spawnattr_t attr;
+	posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+	sigset_t dfl;
+	sigemptyset(&dfl);
+	sigaddset(&dfl, SIGPIPE);
+	posix_spawnattr_setsigdefault(&attr, &dfl);
+	pid_t pid = -1;
+	int err = posix_spawn(&pid, argvs[0], &fa, &attr, argvs, environ);
+	posix_spawnattr_destroy(&attr);
+	posix_spawn_file_actions_destroy(&fa);
+	close(logfd);
+	if (devnull >= 0) {
+		close(devnull);
+	}
+	if (err != 0) {
+		out(r, "ERR spawn %s: %s\n", argvs[0], strerror(err));
+		return;
+	}
+	char path[64];
+	FILE *f;
+	snprintf(path, sizeof(path), "%s/%s.pid", JOBS_DIR, name);
+	if ((f = fopen(path, "w")) != NULL) {
+		fprintf(f, "%d\n", pid);
+		fclose(f);
+	}
+	snprintf(path, sizeof(path), "%s/%s.cmd", JOBS_DIR, name);
+	if ((f = fopen(path, "w")) != NULL) {
+		for (int i = 0; i < argc; i++) {
+			fprintf(f, "%s%s", i ? " " : "", argvs[i]);
+		}
+		fputc('\n', f);
+		fclose(f);
+	}
+	logf_("start %s pid %d -> %s", name, pid, logpath);
+	out(r, "OK job %s pid %d log %s\n", name, pid, logpath);
+}
+
+static void
+h_jobs(struct req *r)
+{
+	jobs_reap();
+	DIR *d = opendir(JOBS_DIR);
+	if (!d) {
+		out(r, "no jobs (%s: %s)\n", JOBS_DIR, strerror(errno));
+		return;
+	}
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		size_t l = strlen(e->d_name);
+		if (l < 5 || strcmp(e->d_name + l - 4, ".pid") != 0) {
+			continue;
+		}
+		char name[JOBS_MAX_NAME];
+		strlcpy(name, e->d_name, (l - 4 < sizeof(name) ? l - 3 : sizeof(name)));
+		long pid = job_pid(name);
+		if (pid == 0) {
+			continue;
+		}
+		int alive = kill((pid_t)pid, 0) == 0;
+		char cmd[256] = "?";
+		char path[64];
+		snprintf(path, sizeof(path), "%s/%s.cmd", JOBS_DIR, name);
+		FILE *f = fopen(path, "r");
+		if (f != NULL) {
+			if (fgets(cmd, sizeof(cmd), f) == NULL) {
+				cmd[0] = 0;
+			}
+			fclose(f);
+			cmd[strcspn(cmd, "\n")] = 0;
+		}
+		out(r, "%-20s pid %-7ld %s %s\n", name, pid, alive ? "running" : "dead   ", cmd);
+	}
+	closedir(d);
+}
+
+static void
+h_stop(struct req *r)
+{
+	const char *name = param(r, "name");
+	char name_buf[JOBS_MAX_NAME];
+	long pid = param_num(r, "pid", 0);
+	if (!name && pid <= 0) {
+		out(r, "ERR need name or pid\n");
+		return;
+	}
+	if (!name) {
+		/* by pid: only a pid file we own (never a bare guess) */
+		DIR *d = opendir(JOBS_DIR);
+		struct dirent *e;
+		bool found = false;
+		while (d && (e = readdir(d)) != NULL) {
+			size_t l = strlen(e->d_name);
+			if (l < 5 || strcmp(e->d_name + l - 4, ".pid") != 0) {
+				continue;
+			}
+			strlcpy(name_buf, e->d_name, (l - 4 < sizeof(name_buf) ? l - 3 : sizeof(name_buf)));
+			if (job_pid(name_buf) == pid) {
+				name = name_buf;
+				found = true;
+				break;
+			}
+		}
+		if (d) {
+			closedir(d);
+		}
+		if (!found) {
+			out(r, "ERR pid %ld is not a job\n", pid);
+			return;
+		}
+	}
+	long sig = param_num(r, "sig", SIGTERM);
+	long p = job_pid(name);
+	if (p == 0) {
+		out(r, "ERR no job %s\n", name);
+		return;
+	}
+	bool already_dead = false;
+	jobs_reap();                        /* reap first: a zombie would kill(0)=0 */
+	if (kill((pid_t)p, (int)sig) != 0) {
+		if (errno != ESRCH) {
+			out(r, "ERR kill %ld: %s\n", p, strerror(errno));
+			return;
+		}
+		already_dead = true;         /* finished since /jobs saw it */
+	}
+	char path[64];
+	snprintf(path, sizeof(path), "%s/%s.pid", JOBS_DIR, name);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/%s.cmd", JOBS_DIR, name);
+	unlink(path);
+	out(r, "OK job %s (pid %ld) %s\n", name, p,
+	    already_dead ? "already dead, pid files removed"
+	    : sig == SIGKILL ? "killed, pid files removed"
+	    : "signaled; /stop?...&sig=9 to finish");
+}
+
 /* --- misc + dispatch --- */
 
 static void
@@ -994,12 +1271,15 @@ static const char HELP[] =
 	"  /ps              pid ppid uid comm path\n"
 	"  /kill?pid=N[&sig=15]\n"
 	"  /run?a=PROG&a=ARG...[&t=30]     spawn; stdout/stderr streamed\n"
+	"  /start?name=N&a=PROG...[&log=PATH|console]  background job\n"
+	"  /jobs                            list background jobs\n"
+	"  /stop?name=N[&sig=15]            stop a background job\n"
 	"  /exit            exit; launchd restarts the binary\n";
 
 static void
 handle(struct req *r)
 {
-	logf_("%s /%s from %s", r->method, r->path, r->peer);
+	logf_("%s %s from %s", r->method, r->path, r->peer);
 	int is_get = strcmp(r->method, "GET") == 0 || strcmp(r->method, "HEAD") == 0;
 	if (!is_get && strcmp(r->method, "PUT") != 0) {
 		respond(r, 405, "text/plain");
@@ -1059,6 +1339,15 @@ handle(struct req *r)
 	} else if (strcmp(r->path, "/run") == 0) {
 		respond(r, 200, "application/octet-stream");
 		h_run(r);
+	} else if (strcmp(r->path, "/start") == 0) {
+		respond(r, 200, "text/plain");
+		h_start(r);
+	} else if (strcmp(r->path, "/jobs") == 0) {
+		respond(r, 200, "text/plain");
+		h_jobs(r);
+	} else if (strcmp(r->path, "/stop") == 0) {
+		respond(r, 200, "text/plain");
+		h_stop(r);
 	} else if (strcmp(r->path, "/exit") == 0) {
 		respond(r, 200, "text/plain");
 		out(r, "OK exiting\n");
