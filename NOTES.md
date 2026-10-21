@@ -38,6 +38,15 @@ controllers/transport - last. Suggested order: red tint + real screen-off (agent
 cheap to investigate; screen-off = port topaz 0104-0110 DCS to parrot DSI0) -> quick battery
 estimate -> Wi-Fi port (proper battery after it) -> GPU when HackiOS publishes -> Bluetooth.
 
+**Panic region (2026-10-22, from sweet 1664d63):** mkadt now carves 1 MiB off the top of the
+highmem window (/pram at 0xa7ff00000, /chosen/embedded-panic-log-size, dram-size shrunk) - without
+it XNU's panic-log init can hang after "kdp_core zlib memory" (sweet: reproduced on QEMU and
+ios-fajita), and it is where a panic-log reader (shim, after reboot) will look. Boot image
+shim-boot-25.img = #23/#24 payload (same kernel d5f0c370, sweetusb=2) + the new kunzite.adt.
+**GPU plan (WIP, private):** the main repo (local-only) has ios/gpu-plan.md; confirmed upstream
+sweet = "HackiOS" (hackiosx.dev) has NO GPU patches - their future page calls it "maybe... the
+hardest item by far".
+
 **Agent image ready (2026-10-22 02:10):** agent built from 8e4cb88 (sha256 12dbe7c7...), installed
 by `sudo tools/root-add-agent-mac.sh` into temp/ios-m8/ios16-root-20H392.img (checked read-only:
 /usr/libexec/kunzite-agent 0:0 0755 same hash, com.kunzite.agent in launchd.plist, 531 daemons);

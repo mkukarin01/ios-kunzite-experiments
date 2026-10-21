@@ -80,6 +80,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, wlan=False):
     phys_base, mem_size = ((HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
+    # Panic log buffer, carved from the TOP of the dram range and exposed to
+    # XNU as /pram + /chosen/embedded-panic-log-size (sweet 1664d63: without
+    # it, pe_init.c's check_for_panic_log() leaves gPanicBase == 0 and the
+    # kernel can hang after "kdp_core zlib memory" - reproduced on QEMU and
+    # ios-fajita). Also what a future panic-log reader reads after a reboot.
+    PANIC_LOG_SIZE = 0x100000
+    panic_base = phys_base + mem_size - PANIC_LOG_SIZE
+    mem_size -= PANIC_LOG_SIZE
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
@@ -88,6 +96,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, wlan=False):
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
+        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('kunzite-shim')),
         ('system-firmware-version', cstr('kunzite-shim')),
@@ -245,6 +254,9 @@ def build(seed=None, qemu=False, highmem=False, native=False, wlan=False):
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
+    # Panic log region: sits just above the dram-size we expose, so XNU maps
+    # it but never allocates into it.
+    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
     return node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,kunzite') + cstr('xiaomi,sweet') + cstr('qcom,parrot') + cstr('AppleARM')),
@@ -254,7 +266,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, wlan=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
