@@ -24,6 +24,20 @@ backboardd, logd; CrashReporter dir empty (fresh userdata); the live log shows o
 crashes during boot. Live log listener: `tools/udp-log.py FILE --no-replay` (kernel d5f0c370 has no
 0910 replay yet).
 
+**ROADMAP FACTS (2026-10-22, live FDT/dmesg):** battery = `qcom,battery-charger` under
+`qcom,pmic_glink` (ADSP firmware owns gauge/charger; a proper driver needs ADSP PAS boot + GLINK +
+battmgr protocol; quick option = estimate from raw PMIC values over SPMI if readable; open: does
+the phone charge under our kernel at all). WLAN = `qcom,icnss` (membase 0x22800000), fw
+WLAN.HL.3.4.3 on the modem Q6, wlan_fw_region 0x82a00000; BT node `bt_wcn3990` -> same Helium
+family as topaz's WCN3988: TopazModem (0113-0130: modem PAS boot, GLINK/QRTR, WLFW, CE/HTC/WMI/HTT,
+WPA2) is a real template; differences: GLINK signalling via `qcom,ipcc` mailboxes (topaz: APCS
+doorbell bit 12) and all addresses. GPU = Adreno 710 (`qcom,adreno-gpu-gen7-3-0`, chipid
+0x07010000, kgsl 0x3d00000, GMU fw gmu_gen70000.bin) - topaz's GPU path (Adreno 610 + HackiOS
+patches, unpublished) does not carry over directly. Bluetooth: iOS bluetoothd expects Apple's
+controllers/transport - last. Suggested order: red tint + real screen-off (agent makes the tint
+cheap to investigate; screen-off = port topaz 0104-0110 DCS to parrot DSI0) -> quick battery
+estimate -> Wi-Fi port (proper battery after it) -> GPU when HackiOS publishes -> Bluetooth.
+
 **Agent image ready (2026-10-22 02:10):** agent built from 8e4cb88 (sha256 12dbe7c7...), installed
 by `sudo tools/root-add-agent-mac.sh` into temp/ios-m8/ios16-root-20H392.img (checked read-only:
 /usr/libexec/kunzite-agent 0:0 0755 same hash, com.kunzite.agent in launchd.plist, 531 daemons);
@@ -582,8 +596,8 @@ kernel console misses SpringBoard/os_log output - a /run helper reading the log 
 **NEXT (candidates):** RTC/date (PMK8350 RTC + boot-time offset); real screen-off (a safe DCS path
 on the parrot DSI0, then drop sweetfb_stayon); black wallpaper (upstream topaz: check whether its
 lock screen has one; PosterBoard/wallpaper renderer logs); About-pane slowness on #22 (sweetbusy=N
-from upstream 0127 shows who keeps IOKit busy); Wi-Fi is a big separate job (parrot WCN, not
-topaz's WCN3988).
+from upstream 0127 shows who keeps IOKit busy); Wi-Fi: see ROADMAP FACTS (2026-10-22) - the WLAN is
+the same modem-integrated family as topaz's, the earlier "not topaz's WCN3988" was wrong.
 
 **BOOT #19 (2026-10-20 ~19:15, shim-boot-19.img, user-typed fastboot): sRGB gamut - no visible
 change.** Same kernel as #18 (283b12cb; the later CI artifact 0da72d25 has no kernel source change),
