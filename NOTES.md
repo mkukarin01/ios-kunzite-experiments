@@ -1,8 +1,44 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> MORNING HANDOFF (2026-10-21, 02:30) - kunzite-agent open issues - READ FIRST <<<
+## >>> HANDOFF (2026-10-23) - branch kunzite-topaz-gpu - READ FIRST <<<
 
-**Where things stand:** boot #23 proved USB Ethernet + live console (0909). 0910 (log replay on
+**State:** `kunzite-topaz-gpu` = kunzite 39b53a5 + upstream topaz e477291 (the HackiOS batch),
+merge 6cdf249, our patches 0960-0969, build fix 54b61da. **CI run 39923346510 (54b61da)
+SUCCEEDED** (xnu-kernel artifact 61 MB). NOT booted yet: the last booted kernel is still d5f0c370
+(boot #24). The previous run 39919704364 failed on a hunk lost when 0908 became 0967 (details in
+the merge notes below).
+
+**Boot #25 (next) needs a NEW boot image:** shim-boot-25.img already exists and holds kernel
+d5f0c370 + the /pram ADT. Build one from the new artifact + the same kunzite.adt, under a new name.
+
+**What to expect (read from the merged code, not seen on the phone yet):**
+- Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
+  CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
+  gets every 2nd frame (fFlushTicks=2). Try `sweetfb_hz=60` to see it (twice the CPU copy work).
+- Without sweetfb_stayon: display off now fades the splash fb to black in place (0143 removed
+  the "fDsi mapped -> keep the last frame" return; kunzite has no fFlip buffers since fVig0=NULL).
+  This is NOT panel sleep: dsiSend no-ops (fDsiBuf needs memory below 4 GiB, kernel RAM is all
+  above), and upstream's own 0143/0152 comments say the DCS commands do not reach the topaz
+  panel yet (video mode).
+- **Keep OFF on kunzite** (khaje addresses inside): `gpu=1` (GPU pool at phys 0x90000000,
+  TopazAdreno MMIO), `adsp=1` (carveout 0x53800000, LPASS 0x0a600000), `modem=1` (also starts
+  0900's wifi/en0), `sweetbattery=1` (0148 now also WRITES the bq2589x charger at I2C 0x6a; it
+  only read before). Checked in code: all gated, default off. TOPAZ_4K is unset everywhere ->
+  16K pages; AMP (0141) is inert.
+
+**Then:** scout plan step (2) is still OPEN: the t02 splash-tail DCS buffer is not on this branch,
+so no DCS command reaches the panel. Port it (0143 already sets LP mode, bit 26) before expecting
+panel sleep. Then step (3) redwood_adreno.c -> parrot a710 (re-derive the GPU pool base for
+kunzite's memory map first), then (4) userland. The t01-t03 branches are based on pre-merge
+69446d0 and their 0911-0913 collide with upstream's 0911-0913: renumber when rebasing.
+
+**Tooling (2026-10-23):** tools/build-local.sh hard-codes /Applications/Xcode_15.4.app; this Mac
+only has Xcode 27.0, so CI is the only way to build the kernel until 15.4 is installed. `gh` is not
+installed either; run status works through the public REST API with curl.
+
+## MORNING HANDOFF (2026-10-21, 02:30) - kunzite-agent open issues (superseded; all six issues FIXED in 8e4cb88, see "AGENT review fixes" near the end)
+
+**Where things stood (superseded by boot #24 below):** boot #23 proved USB Ethernet + live console (0909). 0910 (log replay on
 request, paced sends) is committed but NOT yet CI-built: the last kernel artifact is d5f0c370
 (0909 only). The agent (agent/kunzite-agent.c, doc: rtk-tablet `ios/kunzite-agent.md`) is built
 but NOT installed in the root image yet (checked 2026-10-21: no /usr/libexec/kunzite-agent, no
@@ -53,7 +89,8 @@ superseded: proven path = CA GL renderer <- Mesa <- kernel Adreno driver; our 09
 overlap their panel-sleep/display work. Scout workflow running (porting, adreno ABI, userland,
 topaz delta). Lilu question answered: the lineage's "Lilu" is ElleKit (userland tweak injection).
 
-**UPSTREAM GPU MERGE (2026-10-23, branch kunzite-topaz-gpu @ bf2c963, NOT built/booted):** upstream
+**UPSTREAM GPU MERGE (2026-10-23, branch kunzite-topaz-gpu @ 6cdf249 - re-created from bf2c963, same
+tree; bf2c963 is on no branch):** upstream
 topaz e477291 (the HackiOS open-source batch: 0140-0152 + 0900-0950 + userland/{gpu,mesa,audio})
 merged cleanly; our patches renumbered to **0960-0969**; 0960/0964/0967/0968 regenerated over the
 merged tree. Series verified: 215 patches apply. TOPAZ_4K unset -> 16K pages + our 0961 topology
@@ -62,6 +99,8 @@ charger 0148) merged but dormant until re-ported. NEXT: push kunzite-topaz-gpu -
 (standard cmdline; expect: no change visible except faster frame clock from 0948, panel sleep now
 possible if stayon removed + their LP-mode DCS, GPU still off). THEN: GPU port plan step 3
 (redwood_adreno.c -> parrot a710) + userland (Mesa chipid, eagl slots for 20H392).
+[CORRECTED 2026-10-23, see the top handoff: no panel sleep on kunzite (DCS no-ops, display off =
+fade to black); the 60 Hz clock shows only with sweetfb_hz=60; step (2) comes before step 3.]
 
 **CI run 39919704364 (kunzite-topaz-gpu @ 94bfddc) FAILED, 1 compile error (make -k, nothing else
 broke):** `sweet_ufs.c:843 call to undeclared function 'kunzite_touch_init'`. Cause: regenerating
@@ -70,7 +109,7 @@ at line 54); the old hunk's context still matched. Restored verbatim; series re-
 sweet_ufs.c/sweet_keys.c/kunzite_touch.c cleanly (scratch git apply). 0960/0964/0968 regen diffs
 reviewed: only context moves, no lost hunks. Externs used by 0960-0969 all defined in the series.
 Blacktop's own 4 skipped patches (TrustCache, iobuffermemd, skywalk, syntax_checker) are dxb's, not ours: unrelated to the merge.
-NEXT: push -> rerun CI (link stage not reached yet).
+Pushed as 54b61da; rerun = CI 39923346510 SUCCEEDED (links, xnu-kernel 61 MB).
 
 **SCOUT RESULT (2026-10-23, workflow wf_edc5205d, 4 readers):**
 - HackiOS boot = fastboot RAM-boot -> BootShim + Mu-Silicium UEFI (drivers extracted from the
@@ -91,11 +130,14 @@ NEXT: push -> rerun CI (link stage not reached yet).
   HAS a7xx (FD730/740/750) but NO 710 chipid entry - we add 0x07010000 + verify a7xx paths.
   redwood GPU fw = a660_gmu/sqe/zap from the phone's vendor (never in repo); ours = gmu_gen70000.
 - TOPAZ DELTA d8c82d9..origin/topaz: 4 commits, +22053 lines, 64 patches (HackiOS 0140-0152 +
-  topaz chain 0900-0950 - NUMBERS COLLIDE with our 0901-0913!). Collisions with ours:
+  topaz chain 0900-0950 - NUMBERS COLLIDE with our 0901-0913! [resolved: ours are now 0960-0969;
+  the unmerged t01-t03 branches still use 0911-0913]). Collisions with ours:
   SweetFramebuffer.cpp (their 0143/0144/0151/0152/09xx vs our 0905/0911/0912/0913 - same hunks),
-  bsd/conf/files, SweetBattery, SWEET.h. THEIR PANEL SLEEP (0143+0152) SOLVES OUR BOOT #15
-  MYSTERY: DSI commands must go out in LOW-POWER mode (bit 26 SET; we cleared it for HS); off =
-  0x51/0x28/0x10, on = 0x11 + 120 ms + 0x29. Their 0948 (publishModes 60 Hz + sel 79 block 0x40,
+  bsd/conf/files, SweetBattery, SWEET.h. THEIR PANEL SLEEP (0143+0152) SUGGESTS AN ANSWER TO OUR
+  BOOT #15 MYSTERY: DSI commands in LOW-POWER mode (bit 26 SET; we cleared it for HS); off =
+  0x51/0x28/0x10, on = 0x11 + 120 ms + 0x29. [HYPOTHESIS, 2026-10-23: upstream's own 0143/0152
+  comments say these DCS commands do not reach the topaz panel yet (video mode); their display
+  off is one black frame. LP mode is what Linux does, not proven here.] Their 0948 (publishModes 60 Hz + sel 79 block 0x40,
   fixes CA frame clock, was 20 fps) is device-independent - adopt verbatim. Their GPU core is
   khaje/Adreno-610 (NO GMU) - the parrot core (a7xx+GMU, closer to redwood's 642L) is ours to
   write from redwood_adreno.c.
@@ -115,7 +157,7 @@ family as topaz's WCN3988: TopazModem (0113-0130: modem PAS boot, GLINK/QRTR, WL
 WPA2) is a real template; differences: GLINK signalling via `qcom,ipcc` mailboxes (topaz: APCS
 doorbell bit 12) and all addresses. GPU = Adreno 710 (`qcom,adreno-gpu-gen7-3-0`, chipid
 0x07010000, kgsl 0x3d00000, GMU fw gmu_gen70000.bin) - topaz's GPU path (Adreno 610 + HackiOS
-patches, unpublished) does not carry over directly. Bluetooth: iOS bluetoothd expects Apple's
+patches, unpublished [published 2026-10-22, merged on kunzite-topaz-gpu]) does not carry over directly. Bluetooth: iOS bluetoothd expects Apple's
 controllers/transport - last. Suggested order: red tint + real screen-off (agent makes the tint
 cheap to investigate; screen-off = port topaz 0104-0110 DCS to parrot DSI0) -> quick battery
 estimate -> Wi-Fi port (proper battery after it) -> GPU when HackiOS publishes -> Bluetooth.
@@ -127,7 +169,10 @@ ios-fajita), and it is where a panic-log reader (shim, after reboot) will look. 
 shim-boot-25.img = #23/#24 payload (same kernel d5f0c370, sweetusb=2) + the new kunzite.adt.
 **GPU plan (WIP, private):** the main repo (local-only) has ios/gpu-plan.md; confirmed upstream
 sweet = "HackiOS" (hackiosx.dev) has NO GPU patches - their future page calls it "maybe... the
-hardest item by far".
+hardest item by far". [OUTDATED 2026-10-23: HackiOS published its GPU work on 2026-10-22 (see
+above). CREDITS.md names HackiOS as OOSEX GANG's POCO X5 Pro (redwood) port and lists ios-sweet
+(dipa-studio) separately, so "upstream sweet = HackiOS" looks wrong; where the hackiosx.dev link
+came from is unverified.]
 
 **Agent image ready (2026-10-22 02:10):** agent built from 8e4cb88 (sha256 12dbe7c7...), installed
 by `sudo tools/root-add-agent-mac.sh` into temp/ios-m8/ios16-root-20H392.img (checked read-only:
@@ -143,7 +188,8 @@ O_NONBLOCK and serves regular files only, /ls requires a directory, /put's temp 
 plain file (O_NOFOLLOW). Verified on the Mac build: /get and /ls on a FIFO answer ERR, /ping
 answers afterwards, plain files download as before.
 
-**Open issues (all in h_run unless noted; reproduce with agent/build.sh mac, then run
+**Open issues [ALL SIX FIXED in 8e4cb88, 2026-10-21 - see "AGENT review fixes" near the end]
+(all in h_run unless noted; reproduce with agent/build.sh mac, then run
 agent/out/kunzite-agent.mac and curl 127.0.0.1:8022):**
 1. **t= timeout does not stop the program.** `curl 'http://127.0.0.1:8022/run?a=/bin/sleep&a=20&t=2'`
    prints `[timeout]` but returns after 20 s: when the poll loop times out, the reaping loop only
