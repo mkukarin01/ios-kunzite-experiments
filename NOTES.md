@@ -53,6 +53,16 @@ superseded: proven path = CA GL renderer <- Mesa <- kernel Adreno driver; our 09
 overlap their panel-sleep/display work. Scout workflow running (porting, adreno ABI, userland,
 topaz delta). Lilu question answered: the lineage's "Lilu" is ElleKit (userland tweak injection).
 
+**UPSTREAM GPU MERGE (2026-10-23, branch kunzite-topaz-gpu @ bf2c963, NOT built/booted):** upstream
+topaz e477291 (the HackiOS open-source batch: 0140-0152 + 0900-0950 + userland/{gpu,mesa,audio})
+merged cleanly; our patches renumbered to **0960-0969**; 0960/0964/0967/0968 regenerated over the
+merged tree. Series verified: 215 patches apply. TOPAZ_4K unset -> 16K pages + our 0961 topology
+unchanged; AMP inert (inside the TOPAZ_4K ifdef); khaje-hw patches (wifi 0900, audio 0144-0146,
+charger 0148) merged but dormant until re-ported. NEXT: push kunzite-topaz-gpu -> CI -> boot #25
+(standard cmdline; expect: no change visible except faster frame clock from 0948, panel sleep now
+possible if stayon removed + their LP-mode DCS, GPU still off). THEN: GPU port plan step 3
+(redwood_adreno.c -> parrot a710) + userland (Mesa chipid, eagl slots for 20H392).
+
 **SCOUT RESULT (2026-10-23, workflow wf_edc5205d, 4 readers):**
 - HackiOS boot = fastboot RAM-boot -> BootShim + Mu-Silicium UEFI (drivers extracted from the
   phone's own xbl.img!) -> xnuloader EFI app -> XNU; one kernel for all devices (BCM2837 config
