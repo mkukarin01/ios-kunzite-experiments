@@ -1,0 +1,183 @@
+kunzite: Adreno 710 step 10, the first write to the GMU (kgpu=10; 1-9 unchanged).
+Only with the GMU's processor in reset (CM3_SYSRESET bit 0) and no firmware started
+(FW_INIT_RESULT bit 8 clear): two words (0x600d0001, 0x0a110002) into DTCM 0x1c400 (0x3d71000),
+read back, and the old words restored at once (logged writes, undone via the undo list). kgsl
+gen7_gmu_load_fw loads firmware the same way. The per-entry undo becomes kg_undo_pop(),
+shared with the end-of-run teardown.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -2,9 +2,10 @@
+  * kunzite (POCO M8 5G, SM6475 parrot): the Adreno 710, step by step, after
+  * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
+  * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
+- * 6-9 read again, now inside the powered CX half.
++ * 6-9 read again, now inside the powered CX half; step 10 is the first
++ * write to the GMU itself.
+  *
+- * Boot-arg kgpu=N (N <= 9) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 10) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -53,6 +54,9 @@
+  *     are not HLOS's), and where streams 0 (GPU), 2 (secure) and 5 (GMU) go.
+  *  9  reads translation context 0 (and the one stream 0 maps to, if another
+  *     of the 6): SCTLR, ACTLR, TTBR0, TCR, MAIR0, FSR, FAR.
++ *  10 writes two words into the GMU's DTCM (0x1c400) while its processor is
++ *     held in reset and no firmware has run, reads them back, and restores
++ *     the old words at once (kgsl loads firmware the same way).
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -258,6 +262,37 @@ kg_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned m
+ 	return (kg_rd(base, off) & mask) == want;
+ }
+ 
++/* undo the newest write on the list (the end of the run does all of them, in reverse) */
++static void
++kg_undo_pop(void)
++{
++	if (kg.nundo == 0) {
++		return;
++	}
++	--kg.nundo;
++	vm_offset_t base = kg.undo[kg.nundo].base;
++	uint32_t off = kg.undo[kg.nundo].off, value = kg.undo[kg.nundo].value;
++	const char *name = kg.undo[kg.nundo].name;
++	switch (kg.undo[kg.nundo].kind) {
++	case KG_UNDO_WORD:
++		kg_wr(base, off, value);
++		break;
++	case KG_UNDO_CLEAR:
++		kg_wr(base, off, kg_rd(base, off) & ~value);
++		break;
++	case KG_UNDO_RCG:               /* off = the CFG register; CMD is 4 before it */
++		kg_wr(base, off, value);
++		kg_wr(base, off - 4, kg_rd(base, off - 4) | KG_RCG_UPDATE);
++		(void)kg_poll(base, off - 4, KG_RCG_UPDATE, 0, 10);
++		break;
++	case KG_UNDO_GDSC:              /* the vendor's driver does not check the status on disable */
++		kg_wr(base, off, kg_rd(base, off) | KG_GDSC_COLLAPSE);
++		(void)kg_poll(base, off, KG_GDSC_PWR_ON, 0, 100);
++		break;
++	}
++	printf("SWEET KGPU: undo %s +%#x: now %#x\n", name, off, kg_rd(base, off));
++}
++
+ static void
+ kg_wait(unsigned ms)
+ {
+@@ -831,6 +866,48 @@ kg_step9(void)
+ 	return true;
+ }
+ 
++/* ---- step 10: the GMU's memory takes what is written ---- */
++
++#define KG_GMU_OFF(reg)  (4u * (reg) - (KG_GMU_PA - KG_GPU_PA))
++
++/*
++ * Firmware is loaded by writing it into the GMU processor's memories through
++ * these registers while the processor is held in reset (kgsl
++ * gen7_gmu_load_fw). Two words of DTCM go there and back, and what was there
++ * is put back at once.
++ */
++static bool
++kg_step10(void)
++{
++	static const uint32_t pattern[2] = { 0x600d0001u, 0x0a110002u };
++	uint32_t back[2];
++
++	if (!kg_cx_ready(10) || kg.gmu == 0) {
++		printf("SWEET KGPU: 10 needs steps 4-6\n");
++		return false;
++	}
++	kg_announce(10, "the GMU's reset and firmware state");
++	uint32_t sysreset = kg_gmu(GEN7_GMU_CM3_SYSRESET), init = kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT);
++	printf("SWEET KGPU: 10 cm3 sysreset %#x fw_init_result %#x\n", sysreset, init);
++	if (!(sysreset & 1u) || (init & (1u << 8))) {
++		printf("SWEET KGPU: 10 the GMU's processor is running (or has run firmware): leaving its memory alone\n");
++		return false;
++	}
++	kg_next(10, "two words into the GMU's DTCM (0x3d71000), read back, then restored");
++	for (unsigned i = 0; i < 2; i++) {
++		kg_put("GMU", kg.gmu, KG_GMU_OFF(GEN7_GMU_CM3_DTCM_START + i), pattern[i], KG_UNDO_WORD, 0, "dtcm");
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		back[i] = kg_gmu(GEN7_GMU_CM3_DTCM_START + i);
++	}
++	kg_undo_pop();
++	kg_undo_pop();
++	bool takes = back[0] == pattern[0] && back[1] == pattern[1];
++	printf("SWEET KGPU: 10 read back %#x %#x: the GMU's memory %s\n", back[0], back[1],
++	    takes ? "TAKES WHAT IS WRITTEN: its firmware can be loaded" : "does not hold what was written");
++	return takes;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -851,28 +928,7 @@ kg_teardown(void)
+ 	printf("SWEET KGPU: undoing %u writes, in reverse\n", kg.nundo);
+ 	kg_wait(kg.pause_ms);
+ 	while (kg.nundo > 0) {
+-		--kg.nundo;
+-		vm_offset_t base = kg.undo[kg.nundo].base;
+-		uint32_t off = kg.undo[kg.nundo].off, value = kg.undo[kg.nundo].value;
+-		const char *name = kg.undo[kg.nundo].name;
+-		switch (kg.undo[kg.nundo].kind) {
+-		case KG_UNDO_WORD:
+-			kg_wr(base, off, value);
+-			break;
+-		case KG_UNDO_CLEAR:
+-			kg_wr(base, off, kg_rd(base, off) & ~value);
+-			break;
+-		case KG_UNDO_RCG:               /* off = the CFG register; CMD is 4 before it */
+-			kg_wr(base, off, value);
+-			kg_wr(base, off - 4, kg_rd(base, off - 4) | KG_RCG_UPDATE);
+-			(void)kg_poll(base, off - 4, KG_RCG_UPDATE, 0, 10);
+-			break;
+-		case KG_UNDO_GDSC:              /* the vendor's driver does not check the status on disable */
+-			kg_wr(base, off, kg_rd(base, off) | KG_GDSC_COLLAPSE);
+-			(void)kg_poll(base, off, KG_GDSC_PWR_ON, 0, 100);
+-			break;
+-		}
+-		printf("SWEET KGPU: undo %s +%#x: now %#x\n", name, off, kg_rd(base, off));
++		kg_undo_pop();
+ 	}
+ 	if (kg.gpucc != 0) {
+ 		printf("SWEET KGPU: after undo: cx gdsc %#x hw_ctrl %#x gx gdsc %#x\n", kg_rd(kg.gpucc, KG_CX_GDSCR),
+@@ -883,14 +939,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -925,12 +981,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 9 ? 9u : (unsigned)last;
++	kg.last = last > 10 ? 10u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 9) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..9 exist; running those\n", last);
++	if (last > 10) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..10 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);

@@ -197,7 +197,15 @@ Meaning (open question 1, read half): **every GPU block is readable from our ker
 (GCC, cmd-db, QFPROM, GPU_CC, GMU, GBIF, CX misc, RSCC, PDC, SMMU global + CB0). Whether the
 SMMU's values are the hardware's or the hypervisor's own, they are consistent with an MMU-500.
 NEXT: step 10, the first write to the GMU (two words into DTCM and back, restored), then the
-TrustZone questions (11: SCM availability, 12: zap .mdt signature check). Any other sandbox_container_path_* caller gets
+TrustZone questions (11: SCM availability, 12: zap .mdt signature check).
+
+**GPU STEP 10 = 0975 (2026-10-23, written, NOT built/booted), `kgpu=10`: the first GMU write.**
+Refuses unless CM3_SYSRESET bit 0 is set (processor in reset; #29: 0x1) and FW_INIT_RESULT bit 8
+is clear (no firmware started; #29: 0). Then two logged writes, 0x600d0001 / 0x0a110002, into
+DTCM 0x1c400/0x1c401 (0x3d71000), read back, and the old words restored at once through the
+undo list (new kg_undo_pop(), also used by the teardown; the restores print "undo dtcm ...").
+Success line: "the GMU's memory TAKES WHAT IS WRITTEN: its firmware can be loaded". Verified:
+217 patches, series reproduces the file, syntax clean. **Test:** #30 image with `kgpu=10`. Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
