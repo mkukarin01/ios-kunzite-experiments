@@ -205,7 +205,20 @@ is clear (no firmware started; #29: 0). Then two logged writes, 0x600d0001 / 0x0
 DTCM 0x1c400/0x1c401 (0x3d71000), read back, and the old words restored at once through the
 undo list (new kg_undo_pop(), also used by the teardown; the restores print "undo dtcm ...").
 Success line: "the GMU's memory TAKES WHAT IS WRITTEN: its firmware can be loaded". Verified:
-217 patches, series reproduces the file, syntax clean. **Test:** #30 image with `kgpu=10`. Any other sandbox_container_path_* caller gets
+217 patches, series reproduces the file, syntax clean. **Test:** #30 image with `kgpu=10`.
+
+**BOOT #31 (2026-10-23 18:14, shim/out/shim-boot-31.img = #30 with `kgpu=10`, kernel CI 39957643812
+@ b7db169 sha256 7e7927b2...): STEP 10 PASSES, NO RESET.** Log:
+temp/ios-m8/usblog/live-boot31-20261023-1814.txt. CM3 sysreset 0x1, fw_init_result 0; DTCM
++0x9000 0xdc117fdb -> 0x600d0001, +0x9004 0x0736439a -> 0x0a110002; read back 0x600d0001
+0x0a110002 = **the GMU's memory takes what is written (firmware can be loaded this way)**; old
+words restored at once (undo lines), then the usual 5-write undo; CX back to 0x22f001. System as
+before (driverkitd only). (DTCM's leftover words differ per boot: #29 read 0x8c117fdb first;
+power-up SRAM contents.) First write to the GMU block itself: allowed under Gunyah.
+NEXT: steps 11-12, TrustZone: 11 = SCM calls that pass no memory (does TZ answer this kernel;
+is PAS 13 = GPU zap supported), 12 = zap .mdt signature check (PAS init image with the
+a710_zap.mdt header in memory TZ is pointed at). Both are SCM calls, not MMIO: our SCM/PAS path
+exists only in TopazModem (0113+, never run on kunzite). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
