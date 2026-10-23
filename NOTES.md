@@ -35,7 +35,13 @@ copyin) and the early `return 0` exits. Before the merge op 4 was always ENOENT 
 default) -> clean skip. **Fix = 0970-kunzite-sandbox-container-enoent.patch** (2026-10-23): op 4
 returns ENOENT on every no-answer path. Applied in series order (only 0936 touches the file),
 the result matches the edit; xnu/patches now holds 212 patches. NOT compiled locally (no swiftlang clang, no CI log for xnu-cc.py) and NOT built by CI yet.
-Probably an upstream topaz bug too.
+Probably an upstream topaz bug too. Any other sandbox_container_path_* caller gets
+the same garbage "success", so the fix covers more than syncdefaultsd.
+Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
++[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
+slice 0x10000b9cc-0x10000b9e4: the path is _SFSafariIconImageCacheDirectoryPath(), derived from
+_SFSafariContainerPath; the binary imports sandbox_container_path_for_pid. Very likely the same
+cause; not traced inside the dyld-cache framework. Copies are in the same crash-boot25/ dir.
 
 **BOOT #26 (2026-10-23 15:55, shim/out/shim-boot-26.img = #25 shim + ADT + cmdline, kernel CI
 39941218932 @ aca67b0 sha256 87e73ec0..., 0970 confirmed in the binary: every no-answer exit
@@ -218,15 +224,28 @@ power-up SRAM contents.) First write to the GMU block itself: allowed under Guny
 NEXT: steps 11-12, TrustZone: 11 = SCM calls that pass no memory (does TZ answer this kernel;
 is PAS 13 = GPU zap supported), 12 = zap .mdt signature check (PAS init image with the
 a710_zap.mdt header in memory TZ is pointed at). Both are SCM calls, not MMIO: our SCM/PAS path
-exists only in TopazModem (0113+, never run on kunzite). Any other sandbox_container_path_* caller gets
-the same garbage "success", so the fix covers more than syncdefaultsd.
-Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
-+[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
-slice 0x10000b9cc-0x10000b9e4: the path is _SFSafariIconImageCacheDirectoryPath(), derived from
-_SFSafariContainerPath; the binary imports sandbox_container_path_for_pid. Very likely the same
-cause; not traced inside the dyld-cache framework. Copies are in the same crash-boot25/ dir.
+exists only in TopazModem (0113+, never run on kunzite).
 
-**What to expect (read from the merged code, not seen on the phone yet):**
+**GPU STEPS 11-12 = 0976 (2026-10-23, written, NOT built/booted), `kgpu=12`: TrustZone.** Calls go
+through TopazModem's exported topaz_scm (SiP, SMC64, yielding = Linux qcom_scm-smc; resumes
+"interrupted"); fw via topaz_fw_read (root FS). All four symbols confirmed exported in the CI
+kernel. Step 11 (no memory passed): is_call_available(is_call_available) must say 1 (else
+"TrustZone does not answer the way it answers Linux" and stop); is_call_available for PAS init
+image / mem setup / auth+reset / shutdown / is_supported; pas_is_supported for 1 ADSP, 4 modem,
+9 video, 13 GPU. Step 12: reads /usr/share/firmware/kunzite/a710_zap.mdt (4044 bytes: ELF32
+header 52 + 3 phdrs 96 + hash segment 3896 = the metadata TZ wants as is; checked), writes it
+with aligned words into the uncached page 0xdff00000 (low DDR: Android "System RAM", never
+XNU's; below 4 GiB like Linux's buffer, qcom_scm's default 32-bit DMA mask), then
+PAS_INIT_IMAGE(13, 0xdff00000), arginfo VAL,RW. Success line: "TRUSTZONE ACCEPTS THE ZAP
+SHADER'S SIGNATURE FROM THIS KERNEL". Nothing is loaded or started; the page is not touched again
+(TZ may XPU-protect it); TZ keeps the pending PAS 13 state until reboot (as hk). Verified: 218
+patches, series reproduces the file, syntax clean. **Before the test, once:** `curl -s -T
+temp/kunzite-vendor/proprietary/vendor/firmware/a710_zap.mdt
+'http://192.168.7.2:8022/put?p=/usr/share/firmware/kunzite/a710_zap.mdt&m=644&mk=1'` (vendor
+firmware: on the phone only, never in git). **Test:** #31 image with `kgpu=12`. A reset right
+after an "smc" line = Gunyah/TZ does not take that call from us.
+
+**What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
   gets every 2nd frame (fFlushTicks=2). Try `sweetfb_hz=60` to see it (twice the CPU copy work).

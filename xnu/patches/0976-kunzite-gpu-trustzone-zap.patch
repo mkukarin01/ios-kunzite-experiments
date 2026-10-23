@@ -1,0 +1,254 @@
+kunzite: Adreno 710 steps 11-12, TrustZone (kgpu=11/12; 1-10 unchanged), through TopazModem's
+topaz_scm (SiP SMC64 yielding, resumed when interrupted). 11, no memory passed: is_call_available
+(itself, then the five PAS calls) and pas_is_supported for 1 ADSP, 4 modem, 9 video, 13 GPU zap.
+12: /usr/share/firmware/kunzite/a710_zap.mdt (topaz_fw_read; the phone's /vendor/firmware file,
+uploaded once) checked to be ELF32 headers + hash segment only, copied with aligned word writes
+into the uncached low-DDR page 0xdff00000 (Android System RAM, never XNU's, below 4 GiB like
+Linux's qcom_scm buffer), then PAS_INIT_IMAGE(13, page): TrustZone's signature check. Nothing is
+loaded or started; the page is not touched again.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -3,9 +3,9 @@
+  * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
+  * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+- * write to the GMU itself.
++ * write to the GMU itself; 11-12 ask TrustZone.
+  *
+- * Boot-arg kgpu=N (N <= 10) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 12) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -57,6 +57,15 @@
+  *  10 writes two words into the GMU's DTCM (0x1c400) while its processor is
+  *     held in reset and no firmware has run, reads them back, and restores
+  *     the old words at once (kgsl loads firmware the same way).
++ *  11 asks TrustZone (SCM calls that pass no memory): is IS_CALL_AVAILABLE
++ *     itself available (Linux's first question), are the PAS calls (init
++ *     image, mem setup, auth and reset, shutdown, is supported), and which
++ *     PAS images it supports: 1 ADSP, 4 modem, 9 video, 13 the GPU's zap shader.
++ *  12 hands TrustZone the zap shader's header (KG_ZAP_MDT on the root FS: the
++ *     ELF header, program headers and hash segment, the whole .mdt) in the
++ *     page KG_ZAP_META_PA and asks PAS_INIT_IMAGE(13) to check its
++ *     signature (qcom_mdt_pas_init / qcom_scm_pas_init_image). Nothing is
++ *     loaded or started; the page is not touched again.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -75,6 +84,12 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
++/* iokit/Kernel/arm/TopazModem.cpp: one SCM call, "interrupted" calls resumed with the x6 session */
++extern uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
++/* bsd/dev/topaz_fw.c: a whole file of the root filesystem, once it is mounted */
++extern int topaz_fw_read(const char *path, void **data, size_t *size);
++extern void topaz_fw_free(void *data, size_t size);
++extern int topaz_root_mounted(void);
+ void kunzite_adreno_init(void);
+ 
+ #define KG_GCC_PA        0x00100000u
+@@ -174,6 +189,27 @@ void kunzite_adreno_init(void);
+ #define SMMU_CB_FSR      0x58u
+ #define SMMU_CB_FAR      0x60u
+ 
++/* TrustZone (qcom_scm.c / qcom_scm-smc.c: SiP, SMC64, yielding; the same as TopazModem's) */
++#define KG_SCM_FN(call)          (0x42000000u | (call))         /* the SMC function number */
++#define KG_SCM_ID(call)          (0x02000000u | (call))         /* the same call as an argument */
++#define KG_SCM_INFO_IS_AVAIL     0x601u          /* service << 8 | command */
++#define KG_SCM_PAS_INIT_IMAGE    0x201u
++#define KG_SCM_PAS_MEM_SETUP     0x202u
++#define KG_SCM_PAS_AUTH_RESET    0x205u
++#define KG_SCM_PAS_SHUTDOWN      0x206u
++#define KG_SCM_PAS_IS_SUPPORTED  0x207u
++#define KG_SCM_ARGS_VAL          1u              /* one plain value */
++#define KG_SCM_ARGS_VAL_RW       (2u | (2u << 6))  /* a value, then a buffer TZ reads and writes */
++#define KG_PAS_GPU               13u             /* kgsl_util.c GPU_PASID */
++#define KG_ZAP_MDT               "/usr/share/firmware/kunzite/a710_zap.mdt"
++/*
++ * The page the zap header goes in for TrustZone: low DDR, "System RAM" under
++ * Android (0xa7000000-0xe05fffff), never XNU's (its RAM is 0x900000000 on);
++ * below 4 GiB like Linux's (qcom_scm's 32-bit DMA mask). Mapped uncached.
++ * TrustZone may protect it during and after the call: nothing touches it again.
++ */
++#define KG_ZAP_META_PA           0xdff00000u
++
+ /* cmd-db (cmd-db.c): header 144 bytes, 8 slave headers at +8, entries 24 bytes */
+ #define KG_DB_MAGIC      0x0c0330dbu
+ #define KG_DB_HEADER     144u
+@@ -908,6 +944,139 @@ kg_step10(void)
+ 	return takes;
+ }
+ 
++/* ---- step 11: TrustZone, calls that pass no memory ---- */
++
++/* one call, said before it is made (an SMC the hypervisor dislikes ends the run without a word) */
++static uint64_t
++kg_scm(unsigned step, const char *what, uint32_t call, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t *res)
++{
++	printf("SWEET KGPU: %u smc %#x (%s) args %#llx %#llx\n", step, KG_SCM_FN(call), what, a, b);
++	*res = ~0ull;
++	uint64_t ret = topaz_scm(KG_SCM_FN(call), arginfo, a, b, 0, res);
++	printf("SWEET KGPU: %u   -> ret %#llx res %#llx\n", step, ret, *res);
++	return ret;
++}
++
++static bool
++kg_step11(void)
++{
++	static const struct { uint32_t call; const char *name; } calls[] = {
++		{ KG_SCM_PAS_INIT_IMAGE, "pas init image" }, { KG_SCM_PAS_MEM_SETUP, "pas mem setup" },
++		{ KG_SCM_PAS_AUTH_RESET, "pas auth and reset" }, { KG_SCM_PAS_SHUTDOWN, "pas shutdown" },
++		{ KG_SCM_PAS_IS_SUPPORTED, "pas is supported" },
++	};
++	static const struct { uint32_t id; const char *name; } images[] = {
++		{ 1, "ADSP" }, { 4, "modem" }, { 9, "video" }, { KG_PAS_GPU, "GPU zap shader" },
++	};
++	uint64_t res;
++	unsigned supported = 0;
++
++	kg_announce(11, "nothing; next: SCM is_call_available(is_call_available), Linux's first question to TrustZone");
++	if (kg_scm(11, "is_call_available", KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(KG_SCM_INFO_IS_AVAIL), 0,
++	    &res) != 0 || res != 1) {
++		printf("SWEET KGPU: 11 TrustZone does not answer the way it answers Linux\n");
++		return false;
++	}
++	kg_announce(11, "nothing; next: is_call_available for the five PAS calls");
++	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
++		uint64_t ret = kg_scm(11, calls[i].name, KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(calls[i].call), 0, &res);
++		printf("SWEET KGPU: 11 %s: %s\n", calls[i].name, ret == 0 && res == 1 ? "available" : "NOT available");
++	}
++	kg_announce(11, "nothing; next: pas_is_supported for images 1, 4, 9, 13");
++	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
++		uint64_t ret = kg_scm(11, images[i].name, KG_SCM_PAS_IS_SUPPORTED, KG_SCM_ARGS_VAL, images[i].id, 0, &res);
++		bool yes = ret == 0 && res == 1;
++		printf("SWEET KGPU: 11 PAS %u (%s): %s\n", images[i].id, images[i].name, yes ? "supported" : "not supported");
++		if (yes && images[i].id == KG_PAS_GPU) {
++			supported = 1;
++		}
++	}
++	printf("SWEET KGPU: 11 %s\n", supported ? "TRUSTZONE ANSWERS THIS KERNEL AND SUPPORTS THE GPU ZAP SHADER (PAS 13)" :
++	    "TrustZone answers, but does not list PAS 13: step 12 shows whether that matters");
++	return true;
++}
++
++/* ---- step 12: the zap shader's signature ---- */
++
++/* the .mdt as TrustZone takes it: ELF32 header, program headers, then the hash segment, nothing else */
++static bool
++kg_zap_header_ok(const uint8_t *m, size_t size)
++{
++	if (size < 52 || size > PAGE_SIZE || m[0] != 0x7f || m[1] != 'E' || m[2] != 'L' || m[3] != 'F' || m[4] != 1) {
++		printf("SWEET KGPU: 12 not a 32-bit ELF header of at most a page (%lu bytes)\n", (unsigned long)size);
++		return false;
++	}
++	uint32_t phoff = (uint32_t)m[28] | (uint32_t)m[29] << 8 | (uint32_t)m[30] << 16 | (uint32_t)m[31] << 24;
++	unsigned phnum = (unsigned)m[44] | (unsigned)m[45] << 8;
++	uint32_t hash = 0;
++	if (phoff != 52 || phnum < 2 || 52u + 32u * phnum > size) {
++		printf("SWEET KGPU: 12 unexpected program headers (at %u, %u of them)\n", phoff, phnum);
++		return false;
++	}
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = m + 52 + 32 * i;
++		uint32_t flags = (uint32_t)p[24] | (uint32_t)p[25] << 8 | (uint32_t)p[26] << 16 | (uint32_t)p[27] << 24;
++		if (((flags >> 24) & 7u) == 2) {        /* QCOM_MDT_TYPE_HASH */
++			hash = (uint32_t)p[16] | (uint32_t)p[17] << 8 | (uint32_t)p[18] << 16 | (uint32_t)p[19] << 24;
++		}
++	}
++	printf("SWEET KGPU: 12 zap header: %u program headers, hash segment %u bytes, file %lu bytes\n", phnum, hash,
++	    (unsigned long)size);
++	if (hash == 0 || 52u + 32u * phnum + hash != size) {
++		printf("SWEET KGPU: 12 the file is not the headers followed by the hash segment alone\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++kg_step12(void)
++{
++	void *data = NULL;
++	size_t size = 0;
++	uint64_t res;
++
++	kg_announce(12, "the zap shader's header " KG_ZAP_MDT " from the root filesystem");
++	if (!topaz_root_mounted()) {
++		printf("SWEET KGPU: 12 the root filesystem is not mounted yet: raise kgpu_delay\n");
++		return false;
++	}
++	int err = topaz_fw_read(KG_ZAP_MDT, &data, &size);
++	if (err != 0) {
++		printf("SWEET KGPU: 12 cannot read " KG_ZAP_MDT " (error %d): upload the phone's "
++		    "/vendor/firmware/a710_zap.mdt there\n", err);
++		return false;
++	}
++	if (!kg_zap_header_ok(data, size)) {
++		topaz_fw_free(data, size);
++		return false;
++	}
++	kg_next(12, "the header into the page 0xdff00000 (low DDR, uncached), then PAS_INIT_IMAGE(13)");
++	vm_offset_t page = kg_map("zap metadata page", KG_ZAP_META_PA, PAGE_SIZE);
++	if (page == 0) {
++		topaz_fw_free(data, size);
++		return false;
++	}
++	printf("SWEET KGPU: 12 write zap metadata page %#x: %lu bytes\n", KG_ZAP_META_PA, (unsigned long)size);
++	for (size_t off = 0; off < PAGE_SIZE; off += 4) {      /* device memory: aligned words only */
++		uint32_t w = 0;
++		for (size_t k = 0; k < 4 && off + k < size; k++) {
++			w |= (uint32_t)((const uint8_t *)data)[off + k] << (8 * k);
++		}
++		kg_wr(page, (uint32_t)off, w);
++	}
++	topaz_fw_free(data, size);
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t ret = kg_scm(12, "pas init image (zap signature)", KG_SCM_PAS_INIT_IMAGE, KG_SCM_ARGS_VAL_RW, KG_PAS_GPU,
++	    KG_ZAP_META_PA, &res);
++	if (ret == 0 && res == 0) {
++		printf("SWEET KGPU: 12 TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n");
++		return true;
++	}
++	printf("SWEET KGPU: 12 TrustZone does not take it (ret %#llx res %#llx)\n", ret, res);
++	return false;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -939,14 +1108,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -981,12 +1150,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 10 ? 10u : (unsigned)last;
++	kg.last = last > 12 ? 12u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 10) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..10 exist; running those\n", last);
++	if (last > 12) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..12 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
