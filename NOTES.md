@@ -568,6 +568,30 @@ the three blocks freed, then step 18's OOB clear and slumber; peaks at 50. Teard
 CP stays halted)". Verified: 226 patches, series reproduces the file, syntax clean. **Test:** #39
 image with `kgpu=19`.
 
+**BOOT #40 (2026-10-24 00:03, shim/out/shim-boot-40.img = #39 with `kgpu=19`, kernel CI 40007469839
+@ c950025 sha256 09e89eac...): KGPU 19 PASSES, "THE GPU HAS ITS CONTEXT, RING AND SQE MICROCODE (the
+CP stays halted)"; NO PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot40-20261024-0003.txt.
+Steps 1-18 as #39 (GX on: gfx_pwr_clk_status 0, GX GDSCR 0xf8222800, RBBM_STATUS 0x1). Step 19
+before: smr0 0, s2cr0 0x20000 (fault), cbar0 0, cb0 sctlr 0x70e (off, leftovers: tcr 0x5886538a,
+ttbr0 0x2e01032f:40804030, mair0 0xf020241), stream 0 unmatched; CP_SQE_CNTL 0, SQE_INSTR_BASE
+and RB_BASE 0. **H2F_MSG_START acked result 0** (hdr 0x90010a, ack 0x81030a). a710_sqe.fw read
+from the root filesystem: 36308 bytes, version 0x1710181, words 0 0x1710181 0x1002374
+0x1710149. GPU 0x100000000 (ring, 32K) -> 0xa2b248000, 0x100008000 (scratch) -> 0xa2b24c000,
+0x100010000 (SQE, 9 pages) -> 0xa2b258000; **9 of 12 tables used** (7 + L2 + L3, as planned),
+root 0xa24a4c000. CB0 programmed and kept (cba2r 1, cbar 0x1f300, tcr2 0x38011, tcr 0x803519,
+ttbr0 0xa:24a4c000, mair0 0xf404ff44); TLB syncs on CB0 and CB1 done; CB0 on (sctlr reads 0x27,
+as CB1 does), S2CR0 0 (translate, CB0), **SMR0 0x84000000** (valid, mask 0x400, stream 0); fsr
+0x400 sgfsr 0. **CP_RB_BASE 0x1:00000000 and CP_SQE_INSTR_BASE 0x1:00010000 read back**;
+CP_SQE_CNTL 0; RBBM_STATUS 0x1; CB0 and CB1 FSR 0x400 (no fault). Undo (50 entries): smr0 0,
+s2cr0 0x20000, cb0 sctlr 0, the three blocks freed, then oob_gpu clear and the slumber
+(PREPARE_SLUMBER acked, GX off, rpmh_power_state 0xf, RSC sleep done), CM3s, alias unmapped,
+RSC/PDC back, three table pages freed, CX down; "run over". The undo's lines now carry step 19
+(kg.step kept). System as #39 (agent up). **The port map's 1-18 proven (kgpu 1-19).** NEXT
+(kgpu 20 = the port map's 19-20): the zap shader loaded through TrustZone (PAS mem setup + auth
+and reset of a710_zap.mdt/.bNN into its region 0x89e1a000), then gen7_start's registers and
+gen7_rb_start: RPTR_ADDR, RB_CNTL, CP_SQE_CNTL 1 and CP_INIT - the CP fetching the microcode
+through context 0 is the proof of the GPU's translation.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
