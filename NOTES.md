@@ -146,7 +146,26 @@ status0, pdc_slave_id, seq_busy, seq_mem_0, drv config, slot irq enable/pending,
 enable 0x4500 / seq_start 0x4520. Verified: 215 patches, series reproduces the file, syntax
 check clean. **Test:** CI -> #28 image with `kgpu=7`. A reset after an "about to read" line =
 that block is not reachable (or needs something kgsl does that we skip); counters at 19.2 MHz
-= the GMU side answers; then steps 8-9 (SMMU ID registers, first context, read-only). Any other sandbox_container_path_* caller gets
+= the GMU side answers; then steps 8-9 (SMMU ID registers, first context, read-only).
+
+**BOOT #29 (2026-10-23 17:31, shim/out/shim-boot-29.img = #28 with `kgpu=7`, kernel CI 39952140324
+@ 4fcd0ce sha256 5bb229d3...): STEPS 6-7 READ CLEAN, UNDO CLEAN, NO RESET.** Log:
+temp/ios-m8/usblog/live-boot29-20261023-1731.txt. System as before (driverkitd only, no panic).
+- 6 GMU: cm3 sysreset 0x1 (the GMU's CM3 is held in reset), boot_config 0, fw_init_result 0
+  (no firmware), cm3_cfg 0x4052; hfi_ctrl_status 0, general_7 0, rpmh_power_state 0xf,
+  gfx_pwr_clk_status 0x3, keepalive 0; AO host irq 0, cx_busy 0x30000000, ahb_fence 0.
+  **ALWAYS_ON_COUNTER (0x1f888) runs at 19,198,540 Hz: THE GPU BLOCK ANSWERS.** CX_AO_COUNTER
+  (0x1f880, the one kgsl reads) = 0, not counting: started by something later (GMU firmware?).
+  ITCM/DTCM first words = random SRAM content (readable). GBIF cx_config 0x20001, scache_cntl0 0,
+  **halt 0x8, halt_ack 0x3** (kgsl writes GBIF_HALT=0 before GMU boot, adreno_gen7_gmu.c:1007,
+  "may not get cleared if the gdsc was not reset": part of step 15). CX misc AHB controls all 0.
+- 7 RSCC 0x3d50000: status0 0, pdc_slave_id 0x1, seq_busy 0, **seq_mem_0 0 (no RSC microcode:
+  kgsl loads 0xeaaae5a0 there, step 16)**, drv_config 0x4000000a, control_ack 0; slot irq 0/0;
+  slots 0-3 idle 0x1, nothing enabled. PDC 0xb270000: enable 0x101, seq_start 0 (kgsl writes
+  both in gen7_load_pdc_ucode, step 16; a6xx's enable value is 0x80000001, gen7's not in our tree).
+Meaning: GMU, GBIF, CX misc, RSCC and PDC are all reachable with CX on. NEXT: steps 8-9, the GPU
+SMMU (qsmmu-v500 0x3da0000): ID registers, stream matching, first context (read-only), then the
+TrustZone questions (11-12). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
