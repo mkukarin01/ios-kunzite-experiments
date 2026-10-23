@@ -1,0 +1,283 @@
+kunzite: Adreno 710 step 16, the GMU's RPMh channel and HFI start (kgpu=16; 1-15 unchanged).
+16 continues kgsl's gen7_gmu_first_boot after gen7_gmu_device_start, the GMU running as step 15
+left it (FW_INIT_RESULT 0x100, CM3 out of reset; checked first). gen7_load_rsc_ucode into the
+RSCC (0x3d50000), in kgsl's order: STATUS0 bit 24 (SDE clock gating off), PDC_SLAVE_ID 1, the
+three hidden TCS commands (0, 0, data 0x80000000: gen7_3_0 is not in the gen7_2_x family),
+OVERRIDE_START_ADDR 0, PDC_SEQ_START_ADDR 0x4520, PDC_MATCH_VALUE 0x4510/0x4514, and the five
+sequencer words at SEQ_MEM_0 (0x180); every word read back. gen7_load_pdc_ucode into the GPU PDC
+(0xb270000): SEQ_START_ADDR 0, ENABLE_PDC 0x80000001 (the boot leaves 0x101). kgsl writes these
+once per boot and never takes them back; here all 19 are undone at the end (the boot's words
+back, popped before step 15's reset, the GMU idle in its HFI loop). Then gen7_gmu_hfi_start:
+HFI_CTRL_INIT 1 (kept) and HFI_CTRL_STATUS bit 0 polled for 100 ms (boot #36 already saw 1
+right after the firmware started, so the before/after values are printed), 100 ms more, then
+GMU2HOST_INTR_INFO decoded (msgq, dbgq, CM3 fault, OOB), the log's non-zero words before and
+after, the three queue headers and the debug queue's first words if it has any, CB1 FSR. No HFI
+message is sent (step 17). The log count now covers the whole 64K log (step 15 too, through a
+helper); KG_UNDO_MAX 40 -> 64 (the undo peaks at 39).
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 507e28c..a0937e0 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -4,9 +4,10 @@
+  * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+  * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write;
+- * 14 loads the GMU's firmware; 15 lets the GMU run it.
++ * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
++ * channel and starts HFI.
+  *
+- * Boot-arg kgpu=N (N <= 15) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 16) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -86,6 +87,12 @@
+  *     (kept), then CM3_SYSRESET 0 and FW_INIT_RESULT polled for 0x100
+  *     (bits 11:9 = NMI). Reports the SMMU fault registers and how much of
+  *     the log the GMU wrote. Undo: back into reset first, then the frees.
++ *  16 continues kgsl's first boot after device_start: gen7_load_rsc_ucode
++ *     (RSCC handshake words + 5 sequencer words; gen7_3_0 is not gen7_2_x)
++ *     and gen7_load_pdc_ucode (PDC seq start 0, enable 0x80000001), both
++ *     undone at the end (the boot's words back, the GMU still running);
++ *     then gen7_gmu_hfi_start: HFI_CTRL_INIT 1 (kept), HFI_CTRL_STATUS bit
++ *     0 polled for 100 ms. Reports the log, interrupts and HFI queues.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -144,7 +151,7 @@ void kunzite_adreno_init(void);
+ #define KG_RCG_CFG_MASK  0x371fu         /* [4:0] 2*div-1, [10:8] source, [13:12] mode */
+ #define KG_RCG_GPLL0_DIV(twice) (6u << 8 | ((twice) - 1u))
+ #define KG_CBCR_ENABLE   (1u << 0)
+-#define KG_UNDO_MAX      40u
++#define KG_UNDO_MAX      64u
+ 
+ /* the GPU block: kgsl register numbers are dwords from 0x3d00000 (gen7_reg.h) */
+ #define KG_GPU_PA        0x03d00000u
+@@ -1381,6 +1388,7 @@ static struct {
+ } kg_gmu_mem[KG_GMU_BLOCKS];
+ static unsigned kg_gmu_nmem;
+ static bool kg_gmu_loaded;               /* step 14 got through, in this run */
++static bool kg_gmu_runs;                 /* step 15 got FW_INIT_RESULT 0x100 */
+ 
+ /* [a, a + s) inside [base, base + len) */
+ static bool
+@@ -1604,6 +1612,20 @@ kg_gmu_host(uint32_t addr)
+ 	return 0;
+ }
+ 
++/* non-zero words in the GMU's log, read from memory */
++static unsigned
++kg_gmu_log_words(void)
++{
++	volatile uint32_t *log = (volatile uint32_t *)kg_gmu_host(KG_GMU_LOG_VA);
++	unsigned n = 0;
++
++	kg_to_memory((vm_offset_t)log, KG_GMU_LOG_SIZE);
++	for (unsigned i = 0; i < KG_GMU_LOG_SIZE / 4u; i++) {
++		n += log[i] != 0;
++	}
++	return n;
++}
++
+ /*
+  * kgsl gen7_gmu_first_boot after load_fw: gen7_gmu_register_config (with
+  * gen7_gmu_power_config), then gen7_gmu_device_start. Skipped: the TZ CX
+@@ -1697,30 +1719,155 @@ kg_step15(void)
+ 	bool runs = (result & 0x1ffu) == 0x100u;
+ 
+ 	/* what the GMU did: its status registers, the SMMU's view, and its log in our memory */
++	unsigned written = kg_gmu_log_words();
+ 	vm_offset_t log = kg_gmu_host(KG_GMU_LOG_VA);
+-	kg_to_memory(log, 0x1000);
+ 	kg_to_memory((vm_offset_t)t, sizeof(*t));
+-	unsigned written = 0;
+-	for (unsigned i = 0; i < 1024; i++) {
+-		written += ((volatile uint32_t *)log)[i] != 0;
+-	}
+ 	printf("SWEET KGPU: 15 fw_init_result %#x hfi_ctrl_status %#x gmu2host_intr_info %#x ao_host_interrupt_status %#x "
+ 	    "sysreset %#x\n", result, kg_gmu(GEN7_GMU_HFI_CTRL_STATUS), kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO),
+ 	    kg_gmu(GEN7_GMU_AO_HOST_INTERRUPT_STATUS), kg_gmu(GEN7_GMU_CM3_SYSRESET));
+ 	printf("SWEET KGPU: 15 cb1 fsr %#x far %#x:%08x fsynr0 %#x; sgfsr %#x\n", kg_rd(kg.smmu, cb + SMMU_CB_FSR),
+ 	    kg_rd(kg.smmu, cb + SMMU_CB_FAR + 4), kg_rd(kg.smmu, cb + SMMU_CB_FAR), kg_rd(kg.smmu, cb + SMMU_CB_FSYNR0),
+ 	    kg_rd(kg.smmu, SMMU_SGFSR));
+-	printf("SWEET KGPU: 15 gmu log: %u of its first 1024 words written; %#x %#x %#x %#x; "
++	printf("SWEET KGPU: 15 gmu log: %u of its %u words written; %#x %#x %#x %#x; "
+ 	    "hfi queues r/w %u/%u %u/%u %u/%u\n",
+-	    written, ((volatile uint32_t *)log)[0], ((volatile uint32_t *)log)[1], ((volatile uint32_t *)log)[2],
+-	    ((volatile uint32_t *)log)[3], t->q[0].read_index, t->q[0].write_index, t->q[1].read_index,
+-	    t->q[1].write_index, t->q[2].read_index, t->q[2].write_index);
++	    written, KG_GMU_LOG_SIZE / 4u, ((volatile uint32_t *)log)[0], ((volatile uint32_t *)log)[1],
++	    ((volatile uint32_t *)log)[2], ((volatile uint32_t *)log)[3], t->q[0].read_index, t->q[0].write_index,
++	    t->q[1].read_index, t->q[1].write_index, t->q[2].read_index, t->q[2].write_index);
+ 	printf("SWEET KGPU: 15 %s\n", runs ? "THE GMU'S FIRMWARE RUNS" :
+ 	    (result & 0xe00u) ? "the GMU's firmware stopped in its NMI handler (fw_init_result bits 11:9)" :
+ 	    "the GMU's firmware does not report started in 500 ms");
++	kg_gmu_runs = runs;
+ 	return runs;
+ }
+ 
++/* ---- step 16: the GMU's RPMh channel, HFI ---- */
++
++#define GEN7_RSCC_PDC_SEQ_START_ADDR     0x008
++#define GEN7_RSCC_PDC_MATCH_VALUE_LO     0x009
++#define GEN7_RSCC_PDC_MATCH_VALUE_HI     0x00a
++#define GEN7_RSCC_HIDDEN_TCS_CMD0_ADDR   0x00d   /* cmd n at +2 n (RSC_CMD_OFFSET) */
++#define GEN7_RSCC_HIDDEN_TCS_CMD0_DATA   0x00e
++#define GEN7_RSCC_OVERRIDE_START_ADDR    0x100
++#define GEN7_GMU_HFI_CTRL_INIT           0x1f986
++#define KG_PDC_ENABLE    0x80000001u     /* GEN7_PDC_ENABLE_REG_VALUE */
++#define KG_HFI_MSGQ      (1u << 0)       /* GMU2HOST_INTR_INFO, adreno_hfi.h */
++#define KG_HFI_DBGQ      (1u << 2)
++#define KG_HFI_CM3_FAULT (1u << 15)
++
++/* kgsl gen7_load_rsc_ucode, in its order (gen7_3_0: SEQ_MEM_0 0x180, cmd2 data 0x80000000) */
++static const struct {
++	uint32_t reg, val;
++	const char *name;
++} kg_rsc[] = {
++	{ GEN7_RSCC_RSC_STATUS0_DRV0, 1u << 24, "rscc status0 (sde clock gating off)" },
++	{ GEN7_RSCC_PDC_SLAVE_ID_DRV0, 1, "rscc pdc_slave_id" },
++	{ GEN7_RSCC_HIDDEN_TCS_CMD0_DATA, 0, "rscc hidden tcs cmd0 data" },
++	{ GEN7_RSCC_HIDDEN_TCS_CMD0_ADDR, 0, "rscc hidden tcs cmd0 addr" },
++	{ GEN7_RSCC_HIDDEN_TCS_CMD0_DATA + 2, 0, "rscc hidden tcs cmd1 data" },
++	{ GEN7_RSCC_HIDDEN_TCS_CMD0_ADDR + 2, 0, "rscc hidden tcs cmd1 addr" },
++	{ GEN7_RSCC_HIDDEN_TCS_CMD0_DATA + 4, 0x80000000u, "rscc hidden tcs cmd2 data" },
++	{ GEN7_RSCC_HIDDEN_TCS_CMD0_ADDR + 4, 0, "rscc hidden tcs cmd2 addr" },
++	{ GEN7_RSCC_OVERRIDE_START_ADDR, 0, "rscc override_start_addr" },
++	{ GEN7_RSCC_PDC_SEQ_START_ADDR, 0x4520, "rscc pdc_seq_start_addr" },
++	{ GEN7_RSCC_PDC_MATCH_VALUE_LO, 0x4510, "rscc pdc_match_value_lo" },
++	{ GEN7_RSCC_PDC_MATCH_VALUE_HI, 0x4514, "rscc pdc_match_value_hi" },
++	{ GEN7_RSCC_SEQ_MEM_0_DRV0, 0xeaaae5a0u, "rscc seq_mem_0" },
++	{ GEN7_RSCC_SEQ_MEM_0_DRV0 + 1, 0xe1a1ebabu, "rscc seq_mem_1" },
++	{ GEN7_RSCC_SEQ_MEM_0_DRV0 + 2, 0xa2e0a581u, "rscc seq_mem_2" },
++	{ GEN7_RSCC_SEQ_MEM_0_DRV0 + 3, 0xecac82e2u, "rscc seq_mem_3" },
++	{ GEN7_RSCC_SEQ_MEM_0_DRV0 + 4, 0x0020edadu, "rscc seq_mem_4" },
++};
++
++/*
++ * kgsl gen7_gmu_first_boot after gen7_gmu_device_start: the RSC and PDC
++ * words (once per boot in kgsl, never taken back; here undone at the end,
++ * while the GMU still runs, before step 15's reset), then gen7_gmu_hfi_start.
++ * No HFI message is sent (step 17).
++ */
++static bool
++kg_step16(void)
++{
++	unsigned rsc = sizeof(kg_rsc) / sizeof(kg_rsc[0]), bad = 0;
++
++	if (!kg_gmu_runs || kg.rscc == 0 || kg.pdc == 0) {
++		printf("SWEET KGPU: 16 needs steps 4-15 (the GMU running in this run)\n");
++		return false;
++	}
++	kg_announce(16, "the GMU's state and the RSCC/PDC words kgsl writes");
++	uint32_t init = kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT), sysreset = kg_gmu(GEN7_GMU_CM3_SYSRESET);
++	printf("SWEET KGPU: 16 fw_init_result %#x sysreset %#x hfi_ctrl_status %#x gmu2host_intr_info %#x "
++	    "rscc_control_ack %#x\n",
++	    init, sysreset, kg_gmu(GEN7_GMU_HFI_CTRL_STATUS), kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO),
++	    kg_gmu(GEN7_GMU_RSCC_CONTROL_ACK));
++	printf("SWEET KGPU: 16 rscc seq_busy %#x; pdc enable %#x seq_start_addr %#x\n",
++	    kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0), kg_rd(kg.pdc, 4u * GEN7_PDC_GPU_ENABLE_PDC),
++	    kg_rd(kg.pdc, 4u * GEN7_PDC_GPU_SEQ_START_ADDR));
++	if ((init & 0x1ffu) != 0x100u || (sysreset & 1u)) {
++		printf("SWEET KGPU: 16 the GMU is not running as step 15 left it\n");
++		return false;
++	}
++
++	kg_next(16, "the RSC's words (kgsl gen7_load_rsc_ucode, RSCC 0x3d50000), undone at the end");
++	for (unsigned i = 0; i < rsc; i++) {
++		kg_put("RSCC", kg.rscc, 4u * kg_rsc[i].reg, kg_rsc[i].val, KG_UNDO_WORD, 0, kg_rsc[i].name);
++	}
++	for (unsigned i = 0; i < rsc; i++) {
++		uint32_t now = kg_rd(kg.rscc, 4u * kg_rsc[i].reg);
++		if (now != kg_rsc[i].val) {
++			printf("SWEET KGPU: 16   %s reads %#x\n", kg_rsc[i].name, now);
++			bad++;
++		}
++	}
++	printf("SWEET KGPU: 16 rscc: %u of %u words read back different; seq_busy %#x\n", bad, rsc,
++	    kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0));
++
++	kg_next(16, "the GPU PDC (kgsl gen7_load_pdc_ucode, 0xb270000: seq_start_addr 0, enable_pdc 0x80000001), "
++	    "undone at the end");
++	kg_put("PDC", kg.pdc, 4u * GEN7_PDC_GPU_SEQ_START_ADDR, 0, KG_UNDO_WORD, 0, "pdc seq_start_addr");
++	kg_put("PDC", kg.pdc, 4u * GEN7_PDC_GPU_ENABLE_PDC, KG_PDC_ENABLE, KG_UNDO_WORD, 0, "pdc enable_pdc");
++	printf("SWEET KGPU: 16 pdc enable %#x seq_start_addr %#x\n", kg_rd(kg.pdc, 4u * GEN7_PDC_GPU_ENABLE_PDC),
++	    kg_rd(kg.pdc, 4u * GEN7_PDC_GPU_SEQ_START_ADDR));
++
++	kg_next(16, "HFI start (kgsl gen7_gmu_hfi_start): HFI_CTRL_INIT 1, HFI_CTRL_STATUS bit 0 for up to 100 ms");
++	uint32_t status0 = kg_gmu(GEN7_GMU_HFI_CTRL_STATUS);
++	unsigned log0 = kg_gmu_log_words();
++	kg_set("GMU", kg.gmu, KG_GMU_OFF(GEN7_GMU_HFI_CTRL_INIT), 1, "hfi_ctrl_init");
++	bool up = kg_poll(kg.gmu, KG_GMU_OFF(GEN7_GMU_HFI_CTRL_STATUS), 1u, 1u, 100);
++	kg_wait(100);                   /* time for the firmware to say more */
++
++	/* what the GMU did: registers, its log, the queues, the SMMU's view */
++	struct kg_hfi_table *t = (struct kg_hfi_table *)kg_gmu_host(KG_GMU_HFI_VA);
++	uint32_t cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page;
++	uint32_t info = kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO), fsr = kg_rd(kg.smmu, cb + SMMU_CB_FSR);
++	init = kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT);
++	printf("SWEET KGPU: 16 hfi_ctrl_status %#x -> %#x, fw_init_result %#x, gmu2host_intr_info %#x "
++	    "(msgq %u dbgq %u cm3 fault %u oob %#x), ao_host_interrupt_status %#x\n", status0,
++	    kg_gmu(GEN7_GMU_HFI_CTRL_STATUS), init, info, !!(info & KG_HFI_MSGQ), !!(info & KG_HFI_DBGQ),
++	    !!(info & KG_HFI_CM3_FAULT), info >> 16, kg_gmu(GEN7_GMU_AO_HOST_INTERRUPT_STATUS));
++	printf("SWEET KGPU: 16 gmu log: %u words written before HFI_CTRL_INIT, %u after\n", log0,
++	    kg_gmu_log_words());
++	kg_to_memory((vm_offset_t)t, sizeof(*t));
++	for (unsigned i = 0; i < 3; i++) {
++		printf("SWEET KGPU: 16 hfi queue %u status %#x type %#x size %u r/w %u/%u\n", i, t->q[i].status,
++		    t->q[i].type, t->q[i].queue_size, t->q[i].read_index, t->q[i].write_index);
++	}
++	volatile uint32_t *dbg = (volatile uint32_t *)kg_gmu_host(t->q[2].start_addr);
++	if (t->q[2].write_index != 0 && dbg != NULL) {
++		kg_to_memory((vm_offset_t)dbg, 0x1000);
++		printf("SWEET KGPU: 16 debug queue: %#x %#x %#x %#x\n", dbg[0], dbg[1], dbg[2], dbg[3]);
++	}
++	printf("SWEET KGPU: 16 cb1 fsr %#x sgfsr %#x; rscc seq_busy %#x control_ack %#x\n", fsr,
++	    kg_rd(kg.smmu, SMMU_SGFSR), kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0),
++	    kg_gmu(GEN7_GMU_RSCC_CONTROL_ACK));
++
++	bool ok = up && bad == 0 && (init & 0xe00u) == 0 && !(info & KG_HFI_CM3_FAULT) && !(fsr & SMMU_FSR_ALL);
++	printf("SWEET KGPU: 16 %s%s\n", ok ? "HFI IS UP (HFI_CTRL_STATUS bit 0, as kgsl waits for)" :
++	    !up ? "HFI_CTRL_STATUS bit 0 does not come in 100 ms" :
++	    bad ? "the RSCC does not keep kgsl's words" : "the GMU faulted (NMI, CM3 fault or SMMU)",
++	    (status0 & 1u) ? "; bit 0 was set before HFI_CTRL_INIT too" : "");
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -1752,14 +1899,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -1794,12 +1941,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 15 ? 15u : (unsigned)last;
++	kg.last = last > 16 ? 16u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 15) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..15 exist; running those\n", last);
++	if (last > 16) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..16 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);

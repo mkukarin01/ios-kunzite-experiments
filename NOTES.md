@@ -417,6 +417,25 @@ sctlr, test page and tables freed, steps 4-5; CX back to 0x22f001; "run over". S
 as kgsl gen7_load_pdc_ucode / gen7_load_rsc_ucode, then gen7_gmu_hfi_start (HFI_CTRL_INIT 1, poll
 HFI_CTRL_STATUS bit 0 - already 1 here, so check what kgsl expects first).
 
+**GPU STEP 16 = 0981 (2026-10-23, written, NOT built/booted), `kgpu=16`: RSC/PDC and HFI start.**
+Read from kgsl: after device_start, first_boot loads PDC/RSC once (GMU_PRIV_PDC_RSC_LOADED) and
+calls gen7_gmu_hfi_start = HFI_CTRL_INIT 1 + poll HFI_CTRL_STATUS bit 0 for 100 ms; nothing
+clears the status first, so bit 0 already set (boot #36) satisfies it trivially - 0981 prints
+before/after and looks for other signs (log growth, queue indices, GMU2HOST_INTR_INFO). RSC
+(gen7_load_rsc_ucode, RSCC dwords): 0x4 = 1<<24, 0xb = 1, hidden TCS 0xe/0xd, 0x10/0xf = 0,
+0x12 = 0x80000000 (0x80000021 only for gen7_2_x; gen7_3_0 is not), 0x11 = 0, 0x100 = 0, 0x8 =
+0x4520, 0x9 = 0x4510, 0xa = 0x4514, SEQ_MEM_0 0x180..0x184 = eaaae5a0 e1a1ebab a2e0a581 ecac82e2
+0020edad (gen7_2_x would use 0x154). PDC (gen7_load_pdc_ucode, gmu_pdc dwords): 0x1148 = 0, 0x1140
+= 0x80000001; step 7 read 0x101 / 0 there (enabled by the boot). Boot-time RSCC words (step 7):
+status0 0, slave_id 1, seq_mem_0 0. All 19 via kg_put (undone: the boot's words back; they pop
+before step 15's CM3 reset, with the GMU idle); HFI_CTRL_INIT kept (GMU register, CX collapse).
+Success line: "HFI IS UP (HFI_CTRL_STATUS bit 0, as kgsl waits for)" - plus "; bit 0 was set
+before HFI_CTRL_INIT too" if so. Fails on: no bit 0, an RSCC word not kept (STATUS0 may have
+read-only bits: look at the line), NMI bits, CM3 fault, CB1 fault. Risk: the PDC (0xb270000, AOSS)
+is the first write outside the GPU block and GCC; a stage-2 refusal would be an external abort
+(the line before names it). Undo peaks at 39 (KG_UNDO_MAX now 64). Verified: 223 patches, series
+reproduces the file, syntax clean. **Test:** #36 image with `kgpu=16`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
