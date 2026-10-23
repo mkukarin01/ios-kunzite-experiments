@@ -1,0 +1,270 @@
+kunzite: Adreno 710 steps 6-7, read-only inside the powered CX half (kgpu=6/7; 1-5 unchanged).
+6: GMU 0x3d68000 (kgsl gen7_reg.h numbers): CM3 sysreset/boot/fw_init/cfg, HFI status, power
+state, AO status, both always-on counters with their rate over 10 ms (19.2 MHz = the block
+answers), first ITCM/DTCM words; GBIF cx_config/scache/halt/halt_ack; CX misc AHB controls.
+7: RSCC 0x3d50000 status/sequencer/4 slots and the GMU's rscc_control_ack; PDC 0xb270000
+enable and seq-start. Both need CX on and cx_gmu running (steps 4-5), whose writes are still
+undone at the end of the run.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -1,9 +1,10 @@
+ /*
+  * kunzite (POCO M8 5G, SM6475 parrot): the Adreno 710, step by step, after
+  * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
+- * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks).
++ * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
++ * 6-7 read again, now inside the powered CX half.
+  *
+- * Boot-arg kgpu=N (N <= 5) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 7) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -33,6 +34,17 @@
+  *     both GPLL0_OUT_MAIN_DIV (source 6; gpucc-parrot.c freq tables), then
+  *     the FDT's GMU/SMMU branches: cxo, cx_gmu, hub_cx_int (BRANCH_HALT: must
+  *     report running), hlos1_vote_gpu_smmu (voted: reported only).
++ *  6  reads the first words from the GPU block itself (needs CX on and
++ *     cx_gmu running): the GMU (FDT gmu 0x3d68000; kgsl gen7_reg.h dword
++ *     offsets from the GPU base 0x3d00000): CM3 reset/boot/firmware state,
++ *     HFI status, power state, both always-on counters (rate measured over
++ *     10 ms: the 19.2 MHz crystal means the block answers), the first words of
++ *     ITCM/DTCM; the CX side of the bus interface (GBIF 0x3c00-0x3c46); the CX
++ *     misc AHB controls (0x27810-0x27814).
++ *  7  reads the GMU's own RPMh channel: RSCC (FDT kgsl "rscc" 0x3d50000,
++ *     rpmh-rsc layout: status, sequencer, 4 command slots), the GMU's
++ *     rscc_control_ack, and PDC 0xb270000 enable/seq-start (kgsl
++ *     gen7_load_pdc_ucode writes these later; here they are only read).
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -85,6 +97,49 @@ void kunzite_adreno_init(void);
+ #define KG_CBCR_ENABLE   (1u << 0)
+ #define KG_UNDO_MAX      16u
+ 
++/* the GPU block: kgsl register numbers are dwords from 0x3d00000 (gen7_reg.h) */
++#define KG_GPU_PA        0x03d00000u
++#define KG_GMU_PA        0x03d68000u     /* FDT gmu "gmu", up to 0x3d9f000 (CX misc included) */
++#define KG_GMU_SIZE      0x00037000u
++#define KG_GBIF_PA       0x03d0f000u     /* GBIF 0x3c00.. in the GPU register space, CX side */
++#define KG_RSCC_PA       0x03d50000u     /* FDT kgsl-3d0 "rscc" */
++#define KG_RSCC_SIZE     0x00010000u
++#define KG_PDC_PA        0x0b270000u     /* FDT gmu "gmu_pdc" */
++#define KG_PDC_SIZE      0x00010000u
++#define GEN7_GMU_CM3_ITCM_START          0x1b400
++#define GEN7_GMU_CM3_DTCM_START          0x1c400
++#define GEN7_GMU_CM3_SYSRESET            0x1f800
++#define GEN7_GMU_CM3_BOOT_CONFIG         0x1f801
++#define GEN7_GMU_CM3_FW_INIT_RESULT      0x1f81c
++#define GEN7_GMU_CM3_CFG                 0x1f82d
++#define GEN7_GMU_CX_AO_COUNTER_LO        0x1f880
++#define GEN7_GMU_CX_AO_COUNTER_HI        0x1f881
++#define GEN7_GMU_ALWAYS_ON_COUNTER_L     0x1f888
++#define GEN7_GMU_ALWAYS_ON_COUNTER_H     0x1f889
++#define GEN7_GMU_PWR_COL_KEEPALIVE       0x1f8c3
++#define GEN7_GMU_GFX_PWR_CLK_STATUS      0x1f8d0
++#define GEN7_GMU_RPMH_POWER_STATE        0x1f8ec
++#define GEN7_GMU_HFI_CTRL_STATUS         0x1f980
++#define GEN7_GMU_GENERAL_7               0x1f9cc
++#define GEN7_GMU_AO_HOST_INTERRUPT_STATUS 0x23b05
++#define GEN7_GMU_RSCC_CONTROL_ACK        0x23b08
++#define GEN7_GMU_AO_GPU_CX_BUSY_STATUS   0x23b0c
++#define GEN7_GMU_AHB_FENCE_STATUS        0x23b13
++#define GEN7_GBIF_CX_CONFIG              0x3c00
++#define GEN7_GBIF_SCACHE_CNTL0           0x3c01
++#define GEN7_GBIF_HALT                   0x3c45
++#define GEN7_GBIF_HALT_ACK               0x3c46
++#define GEN7_CX_MISC_CX_AHB_AON_CNTL     0x27810 /* .. +4: GMU, CP, VBIF_SMMU, HOST */
++/* RSCC and PDC numbers are dwords from their own bases */
++#define GEN7_RSCC_RSC_STATUS0_DRV0       0x004
++#define GEN7_RSCC_PDC_SLAVE_ID_DRV0      0x00b
++#define GEN7_RSCC_SEQ_BUSY_DRV0          0x101
++#define GEN7_RSCC_SEQ_MEM_0_DRV0         0x180
++#define KG_RSCC_SLOTS    0xd00u          /* bytes: +0 irq enable, +4 irq pending; slot n at +0x2a0 n */
++#define KG_RSCC_SLOT     0x2a0u
++#define GEN7_PDC_GPU_ENABLE_PDC          0x1140
++#define GEN7_PDC_GPU_SEQ_START_ADDR      0x1148
++
+ /* cmd-db (cmd-db.c): header 144 bytes, 8 slave headers at +8, entries 24 bytes */
+ #define KG_DB_MAGIC      0x0c0330dbu
+ #define KG_DB_HEADER     144u
+@@ -94,7 +149,7 @@ void kunzite_adreno_init(void);
+ enum kg_undo_kind { KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC };
+ 
+ static struct {
+-	vm_offset_t gcc, db, qfprom, gpucc;
++	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc;
+ 	unsigned last, pause_ms, delay_s, hold_s, step;
+ 	bool started, ahb_on;
+ 	struct {
+@@ -505,6 +560,135 @@ kg_step5(void)
+ 	return true;
+ }
+ 
++/* ---- step 6: the first words from the GPU block ---- */
++
++/* a GMU-side register by its kgsl number */
++static uint32_t
++kg_gmu(uint32_t reg)
++{
++	return kg_rd(kg.gmu, 4u * reg - (KG_GMU_PA - KG_GPU_PA));
++}
++
++static uint32_t
++kg_gbif(uint32_t reg)
++{
++	return kg_rd(kg.gbif, 4u * reg - (KG_GBIF_PA - KG_GPU_PA));
++}
++
++/* what steps 6 and 7 stand on: CX powered and the GMU's clock running */
++static bool
++kg_cx_ready(unsigned step)
++{
++	uint32_t gmu_clk = kg.gpucc != 0 ? kg_rd(kg.gpucc, 0x913c) : 0;
++	if (kg.gpucc == 0 || !kg_cx_on() || (gmu_clk & (KG_CBCR_ENABLE | KG_CBCR_OFF)) != KG_CBCR_ENABLE) {
++		printf("SWEET KGPU: %u needs CX on and cx_gmu running (cx_gmu %#x): steps 4 and 5\n", step, gmu_clk);
++		return false;
++	}
++	return true;
++}
++
++/* how fast a 32-bit counter runs, over 10 ms */
++static unsigned
++kg_rate(uint32_t reg)
++{
++	uint64_t nanos;
++	uint64_t t0 = mach_absolute_time();
++	uint32_t c0 = kg_gmu(reg);
++	delay(10000);
++	uint32_t c1 = kg_gmu(reg);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &nanos);
++	return nanos ? (unsigned)((uint64_t)(c1 - c0) * NSEC_PER_SEC / nanos) : 0;
++}
++
++static bool
++kg_step6(void)
++{
++	if (!kg_cx_ready(6)) {
++		return false;
++	}
++	kg_announce(6, "GMU 0x3d68000: CM3 state, HFI status, power state (the first words from the GPU block)");
++	kg.gmu = kg_map("GMU", KG_GMU_PA, KG_GMU_SIZE);
++	if (kg.gmu == 0) {
++		return false;
++	}
++	printf("SWEET KGPU: 6 cm3 sysreset %#x boot_config %#x fw_init_result %#x cfg %#x\n",
++	    kg_gmu(GEN7_GMU_CM3_SYSRESET), kg_gmu(GEN7_GMU_CM3_BOOT_CONFIG), kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT),
++	    kg_gmu(GEN7_GMU_CM3_CFG));
++	printf("SWEET KGPU: 6 hfi_ctrl_status %#x general_7 %#x rpmh_power_state %#x gfx_pwr_clk_status %#x keepalive %#x\n",
++	    kg_gmu(GEN7_GMU_HFI_CTRL_STATUS), kg_gmu(GEN7_GMU_GENERAL_7), kg_gmu(GEN7_GMU_RPMH_POWER_STATE),
++	    kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS), kg_gmu(GEN7_GMU_PWR_COL_KEEPALIVE));
++	printf("SWEET KGPU: 6 ao host_interrupt_status %#x gpu_cx_busy_status %#x ahb_fence_status %#x\n",
++	    kg_gmu(GEN7_GMU_AO_HOST_INTERRUPT_STATUS), kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS),
++	    kg_gmu(GEN7_GMU_AHB_FENCE_STATUS));
++
++	kg_announce(6, "the GMU's two always-on counters, twice 10 ms apart");
++	uint32_t cx_hi = kg_gmu(GEN7_GMU_CX_AO_COUNTER_HI), cx_lo = kg_gmu(GEN7_GMU_CX_AO_COUNTER_LO);
++	uint32_t ao_hi = kg_gmu(GEN7_GMU_ALWAYS_ON_COUNTER_H), ao_lo = kg_gmu(GEN7_GMU_ALWAYS_ON_COUNTER_L);
++	unsigned cx_hz = kg_rate(GEN7_GMU_CX_AO_COUNTER_LO), ao_hz = kg_rate(GEN7_GMU_ALWAYS_ON_COUNTER_L);
++	bool alive = (cx_hz > 18000000u && cx_hz < 20500000u) || (ao_hz > 18000000u && ao_hz < 20500000u);
++	printf("SWEET KGPU: 6 cx_ao_counter %#x:%08x at %u Hz, always_on_counter %#x:%08x at %u Hz: %s\n",
++	    cx_hi, cx_lo, cx_hz, ao_hi, ao_lo, ao_hz,
++	    alive ? "the 19.2 MHz crystal: THE GPU BLOCK ANSWERS" : "no counter at 19.2 MHz (firmware may start them)");
++
++	kg_announce(6, "the first words of the GMU's ITCM and DTCM");
++	printf("SWEET KGPU: 6 itcm %#x %#x %#x %#x, dtcm %#x %#x %#x %#x\n",
++	    kg_gmu(GEN7_GMU_CM3_ITCM_START), kg_gmu(GEN7_GMU_CM3_ITCM_START + 1), kg_gmu(GEN7_GMU_CM3_ITCM_START + 2),
++	    kg_gmu(GEN7_GMU_CM3_ITCM_START + 3), kg_gmu(GEN7_GMU_CM3_DTCM_START), kg_gmu(GEN7_GMU_CM3_DTCM_START + 1),
++	    kg_gmu(GEN7_GMU_CM3_DTCM_START + 2), kg_gmu(GEN7_GMU_CM3_DTCM_START + 3));
++
++	kg_announce(6, "GBIF 0x3d0f000 (CX side of the bus interface)");
++	kg.gbif = kg_map("GBIF", KG_GBIF_PA, 0x1000);
++	if (kg.gbif == 0) {
++		return false;
++	}
++	printf("SWEET KGPU: 6 gbif cx_config %#x scache_cntl0 %#x halt %#x halt_ack %#x\n",
++	    kg_gbif(GEN7_GBIF_CX_CONFIG), kg_gbif(GEN7_GBIF_SCACHE_CNTL0), kg_gbif(GEN7_GBIF_HALT),
++	    kg_gbif(GEN7_GBIF_HALT_ACK));
++
++	kg_announce(6, "CX misc 0x3d9e040: AHB controls");
++	printf("SWEET KGPU: 6 cx_misc ahb aon %#x gmu %#x cp %#x vbif_smmu %#x host %#x\n",
++	    kg_gmu(GEN7_CX_MISC_CX_AHB_AON_CNTL), kg_gmu(GEN7_CX_MISC_CX_AHB_AON_CNTL + 1),
++	    kg_gmu(GEN7_CX_MISC_CX_AHB_AON_CNTL + 2), kg_gmu(GEN7_CX_MISC_CX_AHB_AON_CNTL + 3),
++	    kg_gmu(GEN7_CX_MISC_CX_AHB_AON_CNTL + 4));
++	return true;
++}
++
++/* ---- step 7: the GMU's channel to RPMh ---- */
++
++static bool
++kg_step7(void)
++{
++	if (!kg_cx_ready(7) || kg.gmu == 0) {
++		return false;
++	}
++	kg_announce(7, "RSCC 0x3d50000 (the GMU's RPMh channel) and the GMU's rscc_control_ack");
++	kg.rscc = kg_map("RSCC", KG_RSCC_PA, KG_RSCC_SIZE);
++	if (kg.rscc == 0) {
++		return false;
++	}
++	printf("SWEET KGPU: 7 rscc status0 %#x pdc_slave_id %#x seq_busy %#x seq_mem_0 %#x drv_config %#x control_ack %#x\n",
++	    kg_rd(kg.rscc, 4u * GEN7_RSCC_RSC_STATUS0_DRV0), kg_rd(kg.rscc, 4u * GEN7_RSCC_PDC_SLAVE_ID_DRV0),
++	    kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0), kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_MEM_0_DRV0),
++	    kg_rd(kg.rscc, 0xc), kg_gmu(GEN7_GMU_RSCC_CONTROL_ACK));
++	printf("SWEET KGPU: 7 rscc slots irq enable %#x pending %#x\n", kg_rd(kg.rscc, KG_RSCC_SLOTS),
++	    kg_rd(kg.rscc, KG_RSCC_SLOTS + 4));
++	for (uint32_t slot = 0; slot < 4; slot++) {
++		uint32_t at = KG_RSCC_SLOTS + KG_RSCC_SLOT * slot;
++		printf("SWEET KGPU: 7 rscc slot %u wait %#x control %#x idle %#x enabled %#x cmd0 %#x/%#x/%#x/%#x\n", slot,
++		    kg_rd(kg.rscc, at + 0x10), kg_rd(kg.rscc, at + 0x14), kg_rd(kg.rscc, at + 0x18), kg_rd(kg.rscc, at + 0x1c),
++		    kg_rd(kg.rscc, at + 0x30), kg_rd(kg.rscc, at + 0x34), kg_rd(kg.rscc, at + 0x38), kg_rd(kg.rscc, at + 0x3c));
++	}
++
++	kg_announce(7, "PDC 0xb270000: enable_pdc +0x4500, seq_start_addr +0x4520");
++	kg.pdc = kg_map("PDC", KG_PDC_PA, KG_PDC_SIZE);
++	if (kg.pdc == 0) {
++		return false;
++	}
++	printf("SWEET KGPU: 7 pdc enable %#x seq_start_addr %#x\n", kg_rd(kg.pdc, 4u * GEN7_PDC_GPU_ENABLE_PDC),
++	    kg_rd(kg.pdc, 4u * GEN7_PDC_GPU_SEQ_START_ADDR));
++	return true;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -557,14 +741,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-7 read", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -599,12 +783,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 5 ? 5u : (unsigned)last;
++	kg.last = last > 7 ? 7u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 5) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..5 exist; running those\n", last);
++	if (last > 7) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..7 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);

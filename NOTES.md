@@ -130,7 +130,23 @@ writes total. Held 5 s unchanged, then undone in reverse; after: cx gdsc 0x22f00
 (agent up, no panic; crashes: driverkitd as always, one PosterBoard sig 5 as in #24b).
 **Gunyah lets HLOS write GPU_CC and the GCC vote** (open question 1, write half, for these).
 NEXT: steps 6-7 (read-only again, with CX + clocks on): GMU registers at 0x3d68000 (an AO
-counter that should count, CM3 state), the bus interface, the GMU's RSCC 0x3d50000 / PDC. Any other sandbox_container_path_* caller gets
+counter that should count, CM3 state), the bus interface, the GMU's RSCC 0x3d50000 / PDC.
+
+**GPU STEPS 6-7 = 0973 (2026-10-23, written, NOT built/booted), `kgpu=7`, read-only** (steps
+4-5 still power and clock CX first and are undone after the hold). Registers by kgsl gen7_reg.h
+number (dwords from 0x3d00000; GMU node 0x3d68000+0x37000 also covers GPU_CC and CX misc).
+Step 6, five announced groups: CM3 sysreset/boot_config/fw_init_result/cfg; HFI ctrl status,
+general_7, rpmh_power_state, gfx_pwr_clk_status, keepalive, AO host irq / cx busy / ahb fence;
+CX_AO_COUNTER (0x1f880, what kgsl reads) and ALWAYS_ON_COUNTER (0x1f888), each with its rate
+over 10 ms ("THE GPU BLOCK ANSWERS" if one runs at 19.2 MHz); first 4 words of ITCM 0x1b400
+and DTCM 0x1c400; GBIF 0x3d0f000 cx_config/scache_cntl0/halt/halt_ack; CX misc AHB controls
+0x27810-14. (The gen7 CX timer kgsl seeds is gen7_9_x only: not ours.) Step 7: RSCC 0x3d50000
+status0, pdc_slave_id, seq_busy, seq_mem_0, drv config, slot irq enable/pending, 4 slots
+(wait/control/idle/enabled + first command), GMU rscc_control_ack 0x23b08; PDC 0xb270000
+enable 0x4500 / seq_start 0x4520. Verified: 215 patches, series reproduces the file, syntax
+check clean. **Test:** CI -> #28 image with `kgpu=7`. A reset after an "about to read" line =
+that block is not reachable (or needs something kgsl does that we skip); counters at 19.2 MHz
+= the GMU side answers; then steps 8-9 (SMMU ID registers, first context, read-only). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
