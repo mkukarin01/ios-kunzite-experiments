@@ -592,6 +592,29 @@ and reset of a710_zap.mdt/.bNN into its region 0x89e1a000), then gen7_start's re
 gen7_rb_start: RPTR_ADDR, RB_CNTL, CP_SQE_CNTL 1 and CP_INIT - the CP fetching the microcode
 through context 0 is the proof of the GPU's translation.
 
+**GPU STEP 20 = 0985 (2026-10-24, written, NOT built/booted), `kgpu=20` (the port map's 19-20): zap
+shader, gen7_start, CP start.** Read from kgsl: kgsl_zap_shader_load = request a710_zap.mdt,
+qcom_mdt_get_size (max - min of the loadable segments, 4K-aligned), memremap the zap-shader
+memory-region WC, qcom_mdt_load (pas_init: INIT_IMAGE + MEM_SETUP(pas, phys, size) when
+relocatable; each segment copied from the .mdt or "<name>.bNN"; memsz-filesz zeroed),
+PAS_AUTH_AND_RESET(13). a710_zap.mdt: 3 phdrs; only #1 loads (PT_LOAD, paddr 0x1000, 0x79c,
+flags 0x8000007 = relocatable) -> MEM_SETUP(13, 0x89e1a000, 0x1000), #1 from a710_zap.b01 (1948
+bytes, sha256 34e1cda9..., **uploaded 2026-10-24 during boot #40**, read back identical; copy in
+temp/ios-m8/fw-readback/). gen7_start (gen7_3_0: no_cb family, hbb 15, mal 32 from the FDT, UBWC
+4.0, uche_gmem_base 16M, uche_client_pf 1, hwcg on) and gen7_rb_start transcribed as in the patch
+header; the hwcg and protect tables were compared with kgsl's by script (49 and 46 entries,
+equal). **kgsl's trusted range** (_set_secvid with a 64-bit MMU: base 0xf0000000, size
+0xfffff000) covers 0x100000000, so the GPU's addresses move to 0xe0000000 (kgsl's own globals
+sit just under 0xf0000000). CP packets: CP_THREAD_CONTROL = 0x70970001 (BIT(27)), CP_ME_INIT =
+0x70c80007 + mask 0x94b, 3, 0x20000000, 2, reglist lo/hi (empty, scratch +0x800), BIT(31); WPTR
+10; RB_CNTL 0x20c. Risks in order: the zap region write (0x89e1a000 no-map: if Gunyah does not
+give it to HLOS, an external abort right after "the zap segments into the region"); TrustZone
+refusing MEM_SETUP after step 12's INIT_IMAGE; the CP faulting through context 0 (CB0
+FSR/FAR printed). Undo peaks at 51: CP_SQE_CNTL 0 first. Success lines: "THE ZAP SHADER IS
+LOADED (TrustZone authenticated it)" then "THE CP RUNS: CP_ME_INIT consumed, the GPU idle
+(microcode fetched through context 0)". Verified: 227 patches, series reproduces the file, syntax
+clean. **Test:** #40 image with `kgpu=20`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still

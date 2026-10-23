@@ -1,0 +1,543 @@
+kunzite: Adreno 710 step 20, the zap shader, gen7_start and the CP started (kgpu=20; the port map's 19-20).
+20 runs with GX on and the GPU's context, ring and microcode from step 19. The zap shader as
+kgsl_zap_shader_load does it (qcom_mdt_load + PAS_AUTH_AND_RESET): a710_zap.mdt's loadable
+segments (mdt_phdr_valid: PT_LOAD, not the hash, memsz != 0; one here, relocatable, 0x1000 +
+0x79c) give PAS_MEM_SETUP(13, 0x89e1a000, 0x1000) - INIT_IMAGE was step 12's in this run - then
+each segment is copied from the .mdt or its .bNN file (a710_zap.b01, uploaded to
+/usr/share/firmware/kunzite) to the FDT region (uncached, words), the rest zeroed, then
+PAS_AUTH_AND_RESET(13). Not undone (kgsl never unloads it; TrustZone holds the region). Then
+gen7_start for gen7_3_0 in kgsl's order: GBIF client QoS 3, UCHE GBIF/trap/write-through/GMEM
+range (16M + 512K)/ways/CMDQ, the NC_MODE_CNTLs (highest bank bit 15, min access 32, UBWC 4.0),
+UCHE mode, hang detect 0xcfffff, UCHE client PF, RB_CMP_DBG_ECO bit 11, the GMU power counters,
+CP_PROTECT_CNTL 0xb and the 46 gen7_0_0_protected_regs, CP_APRIV 0x6f, _set_secvid (TSB off,
+trusted 0xf0000000 + 0xfffff000), the AO and gen7_3_0 clock gating tables and RBBM_CLOCK_CNTL
+0x8aa8aa82; register blocks announced as a whole and read back. Then gen7_rb_start: RPTR_ADDR
+(scratch page), RB_CNTL 0x20c, CP_SQE_CNTL 1 (the CP fetches the microcode through context 0),
+gen7_cp_init_cmds at the ring's head (CP_THREAD_CONTROL bit 27; CP_ME_INIT mask 0x94b with an
+empty power-up list in the scratch page, as upstream a7xx does), WPTR 10, then
+adreno_spin_idle's test (RPTR 10, CX busy bit 23 clear) for up to 2 s; CP, RBBM and context 0
+fault registers printed. Undo: CP_SQE_CNTL 0 first. Also: kgsl's trusted range starts at
+0xf0000000, so step 19's GPU addresses move from 0x100000000 to 0xe0000000; step 18 maps the
+whole 256K GPU block; kg_scm takes a third argument.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index b7b36d6..331ba6d 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -6,9 +6,10 @@
+  * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write;
+  * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
+  * channel and starts HFI; 17 talks to it; 18 has it power GX; 19 gives the
+- * GPU its SMMU context, ring and microcode.
++ * GPU its SMMU context, ring and microcode; 20 loads the zap shader and
++ * starts the CP.
+  *
+- * Boot-arg kgpu=N (N <= 19) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 20) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -105,10 +106,14 @@
+  *     powers GX; RBBM/CP registers read only once GFX_PWR_CLK_STATUS says
+  *     on. Undo: OOB clear, then slumber (kgsl gen7_gmu_power_off).
+  *  19 the port map's 18: H2F_MSG_START, stream 0 -> HLOS entry 0 -> context
+- *     0 on the shared tables (GPU addresses from 4 GiB), the ring (32K), a
++ *     0 on the shared tables (GPU addresses from 0xe0000000), the ring (32K), a
+  *     scratch page and a710_sqe.fw (all but its first word) in GPU memory,
+  *     CP_RB_BASE and CP_SQE_INSTR_BASE written and read back; the CP stays
+  *     halted. Undo: stream 0 unrouted, CB0 off, memory freed, before 18's.
++ *  20 the port map's 19-20: the zap shader (PAS_MEM_SETUP, a710_zap.b01
++ *     into 0x89e1a000, AUTH_AND_RESET), gen7_start's registers for
++ *     gen7_3_0, gen7_rb_start: RPTR_ADDR, RB_CNTL, CP_SQE_CNTL 1, CP_ME_INIT,
++ *     RPTR = WPTR and idle. Undo: the CP halted (CP_SQE_CNTL 0) first.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -278,6 +283,7 @@ void kunzite_adreno_init(void);
+ #define KG_SCM_PAS_IS_SUPPORTED  0x207u
+ #define KG_SCM_ARGS_VAL          1u              /* one plain value */
+ #define KG_SCM_ARGS_VAL_RW       (2u | (2u << 6))  /* a value, then a buffer TZ reads and writes */
++#define KG_SCM_ARGS_VAL3         3u              /* three plain values */
+ #define KG_PAS_GPU               13u             /* kgsl_util.c GPU_PASID */
+ #define KG_ZAP_MDT               "/usr/share/firmware/kunzite/a710_zap.mdt"
+ /*
+@@ -1093,11 +1099,12 @@ kg_step10(void)
+ 
+ /* one call, said before it is made (an SMC the hypervisor dislikes ends the run without a word) */
+ static uint64_t
+-kg_scm(unsigned step, const char *what, uint32_t call, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t *res)
++kg_scm(unsigned step, const char *what, uint32_t call, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c,
++    uint64_t *res)
+ {
+-	printf("SWEET KGPU: %u smc %#x (%s) args %#llx %#llx\n", step, KG_SCM_FN(call), what, a, b);
++	printf("SWEET KGPU: %u smc %#x (%s) args %#llx %#llx %#llx\n", step, KG_SCM_FN(call), what, a, b, c);
+ 	*res = ~0ull;
+-	uint64_t ret = topaz_scm(KG_SCM_FN(call), arginfo, a, b, 0, res);
++	uint64_t ret = topaz_scm(KG_SCM_FN(call), arginfo, a, b, c, res);
+ 	printf("SWEET KGPU: %u   -> ret %#llx res %#llx\n", step, ret, *res);
+ 	return ret;
+ }
+@@ -1118,18 +1125,20 @@ kg_step11(void)
+ 
+ 	kg_next(11, "SCM is_call_available(is_call_available), Linux's first question to TrustZone");
+ 	if (kg_scm(11, "is_call_available", KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(KG_SCM_INFO_IS_AVAIL), 0,
+-	    &res) != 0 || res != 1) {
++	    0, &res) != 0 || res != 1) {
+ 		printf("SWEET KGPU: 11 TrustZone does not answer the way it answers Linux\n");
+ 		return false;
+ 	}
+ 	kg_next(11, "is_call_available for the five PAS calls");
+ 	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+-		uint64_t ret = kg_scm(11, calls[i].name, KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(calls[i].call), 0, &res);
++		uint64_t ret = kg_scm(11, calls[i].name, KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(calls[i].call), 0,
++		    0, &res);
+ 		printf("SWEET KGPU: 11 %s: %s\n", calls[i].name, ret == 0 && res == 1 ? "available" : "NOT available");
+ 	}
+ 	kg_next(11, "pas_is_supported for images 1, 4, 9, 13");
+ 	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
+-		uint64_t ret = kg_scm(11, images[i].name, KG_SCM_PAS_IS_SUPPORTED, KG_SCM_ARGS_VAL, images[i].id, 0, &res);
++		uint64_t ret = kg_scm(11, images[i].name, KG_SCM_PAS_IS_SUPPORTED, KG_SCM_ARGS_VAL, images[i].id, 0, 0,
++		    &res);
+ 		bool yes = ret == 0 && res == 1;
+ 		printf("SWEET KGPU: 11 PAS %u (%s): %s\n", images[i].id, images[i].name, yes ? "supported" : "not supported");
+ 		if (yes && images[i].id == KG_PAS_GPU) {
+@@ -1213,7 +1222,7 @@ kg_step12(void)
+ 	topaz_fw_free(data, size);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	uint64_t ret = kg_scm(12, "pas init image (zap signature)", KG_SCM_PAS_INIT_IMAGE, KG_SCM_ARGS_VAL_RW, KG_PAS_GPU,
+-	    KG_ZAP_META_PA, &res);
++	    KG_ZAP_META_PA, 0, &res);
+ 	if (ret == 0 && res == 0) {
+ 		printf("SWEET KGPU: 12 TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n");
+ 		return true;
+@@ -2394,7 +2403,7 @@ out:;
+ #define GEN7_CP_CP2GMU_STATUS            0x812
+ #define GEN7_CP_STATUS_1                 0x825
+ #define GEN7_RBBM_STATUS                 0x210
+-#define KG_GPU_REGS      0x4000u         /* RBBM/CP registers (GX side), read only while GX is on */
++#define KG_GPU_REGS      0x40000u        /* FDT kgsl_3d0_reg_memory (GX side): touched only while GX is on */
+ #define KG_H2F_GX_BW_PERF_VOTE 30u
+ #define KG_H2F_PREPARE_SLUMBER 33u
+ #define KG_DCVS_ACK_BLOCK 1u
+@@ -2546,11 +2555,12 @@ kg_step18(void)
+ #define KG_GPU_STREAM    0u              /* FDT gfx3d_user: iommus <kgsl_smmu 0x0 0x400> */
+ #define KG_GPU_MATCH     0u              /* HLOS SMR/S2CR entry 0 */
+ #define KG_GPU_CB        0u              /* context 0: the GPU's in kgsl and Linux */
+-#define KG_GPU_VA        0x100000000ull  /* the GPU's addresses: root entry 4, apart from the GMU's (same tables) */
++#define KG_GPU_VA        0xe0000000ull   /* root entry 3, under kgsl's trusted range 0xf0000000.. (step 20) */
+ #define KG_RB_SIZE       0x8000u         /* KGSL_RB_SIZE */
+ #define KG_GPU_RB_VA     KG_GPU_VA
+ #define KG_GPU_SCRATCH_VA (KG_GPU_VA + 0x8000u)
+ #define KG_GPU_SQE_VA    (KG_GPU_VA + 0x10000u)
++#define KG_SCRATCH_REGLIST 0x800u       /* in the scratch page: an empty power-up list (CP_ME_INIT bit 8) */
+ #define KG_SQE_FW        "/usr/share/firmware/kunzite/a710_sqe.fw"
+ #define GEN7_CP_RB_BASE                  0x800
+ #define GEN7_CP_RB_BASE_HI               0x801
+@@ -2584,7 +2594,7 @@ kg_gpu_alloc(const char *what, uint64_t va, uint32_t len)
+  * kgsl gen7_gpu_boot, with GX on from step 18: H2F_MSG_START after the OOB
+  * set; kgsl_mmu_start's part, done as step 13 did for the GMU: stream 0 ->
+  * HLOS entry 0 -> context 0, on the same tables (ASID 0; the GPU's addresses
+- * from 4 GiB up); the ringbuffer (32K, 0xaa as gen7_rb_start fills it) and a
++ * from 0xe0000000, under kgsl's trusted range); the ringbuffer (32K, 0xaa as gen7_rb_start fills it) and a
+  * scratch page; adreno_get_firmware's copy of a710_sqe.fw (all but its first
+  * word); then gen7_rb_start's CP_RB_BASE and CP_SQE_INSTR_BASE, read back.
+  * CP_SQE_CNTL is not touched: the CP stays halted (its start is the port
+@@ -2719,6 +2729,365 @@ out:
+ 	return ok;
+ }
+ 
++/* ---- step 20: the zap shader, the 3D core's registers, the CP (the port map's 19-20) ---- */
++
++#define KG_ZAP_PA        0x89e1a000u     /* FDT zap-shader memory-region gpu_microcode_mem, no-map */
++#define KG_ZAP_SIZE      0x2000u
++#define KG_ZAP_SEG       "/usr/share/firmware/kunzite/a710_zap.b%02u"
++#define KG_MDT_RELOC     (1u << 27)      /* QCOM_MDT_RELOCATABLE */
++#define GEN7_CP_RB_CNTL                  0x802
++#define GEN7_CP_RB_RPTR_ADDR_LO          0x804
++#define GEN7_CP_RB_RPTR_ADDR_HI          0x805
++#define GEN7_CP_RB_RPTR                  0x806
++#define GEN7_CP_RB_WPTR                  0x807
++#define GEN7_CP_HW_FAULT                 0x821
++#define GEN7_CP_INTERRUPT_STATUS         0x823
++#define GEN7_CP_PROTECT_STATUS           0x824
++#define GEN7_CP_APRIV_CNTL               0x844
++#define GEN7_CP_PROTECT_CNTL             0x84f
++#define GEN7_CP_PROTECT_REG              0x850
++#define GEN7_CP_SQE_STAT_ADDR            0x908
++#define GEN7_CP_SQE_STAT_DATA            0x909
++#define GEN7_RBBM_INT_0_STATUS           0x201
++#define GEN7_RBBM_STATUS3                0x213
++#define GEN7_RBBM_CLOCK_CNTL             0x0ae
++#define GEN7_RB_CMP_DBG_ECO_CNTL         0x8e28
++#define GEN7_GMU_CX_GMU_POWER_COUNTER_SELECT_0 0x1f841
++#define GEN7_GMU_CX_GMU_POWER_COUNTER_SELECT_1 0x1f842
++#define GEN7_GPU_GMU_AO_GPU_CX_BUSY_MASK 0x23b0e
++#define KG_CLOCK_CNTL_ON 0x8aa8aa82u     /* RBBM_CLOCK_CNTL_ON */
++#define KG_CP_RB_CNTL    (12u | 2u << 8)  /* GEN7_CP_RB_CNTL_DEFAULT: log2(KGSL_RB_DWORDS / 2), log2(4) */
++#define KG_ME_INIT_MASK  0x94bu          /* multi-ctx, error detect, reset state, no perf s/r, reglist, no DMS */
++
++struct kg_reg {
++	uint32_t reg, val;
++};
++
++/* gen7_start for gen7_3_0, the plain writes in its order (hbb 15: lo 2, hi 0; mal 32; UBWC 4.0; no_cb family) */
++static const struct kg_reg kg_gen7_start_regs[] = {
++	{ 0x0011, 0x00000003 },         /* RBBM_GBIF_CLIENT_QOS_CNTL (gen7_3_0) */
++	{ 0x0e3a, 0x010240e0 },         /* UCHE_GBIF_GX_CONFIG */
++	{ 0x050b, 0xffffffff },         /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	{ 0x0e09, 0xfffff000 },         /* UCHE_TRAP_BASE: GEN7_UCHE_TRAP_BASE 0x1fffffffff000 */
++	{ 0x0e0a, 0x0001ffff },
++	{ 0x0e07, 0xfffff000 },         /* UCHE_WRITE_THRU_BASE, the same */
++	{ 0x0e08, 0x0001ffff },
++	{ 0x0e0b, 0x01000000 },         /* UCHE_GMEM_RANGE_MIN: ALIGN(GMEM 512K, 16M) */
++	{ 0x0e0c, 0x00000000 },
++	{ 0x0e0d, 0x0107ffff },         /* UCHE_GMEM_RANGE_MAX */
++	{ 0x0e0e, 0x00000000 },
++	{ 0x0e17, 0x00800000 },         /* UCHE_CACHE_WAYS */
++	{ 0x0e3c, 0x0006690e },         /* UCHE_CMDQ_CONFIG */
++	{ 0x8e08, 0x00000814 },         /* RB_NC_MODE_CNTL: rgb565 predicator, AMSBC, hbb_lo */
++	{ 0xb604, 0x00000004 },         /* TPL1_NC_MODE_CNTL */
++	{ 0xae02, 0x00000024 },         /* SP_NC_MODE_CNTL */
++	{ 0x8602, 0x00000040 },         /* GRAS_NC_MODE_CNTL (no BR/BV apertures) */
++	{ 0x0e01, 0x00400000 },         /* UCHE_MODE_CNTL */
++	{ 0x001f, 0x40cfffff },         /* RBBM_INTERFACE_HANG_INT_CNTL: hang_detect_cycles 0xcfffff */
++	{ 0x0e19, 0x00000081 },         /* UCHE_CLIENT_PF: uche_client_pf 1 */
++};
++
++/* gen7_0_0_protected_regs (gen7_3_0's): CP_PROTECT_REG + n, first, last, no access */
++static const struct {
++	uint16_t n;
++	uint32_t start, end;
++	uint8_t noaccess;
++} kg_protect[] = {
++	{ 0, 0x00000, 0x004ff, 0 }, { 1, 0x0050b, 0x00563, 0 }, { 2, 0x0050e, 0x0050e, 1 }, { 3, 0x00510, 0x00510, 1 },
++	{ 4, 0x00534, 0x00534, 1 }, { 5, 0x005fb, 0x00698, 0 }, { 6, 0x00699, 0x00882, 1 }, { 7, 0x008a0, 0x008a8, 1 },
++	{ 8, 0x008ab, 0x008cf, 1 }, { 9, 0x008d0, 0x00a40, 0 }, { 10, 0x00900, 0x0094d, 1 }, { 11, 0x0098d, 0x00a3f, 1 },
++	{ 12, 0x00a41, 0x00bff, 1 }, { 13, 0x00df0, 0x00df1, 1 }, { 14, 0x00e01, 0x00e01, 1 }, { 15, 0x00e07, 0x00e0f, 1 },
++	{ 16, 0x03c00, 0x03cc3, 1 }, { 17, 0x03cc4, 0x05cc3, 0 }, { 18, 0x08630, 0x087ff, 1 }, { 19, 0x08e00, 0x08e00, 1 },
++	{ 20, 0x08e08, 0x08e08, 1 }, { 21, 0x08e50, 0x08e6f, 1 }, { 22, 0x08e80, 0x09100, 1 }, { 23, 0x09624, 0x097ff, 1 },
++	{ 24, 0x09e40, 0x09e40, 1 }, { 25, 0x09e64, 0x09e71, 1 }, { 26, 0x09e78, 0x09fff, 1 }, { 27, 0x0a630, 0x0a7ff, 1 },
++	{ 28, 0x0ae02, 0x0ae02, 1 }, { 29, 0x0ae50, 0x0ae5f, 1 }, { 30, 0x0ae66, 0x0ae69, 1 }, { 31, 0x0ae6f, 0x0ae72, 1 },
++	{ 32, 0x0b604, 0x0b607, 1 }, { 33, 0x0ec00, 0x0fbff, 1 }, { 34, 0x0fc00, 0x11bff, 0 }, { 35, 0x18400, 0x1844a, 1 },
++	{ 36, 0x1844b, 0x1857f, 0 }, { 37, 0x1844c, 0x18453, 1 }, { 38, 0x18580, 0x1a57f, 1 }, { 39, 0x1a580, 0x1c57f, 1 },
++	{ 40, 0x1c580, 0x1e57f, 1 }, { 41, 0x1f400, 0x1f843, 1 }, { 42, 0x1f844, 0x1f8bf, 0 }, { 43, 0x1f860, 0x1f860, 1 },
++	{ 44, 0x1f87f, 0x1f8a2, 1 }, { 47, 0x1f8c0, 0x1f8c0, 1 },
++};
++
++/* gen7_3_0_hwcg_regs (RBBM_CLOCK_CNTL itself among them, as in the table) */
++static const struct kg_reg kg_hwcg[] = {
++	{ 0x0b0, 0x02222222 }, { 0x0b4, 0x02022222 }, { 0x0bc, 0x0000f3cf }, { 0x0b8, 0x00000080 },
++	{ 0x0c0, 0x22222220 }, { 0x0c4, 0x22222222 }, { 0x0c8, 0x22222222 }, { 0x0cc, 0x00222222 },
++	{ 0x0e0, 0x77777777 }, { 0x0e4, 0x77777777 }, { 0x0e8, 0x77777777 }, { 0x0ec, 0x00077777 },
++	{ 0x0d0, 0x11111111 }, { 0x0d4, 0x11111111 }, { 0x0d8, 0x11111111 }, { 0x0dc, 0x00011111 },
++	{ 0x10b, 0x22222222 }, { 0x110, 0x00000004 }, { 0x10f, 0x00000002 }, { 0x0f0, 0x22222222 },
++	{ 0x0f4, 0x01002222 }, { 0x0f8, 0x00002220 }, { 0x100, 0x44000f00 }, { 0x104, 0x25222022 },
++	{ 0x105, 0x00555555 }, { 0x106, 0x00000011 }, { 0x107, 0x00440044 }, { 0x108, 0x04222222 },
++	{ 0x286, 0x00000222 }, { 0x114, 0x02222223 }, { 0x111, 0x00002222 }, { 0x10a, 0x00000000 },
++	{ 0x116, 0x04104004 }, { 0x113, 0x00000000 }, { 0x109, 0x00004000 }, { 0x115, 0x00000200 },
++	{ 0x112, 0x00002222 }, { 0x11b, 0x00002222 }, { 0x11c, 0x00000000 }, { 0x11d, 0x00000000 },
++	{ 0x117, 0x00000002 }, { 0x260, 0x00000223 }, { 0x0ae, 0x8aa8aa82 }, { 0x533, 0x00000182 },
++	{ 0x044, 0x00000000 }, { 0x042, 0x00000000 }, { 0x118, 0x00000222 }, { 0x119, 0x00000111 },
++	{ 0x11a, 0x00000555 },
++};
++
++/* gen7_0_0_ao_hwcg_regs: GMU always-on clock gating */
++static const struct kg_reg kg_ao_hwcg[] = {
++	{ 0x23b09, 0x00020000 }, { 0x23b0a, 0x00010111 }, { 0x23b0b, 0x00005555 },
++};
++
++/* a block of GPU registers, announced as one, written, then read back */
++static unsigned
++kg_gpu_regs(const char *what, const struct kg_reg *r, unsigned n)
++{
++	unsigned bad = 0;
++
++	printf("SWEET KGPU: 20 write %u GPU registers: %s\n", n, what);
++	for (unsigned i = 0; i < n; i++) {
++		kg_wr(kg.gpu, 4u * r[i].reg, r[i].val);
++	}
++	for (unsigned i = 0; i < n; i++) {
++		uint32_t v = kg_rd(kg.gpu, 4u * r[i].reg);
++		if (v != r[i].val) {
++			printf("SWEET KGPU: 20   %#x reads %#x, not %#x\n", r[i].reg, v, r[i].val);
++			bad++;
++		}
++	}
++	return bad;
++}
++
++/*
++ * kgsl_zap_shader_load = qcom_mdt_load + PAS_AUTH_AND_RESET(13). qcom_mdt_pas_init's
++ * PAS_INIT_IMAGE was step 12's, in this run; then PAS_MEM_SETUP(13, region,
++ * max - min of the loadable segments), each segment copied to region +
++ * paddr - min (relocatable) from the .mdt or its .bNN file, the rest zeroed,
++ * then AUTH_AND_RESET. TrustZone keeps the region from then on: it is not
++ * touched again, and nothing undoes the load (kgsl never unloads it either).
++ */
++static bool
++kg_zap_load(void)
++{
++	void *mdt = NULL, *seg = NULL;
++	size_t mdt_size = 0, seg_size = 0;
++	uint64_t res;
++	bool ok = false;
++
++	if (topaz_fw_read(KG_ZAP_MDT, &mdt, &mdt_size) != 0 || !kg_zap_header_ok(mdt, mdt_size)) {
++		printf("SWEET KGPU: 20 cannot use " KG_ZAP_MDT "\n");
++		if (mdt != NULL) {
++			topaz_fw_free(mdt, mdt_size);
++		}
++		return false;
++	}
++	const uint8_t *m = mdt;
++	unsigned phnum = (unsigned)m[44] | (unsigned)m[45] << 8;
++	uint32_t min = ~0u, max = 0;
++	bool reloc = false;
++#define KG_PH(i, f) ((uint32_t)m[52 + 32 * (i) + (f)] | (uint32_t)m[53 + 32 * (i) + (f)] << 8 | \
++	(uint32_t)m[54 + 32 * (i) + (f)] << 16 | (uint32_t)m[55 + 32 * (i) + (f)] << 24)
++	/* mdt_phdr_valid: PT_LOAD, not the hash segment, memsz != 0 */
++#define KG_PH_LOAD(i) (KG_PH(i, 0) == 1 && ((KG_PH(i, 24) >> 24) & 7u) != 2 && KG_PH(i, 20) != 0)
++	for (unsigned i = 0; i < phnum; i++) {
++		if (!KG_PH_LOAD(i)) {
++			continue;
++		}
++		reloc |= (KG_PH(i, 24) & KG_MDT_RELOC) != 0;
++		min = KG_PH(i, 12) < min ? KG_PH(i, 12) : min;
++		uint32_t end = (KG_PH(i, 12) + KG_PH(i, 20) + 0xfffu) & ~0xfffu;
++		max = end > max ? end : max;
++	}
++	if (min == ~0u || !reloc || max - min > KG_ZAP_SIZE) {
++		printf("SWEET KGPU: 20 zap segments %#x..%#x%s: not what this loader handles\n", min, max,
++		    reloc ? "" : " (not relocatable)");
++		goto out;
++	}
++	printf("SWEET KGPU: 20 zap: loadable %#x..%#x (relocatable) -> region %#x+%#x\n", min, max, KG_ZAP_PA, max - min);
++
++	kg_next(20, "PAS_MEM_SETUP(13, the zap region, its size) (qcom_mdt_pas_init; INIT_IMAGE was step 12's)");
++	if (kg_scm(20, "pas mem setup", KG_SCM_PAS_MEM_SETUP, KG_SCM_ARGS_VAL3, KG_PAS_GPU, KG_ZAP_PA, max - min, &res) != 0 ||
++	    res != 0) {
++		printf("SWEET KGPU: 20 TrustZone does not take the zap region\n");
++		goto out;
++	}
++
++	kg_next(20, "the zap segments into the region 0x89e1a000 (uncached, words)");
++	vm_offset_t region = kg_map("zap region", KG_ZAP_PA, KG_ZAP_SIZE);
++	if (region == 0) {
++		goto out;
++	}
++	for (unsigned i = 0; i < phnum; i++) {
++		if (!KG_PH_LOAD(i)) {
++			continue;
++		}
++		uint32_t off = KG_PH(i, 12) - min, fsz = KG_PH(i, 16), msz = KG_PH(i, 20), foff = KG_PH(i, 4);
++		const uint8_t *src = NULL;
++		if (fsz > msz) {
++			printf("SWEET KGPU: 20 zap segment %u: file size above memory size\n", i);
++			goto out;
++		}
++		if (fsz != 0 && foff < mdt_size && foff + fsz <= mdt_size) {
++			src = m + foff;
++		} else if (fsz != 0) {
++			char path[64];
++			snprintf(path, sizeof(path), KG_ZAP_SEG, i);
++			if (topaz_fw_read(path, &seg, &seg_size) != 0 || seg_size < fsz) {
++				printf("SWEET KGPU: 20 cannot read %s (%lu bytes, %u wanted): upload the phone's vendor one\n", path,
++				    (unsigned long)seg_size, fsz);
++				goto out;
++			}
++			src = seg;
++		}
++		printf("SWEET KGPU: 20 zap segment %u: %u bytes (+%u zero) at region +%#x\n", i, fsz, msz - fsz, off);
++		for (uint32_t o = 0; o < msz; o += 4) {
++			uint32_t w = 0;
++			for (uint32_t k = 0; k < 4 && o + k < fsz; k++) {
++				w |= (uint32_t)src[o + k] << (8 * k);
++			}
++			kg_wr(region, off + o, w);
++		}
++		if (seg != NULL) {
++			topaz_fw_free(seg, seg_size);
++			seg = NULL;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	kg_next(20, "PAS_AUTH_AND_RESET(13): TrustZone checks and takes the zap shader");
++	uint64_t ret = kg_scm(20, "pas auth and reset (zap)", KG_SCM_PAS_AUTH_RESET, KG_SCM_ARGS_VAL, KG_PAS_GPU, 0, 0, &res);
++	ok = ret == 0 && res == 0;
++	printf("SWEET KGPU: 20 %s\n", ok ? "THE ZAP SHADER IS LOADED (TrustZone authenticated it)" :
++	    "TrustZone does not authenticate the zap shader");
++#undef KG_PH_LOAD
++#undef KG_PH
++out:
++	if (seg != NULL) {
++		topaz_fw_free(seg, seg_size);
++	}
++	topaz_fw_free(mdt, mdt_size);
++	return ok;
++}
++
++/*
++ * The port map's 19-20 with GX on and the GPU's context from step 19: the
++ * zap shader through TrustZone, then gen7_start for gen7_3_0 (its writes in
++ * kgsl's order; not done: preemption, LLCC slices, the IFPC power-up list,
++ * perfcounters, coresight, interrupts), then gen7_rb_start: RPTR_ADDR to the
++ * scratch page, RB_CNTL, CP_SQE_CNTL 1 (the CP fetches the microcode through
++ * context 0: the first proof of the GPU's translation), CP_THREAD_CONTROL +
++ * CP_ME_INIT (gen7_cp_init_cmds, its power-up list empty, in the scratch
++ * page) at the ring's head, WPTR 10, and adreno_spin_idle: RPTR = WPTR and
++ * CX busy bit 23 clear, for up to 2 s. The GX registers go with GX in the
++ * slumber; the undo halts the CP first (CP_SQE_CNTL 0), before stream 0 is
++ * unrouted and its memory freed.
++ */
++static bool
++kg_step20(void)
++{
++	if (kg.gpu == 0 || !kg_gx_on() || kg_rd(kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_LO) != (uint32_t)KG_GPU_SQE_VA) {
++		printf("SWEET KGPU: 20 needs steps 1-19 (GX on, the CP's ring and microcode set, in this run)\n");
++		return false;
++	}
++	kg_announce(20, "the zap shader " KG_ZAP_MDT " again, for its segments");
++	if (!kg_zap_load()) {
++		return false;
++	}
++
++	kg_next(20, "gen7_start's registers (GX registers, kept: they go with GX)");
++	unsigned bad = kg_gpu_regs("gen7_start, plain writes", kg_gen7_start_regs,
++	    sizeof(kg_gen7_start_regs) / sizeof(kg_gen7_start_regs[0]));
++	kg_set("GMU", kg.gmu, KG_GMU_OFF(GEN7_GMU_CX_GMU_POWER_COUNTER_SELECT_1), 0x4, "power_counter_select_1 (ifpc)");
++	kg_set("GPU", kg.gpu, 4u * GEN7_RB_CMP_DBG_ECO_CNTL, kg_rd(kg.gpu, 4u * GEN7_RB_CMP_DBG_ECO_CNTL) | (1u << 11),
++	    "rb_cmp_dbg_eco_cntl | bit 11");
++	kg_set("GMU", kg.gmu, KG_GMU_OFF(GEN7_GPU_GMU_AO_GPU_CX_BUSY_MASK), 0xff000000u, "ao_gpu_cx_busy_mask");
++	kg_set("GMU", kg.gmu, KG_GMU_OFF(GEN7_GMU_CX_GMU_POWER_COUNTER_SELECT_0),
++	    (kg_gmu(GEN7_GMU_CX_GMU_POWER_COUNTER_SELECT_0) & ~0xffu) | 0x20u, "power_counter_select_0 (gpu busy)");
++	kg_set("GMU", kg.gmu, KG_GMU_OFF(GEN7_GMU_CX_GMU_POWER_COUNTER_ENABLE), 1, "power_counter_enable");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_PROTECT_CNTL, 0xbu, "cp_protect_cntl (GEN7_PROTECT_DEFAULT)");
++	struct kg_reg prot[sizeof(kg_protect) / sizeof(kg_protect[0])];
++	for (unsigned i = 0; i < sizeof(kg_protect) / sizeof(kg_protect[0]); i++) {
++		prot[i].reg = GEN7_CP_PROTECT_REG + kg_protect[i].n;
++		prot[i].val = kg_protect[i].start | (kg_protect[i].end - kg_protect[i].start) << 18 |
++		    (uint32_t)kg_protect[i].noaccess << 31;
++	}
++	bad += kg_gpu_regs("gen7_protect_init (gen7_0_0_protected_regs)", prot, sizeof(prot) / sizeof(prot[0]));
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_APRIV_CNTL, 0x6fu, "cp_apriv_cntl (GEN7_BR_APRIV_DEFAULT)");
++	static const struct kg_reg secvid[] = {
++		{ 0xf803, 0 }, { 0xf800, 0xf0000000u }, { 0xf801, 0 }, { 0xf802, 0xfffff000u },
++	};
++	bad += kg_gpu_regs("_set_secvid: TSB off, trusted 0xf0000000 + 0xfffff000 (64-bit kgsl)", secvid, 4);
++	for (unsigned i = 0; i < sizeof(kg_ao_hwcg) / sizeof(kg_ao_hwcg[0]); i++) {
++		kg_set("GMU", kg.gmu, KG_GMU_OFF(kg_ao_hwcg[i].reg), kg_ao_hwcg[i].val, "ao hwcg");
++	}
++	uint32_t clock = kg_rd(kg.gpu, 4u * GEN7_RBBM_CLOCK_CNTL);
++	if (clock != KG_CLOCK_CNTL_ON) {
++		bad += kg_gpu_regs("gen7_hwcg_set(on): gen7_3_0_hwcg_regs", kg_hwcg, sizeof(kg_hwcg) / sizeof(kg_hwcg[0]));
++		kg_set("GPU", kg.gpu, 4u * GEN7_RBBM_CLOCK_CNTL, KG_CLOCK_CNTL_ON, "rbbm_clock_cntl (top level hwcg)");
++	}
++	printf("SWEET KGPU: 20 gen7_start done: %u registers read back different (rbbm_clock_cntl was %#x); rbbm_status %#x, "
++	    "cb0 fsr %#x\n", bad, clock, kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS),
++	    kg_rd(kg.smmu, (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page + SMMU_CB_FSR));
++
++	/* gen7_rb_start; the CP_ME_INIT stream of gen7_cp_init_cmds at the ring's head */
++	vm_offset_t rb = 0, scratch = 0;
++	for (unsigned i = 0; i < kg.nundo; i++) {
++		if (kg.undo[i].kind == KG_UNDO_KFREE && strcmp(kg.undo[i].name, "gpu ringbuffer") == 0) {
++			rb = kg.undo[i].base;
++		} else if (kg.undo[i].kind == KG_UNDO_KFREE && strcmp(kg.undo[i].name, "gpu scratch page") == 0) {
++			scratch = kg.undo[i].base;
++		}
++	}
++	if (rb == 0 || scratch == 0) {
++		printf("SWEET KGPU: 20 step 19's ring or scratch page is gone\n");
++		return false;
++	}
++	uint64_t reglist = KG_GPU_SCRATCH_VA + KG_SCRATCH_REGLIST;
++	const uint32_t init[10] = {
++		0x70970001u, 1u << 27,          /* CP_THREAD_CONTROL: concurrent binning off */
++		0x70c80007u, KG_ME_INIT_MASK, 0x3, 0x20000000u, 0x2, (uint32_t)reglist, (uint32_t)(reglist >> 32), 1u << 31,
++	};
++	memcpy((void *)rb, init, sizeof(init));
++	memset((void *)scratch, 0, 0x1000);
++	kg_to_memory(rb, sizeof(init));
++	kg_to_memory(scratch, 0x1000);
++
++	kg_next(20, "gen7_rb_start: RPTR_ADDR (the scratch page), RB_CNTL, then CP_SQE_CNTL 1: THE CP STARTS");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_RPTR_ADDR_LO, (uint32_t)KG_GPU_SCRATCH_VA, "cp_rb_rptr_addr_lo");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_RPTR_ADDR_HI, (uint32_t)(KG_GPU_SCRATCH_VA >> 32), "cp_rb_rptr_addr_hi");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_CNTL, KG_CP_RB_CNTL, "cp_rb_cntl");
++	kg_put("GPU", kg.gpu, 4u * GEN7_CP_SQE_CNTL, 1, KG_UNDO_WORD, 0, "cp_sqe_cntl (the CP halted again)");
++	kg_wait(10);
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
++	printf("SWEET KGPU: 20 cp started: rbbm_status %#x cp_status_1 %#x rptr %u; cp_interrupt_status %#x hw_fault %#x; "
++	    "cb0 fsr %#x\n", kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_STATUS_1),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT), kg_rd(kg.smmu, cb + SMMU_CB_FSR));
++
++	kg_next(20, "CP_THREAD_CONTROL + CP_ME_INIT (10 words at the ring's head), WPTR 10, then RPTR = 10 and idle "
++	    "for up to 2 s (adreno_spin_idle)");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_WPTR, 10, "cp_rb_wptr");
++	uint32_t fence = kg_gmu(GEN7_GMU_AHB_FENCE_STATUS);
++	uint32_t rptr = 0, busy = 0;
++	unsigned t;
++	for (t = 0; t < 20000; t++) {
++		rptr = kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR);
++		busy = kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS);
++		if (rptr == 10 && !(busy & (1u << 23))) {
++			break;
++		}
++		delay(100);
++	}
++	kg_to_memory(scratch, 64);
++	kg_wr(kg.gpu, 4u * GEN7_CP_SQE_STAT_ADDR, 1);
++	printf("SWEET KGPU: 20 after %u.%u ms: rptr %u (shadow %u) wptr 10, cx_busy %#x, fence status %#x\n", t / 10, t % 10,
++	    rptr, *(volatile uint32_t *)scratch, busy, fence);
++	printf("SWEET KGPU: 20 rbbm_status %#x status3 %#x int_0 %#x; cp_status_1 %#x interrupt %#x hw_fault %#x protect %#x "
++	    "sqe_stat %#x\n", kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS3),
++	    kg_rd(kg.gpu, 4u * GEN7_RBBM_INT_0_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_STATUS_1),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_PROTECT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_SQE_STAT_DATA));
++	printf("SWEET KGPU: 20 cb0 fsr %#x far %#x:%08x fsynr0 %#x; sgfsr %#x\n", kg_rd(kg.smmu, cb + SMMU_CB_FSR),
++	    kg_rd(kg.smmu, cb + SMMU_CB_FAR + 4), kg_rd(kg.smmu, cb + SMMU_CB_FAR), kg_rd(kg.smmu, cb + SMMU_CB_FSYNR0),
++	    kg_rd(kg.smmu, SMMU_SGFSR));
++	bool ok = rptr == 10 && !(busy & (1u << 23));
++	printf("SWEET KGPU: 20 %s\n", ok ? "THE CP RUNS: CP_ME_INIT consumed, the GPU idle (microcode fetched through "
++	    "context 0)" : rptr == 10 ? "the CP took CP_ME_INIT but the GPU does not go idle" :
++	    "the CP does not consume CP_ME_INIT");
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -2749,14 +3118,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -2791,12 +3160,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 19 ? 19u : (unsigned)last;
++	kg.last = last > 20 ? 20u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 19) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..19 exist; running those\n", last);
++	if (last > 20) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..20 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
