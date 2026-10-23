@@ -726,6 +726,24 @@ next suspects are then the 2D engine's other paths (Mesa's a710 magic registers)
 patches, series reproduces the file, syntax clean. **Test:** #43 image with `kgpu=22` (watch the
 panel ~75-90 s after boot).
 
+**BOOT #44 (2026-10-24 01:26, shim/out/shim-boot-44.img = #43's with the 0988 kernel, CI 40018271036
+@ 9f70363 sha256 ab47fe4a...): THE GPU DRAWS A PICTURE AND IT IS ON THE PANEL (the user saw the
+stripes); THEN A KERNEL PANIC FROM OUR OWN UNMAP.** Log: temp/ios-m8/usblog/live-boot44-20261024-
+0126.txt (ends inside the 15 s show). Step 19: CB0 SCTLR written 0x1127, **reads 0x127: HUPCF
+kept** (ASIDPNE still not). Step 22: picture mapped "unprivileged too", 14 of 16 tables; 2D
+stream consumed in 0.9 ms, idle, no interrupt, **CB0 FSR 0x400 (no fault)**, **marker
+0x6b677022, first pixel 00 80 ff ff (orange), middle ff ff ff ff (white), last row ff 80 00 ff
+(blue), 0 of 144 samples wrong**; "A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white,
+blue from the top (held 15 s)". **Milestone K2 of the port map: the GPU's 2D engine draws through
+our SMMU tables, out of secure mode, and the picture is shown.** The panic, after the show (the
+USB log stops; panic screen not transcribed): ml_io_unmap(panel, 4320 * 2400) - its
+pmap_remove(addr, addr + 0x9e3400) panics in pmap_remove_options when the end is not page
+aligned (osfmk/arm/pmap/pmap.c: "pmap_remove_options() pmap %p start 0x%llx end 0x%llx");
+ml_io_map_unmappable had rounded the mapping up to 0x9e4000 (kmem_free rounds too; pmap_remove
+does not). Step 17's HFI alias (0x4000) was already page sized. **FIX (0989, to write):** map and
+unmap the panel alias with the size rounded to PAGE_SIZE. Nothing of the GPU's undo ran this boot;
+the reboot reset it all.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
