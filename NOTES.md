@@ -652,6 +652,24 @@ the scratch page. Nothing new to undo (step 20's CP halt runs first). Success li
 A WORD: 0x6b677021 at 0xe0008100, out of secure mode". Verified: 228 patches, series reproduces
 the file, syntax clean. **Test:** #41 image with `kgpu=21`.
 
+**BOOT #42 (2026-10-24 00:47, shim/out/shim-boot-42.img = #41 with `kgpu=21`, kernel CI 40012827112
+@ 3cfdc6f sha256 1caabb21...): KGPU 21 PASSES, "THE GPU WROTE A WORD: 0x6b677021 at 0xe0008100, out
+of secure mode"; NO PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot42-20261024-0047.txt (the
+boot #41 listener was still running and held the UDP port, so the first #42 listener exited;
+stopped it and started a new one, which got the full replay from the kernel's first line;
+live-boot41's file also holds lines received after #41's run, up to 00:48). Steps 1-20 as #41
+(zap MEM_SETUP and AUTH_AND_RESET ret 0, CP_ME_INIT consumed at once). Step 21: before,
+**RBBM_SECVID_TRUST_CNTL 0x1** (secure), scratch rptr shadow 10, word 0. CP_SET_SECURE_MODE 0:
+WPTR 0xa -> 0xc, RPTR 12 after 0.1 ms, idle, no CP interrupt/fault, SQE_STAT 0x70e60001 (the
+packet), CB0 FSR 0x400; **RBBM_SECVID_TRUST_CNTL 0 after: out of secure mode** (through the
+zap shader, as kgsl). CP_MEM_WRITE + CP_WAIT_MEM_WRITES: WPTR 0xc -> 0x11, RPTR 17 at once,
+idle, SQE_STAT 0x70928000; **the word at 0xe0008100 reads 0x6b677021** (the rptr shadow 17). Undo
+(51): CP halted, stream 0 unrouted, frees, oob clear, slumber (acked, GX off, 0xf, RSC sleep
+done), the rest; "run over". System as #41 (agent up). **The port map's 1-21 proven (kgpu 1-21):
+the GPU runs commands and writes memory, out of secure mode, on this kernel under Gunyah.**
+NEXT (kgpu 22 = the port map's 22): a picture - the GPU fills a buffer (CP_MEM_WRITE runs, or a
+blit/2D clear) that ends up on the splash framebuffer (0xb8000000), as hk did on redwood.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
