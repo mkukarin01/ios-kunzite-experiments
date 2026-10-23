@@ -1,16 +1,17 @@
-kunzite (SM6475 parrot): sweet's USB device mode (CDC-ECM Ethernet ue0 at
-192.168.7.2, live console as UDP to 192.168.7.1:5140) with parrot's GCC
-USB30_PRIM GDSC/clock offsets (gcc-parrot.c, live FDT gdsc@149004). Same DWC3
-base and QSCRATCH VBUS override (Xiaomi dwc3-msm-core.c); the femto PHY is not
-read. Kernel RAM is above 4 GiB, so device mode starts only when GHWPARAMS0
-says 64-bit AXI addressing. Runs without sweethw=1: read-only state report by
-default, device mode with sweetusb=2.
+kunzite: sweet_usb.c with parrot GCC USB30_PRIM GDSC/clock offsets, no QUSB2 read, a
+64-bit DWC3 addressing check; runs without sweethw=1 (device mode with sweetusb=2).
+Regenerated over the merged series (call site re-derived; the sweet_usb.c body is
+carried over unchanged).
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -844,11 +844,13 @@
- 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+@@ -840,15 +840,13 @@
+ 	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
+ 	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
+ 	 */
+-	int hw = 0;
+-	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
  	kunzite_touch_init();   /* kunzite: GT9916K on SPI; topaz's sweet_touch.c is SM6225 I2C */
  	sweet_keys_init();
 -	if (hw == 1) {
@@ -19,11 +20,9 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
 -	}
 +	/*
-+	 * kunzite: sweet_usb.c carries parrot's GCC offsets (0909); it reads
-+	 * state by default and starts the CDC-ECM device only with sweetusb=2
-+	 * (sweetusb=0: not at all). sweethw is no longer needed for it.
++	 * kunzite: sweet_usb.c carries parrot's GCC USB offsets (0968); it reads
++	 * state by default and starts the CDC-ECM device only with sweetusb=2.
 +	 */
-+	(void)hw;
 +	sweet_usb_probe();
  	return 0;
  }

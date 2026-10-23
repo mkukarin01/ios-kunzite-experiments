@@ -1,27 +1,25 @@
-kunzite (SM6475 parrot): AppleCLCD::start mapped sweet's SM7150/SM6115
-display addresses and faulted reading DSI0 ctrl at 0x05e94000+4 (boot #6,
-AppleCLCD::start+0x2f4, kernel data abort). Map the verified parrot DSI0 ctrl
-(0xae94000, live FDT) and NULL the VIG0/CTL0/INTF1 direct-scanout maps - all
-their uses are NULL-guarded, so direct scanout is off until the parrot SDE
-catalog is mined from the kunzite kernel source; the DSI write paths no-op
-(their <4GiB DSI DMA buffer cannot be allocated from the highmem-only window).
+kunzite (SM6475 parrot): map the real parrot DSI0 ctrl (0x0ae94000, live FDT) and NULL the
+SM7150/SM6115 scanout maps (all uses NULL-guarded). Regenerated over upstream's display chain.
 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -305,9 +305,9 @@
+@@ -352,11 +352,11 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
 -	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
 -	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
--	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
 +	fVig0 = NULL;    /* kunzite: SM7150 VIG0 is an unmapped hole; scanout off */
 +	fCtl0 = NULL;    /* kunzite: SM7150 CTL0 likewise */
+ 	topaz_adreno_init();
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
 +	fDsi = (volatile uint8_t *)ml_io_map(0x0ae94000, 0x1000);    /* kunzite: parrot DSI0 ctrl, live FDT */
  	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
  	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
  	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
-@@ -350,7 +350,7 @@
+@@ -399,7 +399,7 @@
  	}
  	OSSafeReleaseNULL(accel);
  	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */

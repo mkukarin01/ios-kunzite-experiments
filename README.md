@@ -4,7 +4,13 @@
 
 This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Apple's open-source XNU kernel, xnu-8796, on a Redmi Note 10 Pro) to the Xiaomi **Redmi Note 12 4G** (`topaz` / `tapas`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-As of **2026-10-18** the phone boots to the **iOS lock screen** in about 3 minutes, on the four Cortex-A73 cores. Rendering runs entirely on the CPU; there is no GPU driver. Touch is being brought up (see the roadmap); without it the lock screen cannot be unlocked yet.
+
+> **Thanks to HackiOS.** The GPU (Adreno through Mesa), display presentation, audio, Wi-Fi glue,
+> sandbox and tweak-injection work here started from [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)
+> by OOSEX GANG (kernel: APSL 2.0, [user space](https://github.com/oosexgang/hackios-xnu-userland): MIT).
+> What comes from it and under which licence: [CREDITS.md](CREDITS.md).
+
+As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cortex-A73 cores, with **touch, volume and power keys**, and **Wi-Fi**: iOS Settings lists networks, joins WPA2 networks, remembers the password in the keychain and reconnects after a reboot; Safari loads pages over HTTPS. The modem and Wi-Fi firmware are booted by our own XNU driver straight from the phone's stock `modem_a` partition. Since **2026-10-22** the GPU work is here too: the Adreno 610 draws the whole UI through Mesa freedreno behind CoreAnimation's OpenGL ES renderer, with all eight cores (AMP), sound, charging, wallpapers, widgets and tweak injection (ElleKit). Much of it started from **HackiOS** (now open source, see [CREDITS.md](CREDITS.md)).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. Nothing is flashed to the boot partitions; the kernel is started from RAM with `fastboot boot`.
 
@@ -17,15 +23,19 @@ As of **2026-10-18** the phone boots to the **iOS lock screen** in about 3 minut
 | Memory | The upper DDR bank, `0x1_40000000` + 4 GiB |
 | Storage | UFS host driver (UFS 3.0 at `0x4804000`); the iOS root is a journaled HFS+ volume in `userdata`, read/write |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`); CoreAnimation renders in software into ABL's framebuffer at `0x5c000000` (1080×2400). Presented to iOS as an iPhone X panel |
-| GUI | backboardd, SpringBoard, boot Apple logo, lock screen |
+| Display | Kernel IOSurface (`SweetSurface`) + IOMobileFramebuffer (`AppleCLCD`); the MDP scans iOS surfaces directly from contiguous RAM below 4 GiB, double-buffered, with real cache maintenance (the Apple SoC config made it a no-op). Presented to iOS as an iPhone X panel (1125×2436 canvas centred on the 1080×2400 panel) |
+| GUI | backboardd, SpringBoard, lock screen, home screen, Settings and other apps |
+| Touch and keys | FocalTech FT5452 touch on QUP0 SE2 (patch 0087 fixed the clock that hung the phone), power and volume keys |
+| Wi-Fi | `TopazModem` (patches 0113–0130): modem PAS boot through TrustZone from `modem_a`, GLINK/QRTR, pd-mapper/tftp/rmtfs, WLFW, copy engines, HTC/WMI/HTT, scan, association, WPA2-PSK 4-way handshake in the kernel, Ethernet data path. iOS sees it through `wifid` |
+| Battery | Gauge and charger state (patch 0091) |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 
 ## What does not work (yet)
 
-- **Touch and buttons.** The FocalTech FT5452 driver (patch 0083) is written but not yet confirmed on the phone; power/volume keys are not ported.
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS, SEP.** `bluetoothd` and `fairplayd.H2` relaunch constantly because the hardware is missing.
-- **No GPU**, low frame rate (the CPU copies frames to the panel, `sweetfb_hz`).
+- **No Bluetooth, cellular data, audio, camera, sensors, GPS, SEP.** `bluetoothd` and `fairplayd.H2` relaunch constantly because the hardware is missing.
+- **Frame rate**: 25–35 frames a second in animations (the GPU and CoreAnimation's own pacing are the limits now), not yet 60.
+- **Wi-Fi**: WPA2-PSK only (no WPA3, open networks untested), no power save, no MAC randomisation.
+- **Wallpaper and widgets**: LaunchServices registers apps but no app extensions on this root, so PosterBoard finds no wallpaper provider (being investigated).
 - **No real-time clock**: the date starts at 31 December.
 - **Only 4 of 8 cores** (see "Why only the Gold cores").
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
@@ -128,19 +138,16 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 
 ## Roadmap
 
-1. **Touch** (FT5452 at I²C `0x38` on QUP0 SE2 `0x4a88000`, IRQ GPIO80, reset GPIO86, AVDD GPIO36): patch 0083, needs confirmation on the phone.
-2. **Buttons**: power and volume down on the PM6125 PON block, volume up on PM6125 GPIO5.
-3. **Smoother display**: higher `sweetfb_hz`; check whether the Gold cores run at a low clock without cpufreq (the shim's speed probe) and raise it if so.
+1. ~~Touch~~ and ~~buttons~~: done (patches 0083–0090).
+2. ~~Wi-Fi~~: done (patches 0113–0130); next: WPA3, open networks, power save.
+3. **GPU (Adreno 610)**, in progress: a kernel driver after topaz-woa `TopazGpuW` with Mesa freedreno behind CoreAnimation's OpenGL ES renderer. On the phone the lock screen, home screen and Settings already draw on the GPU. That work uses code from **HackiOS** (a port of iOS 16 to the POCO X5 Pro), published 2026-10-22 under APSL 2.0 / MIT: kernel patches 0900–0947, user space in `userland/` (eagl, Mesa patches, RedwoodAudio), see [CREDITS.md](CREDITS.md). Build the kernel on a Mac with `tools/build-local.sh`. The kernel IOSurface work it needed is here: patches 0131–0139 (`SweetSurface` values, bulk attachments, client-memory surfaces, the release protocol) and 0138 (empty `IOAcceleratorES`, which saves 30 s at every backboardd start). Next: render straight into display surfaces (today the CPU copies every frame out), GPU clock above 600 MHz with the GX voltage vote, then Metal.
 4. **Narrow the GIC fix** to the register that actually matters, then move it into XNU.
 5. **Real-time clock** from the PMIC RTC or passed in by the shim.
 6. **All 8 cores (experiment, later):** build XNU with 4K pages (drop `__ARM_16K_PG__` from `SWEET.h`, as XNU's own `BCM2837` Raspberry Pi 3 config does on Cortex-A53) and describe two clusters, Gold as `P` and Silver as `E`, so the AMP scheduler uses both. Risk: the iOS 16 userland was only ever run on 16K pages (hard-coded 16K in malloc, JIT guard pages, IOSurface, commpage layout), and the 16K assumptions in the shim and sweet's patches have to be checked too. The 16K Gold-only kernel stays as the fallback.
 7. **Silver cores as a coprocessor** (idea): run bare-metal shim code on them for the panel frame copy instead of XNU.
 8. **6 GB model** (requested): the RAM layout is hard-coded for the 4 GB phone (`mkadt.py --highmem`, 4 GiB at `0x1_40000000`). Have the shim read the DDR ranges from the `/memory` node of the DTB that ABL passes and write them into the ADT and boot args, so one image boots both the 4 GB and the 6 GB versions. Everything else (SoC, panel, touch, battery) is the same hardware.
-**GPU plan (2026-10-19):** a kernel Adreno 610 driver (topaz-woa `TopazGpuW` sequences) with an msm DRM style user client for Mesa freedreno, so QuartzCore's OpenGL ES renderer draws the UI on the GPU; Metal for apps after that.
-
-9. **Wi-Fi** (port from [MakrSas/topaz-woa](https://github.com/MakrSas/topaz-woa) `TopazWifi`, which has scan, WPA2 and working internet on Windows): bring up the modem/WLAN firmware through TrustZone, SMEM/QMI and the WCN3988 WLAN commands exactly as `TopazWifi` does, in an XNU driver. Expose it to iOS first as a network interface (IONetworkingFamily, network set by config), then emulate the IO80211 interface that `wifid` talks to, so Settings → Wi-Fi shows the scan list and joins networks.
-10. **Speaker** (port from topaz-woa `TopazAudio` (ADSP / AudioReach) + `TopazSpeaker`, see its `docs/P9_audio.md`): ADSP firmware through TrustZone, AudioReach graph to the speaker, and an XNU audio driver that CoreAudio can output to.
-11. **Also ready in topaz-woa to port**: brightness (display adapter), USB host/OTG (`TopazOtgDxe` + XHCI), RPM requests (`TopazRpm`: rails, clocks, GPU CX level), SIM/LTE registration (`docs/P9_sim.md`). The GPU work follows `TopazGpuW`.
+9. **Speaker** (port from topaz-woa `TopazAudio` (ADSP / AudioReach) + `TopazSpeaker`, see its `docs/P9_audio.md`): ADSP firmware through TrustZone, AudioReach graph to the speaker, and an XNU audio driver that CoreAudio can output to.
+10. **Also ready in topaz-woa to port**: brightness (display adapter), USB host/OTG (`TopazOtgDxe` + XHCI), RPM requests (`TopazRpm`: rails, clocks, GPU CX level), SIM/LTE registration (`docs/P9_sim.md`). The GPU work follows `TopazGpuW`.
 
 ## Repository layout
 
@@ -165,6 +172,16 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0081 | ARMv8.0: `-mcpu=cortex-a53`, no PAN, PFZ without CASA, userland LSE/LDAPR emulation |
 | 0082 | Boot CPU is Gold MPIDR `0x100` |
 | 0083 | Touch: FocalTech FT5452 on QUP0 SE2 (values from [topaz-woa](https://github.com/MakrSas/topaz-woa) TopazTouch) |
+| 0084–0090 | Touch diagnostics and fixes (0087: SE2 clock RCG was wrong and hung the phone; keys), LUN0 GPT watchdog (0088) |
+| 0091 | Battery gauge and charger |
+| 0092–0103 | Direct MDP scanout of iOS surfaces from contiguous RAM, write-combined console, double-buffered frames, real dcache maintenance |
+| 0104–0107, 0110 | Panel brightness over DSI DCS, `AppleARMBacklight` for CoreBrightness (opt-in `sweetbl=1`), display on/off |
+| 0111–0112, 0119–0120 | Real dcache ops, console filter `sweetlog=WORDS`, `sweetfb_console=1` |
+| 0113–0130 | `TopazModem`: modem boot, GLINK/QRTR, modem host services, WLFW, WLAN scan, HTT, station, WPA2 join |
+| 0114 | iPhone X canvas (1125×2436) with a 16-byte aligned panel window |
+| 0127–0128 | `sweetbusy=N`; no IOKit-daemon busy hold (IOKit never quiesced, wifid hung boot) |
+| 0131–0137, 0139 | `SweetSurface` for CoreAnimation's GL renderer: real values / bulk attachments / purgeability, wrapped client image and memory, `IOSurfaceAddress` surfaces, detach/release protocol |
+| 0138 | Empty `IOAcceleratorES` service |
 
 ## Key hardware facts (topaz)
 
