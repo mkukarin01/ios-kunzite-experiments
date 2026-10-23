@@ -51,7 +51,33 @@ CoreImage taking the OpenGL ES road with no GL behind it (no GPU, empty IOAccele
 Not container-path related. Unknown whether pre-merge kernels crash the same way; untested.
 The GPU port (or HackiOS's eagl) is the real fix. Report counter suffixes (.000N) restart each
 boot, and the epoch clock repeats (16:03 = launchd start every boot): tell boots apart by
-file set, not by name. Any other sandbox_container_path_* caller gets
+file set, not by name.
+
+**GPU PROBE 0971 (2026-10-23, written, NOT built/booted): `kgpu=N`, read-only steps 1-3** of the
+port map (main repo ios/gpu-plan.md). New bsd/dev/kunzite_adreno.c (+ files entry, hook +
+extern in sweet_ufs.c after sweet_usb_probe). Thread waits kgpu_delay s (default 60), then each
+group of reads is announced ("SWEET KGPU: N about to read ...") and kgpu_pause ms (default
+1500) pass before the reads. Step 1: GCC gpu_cfg_ahb 0x81004 / memnoc_gfx 0x81010 /
+snoc_dvm_gfx 0x81018 / GPLL0 votes 0x62000, cmd-db ARC gfx.lvl cx.lvl mx.lvl + level tables.
+Step 2: QFPROM 0x221c8000 +0x118/+0x130 -> speed bin (FDT bins 0x00/0xc6 940 MHz, 0xbe 900,
+0xb2 844, 0x8f 676, 0x82 612), gaming bin. Step 3 (only if gpu_cfg_ahb is on): GPU_CC
+0x3d90000 PLL0/PLL1 (Lucid EVO), RCGs xo/gmu/hub/ff, 16 branches, CX GDSC 0x9108, GX GDSC
+0x905c. Writes nothing; refuses gpu=1. Verified: 213 patches, the series reproduces the
+three files exactly (bsd/conf/files from pristine xnu-8796.141.3 + all 16 patches touching
+it); syntax-only compile clean (0 diagnostics). **Local syntax check that works now** (no
+swiftlang clang needed): Xcode 27 `xcrun clang -fsyntax-only -arch arm64 -mkernel -nostdinc
+-std=gnu11 -Werror=implicit-function-declaration -DKERNEL -DKERNEL_PRIVATE -DXNU_KERNEL_PRIVATE
+-DBSD_KERNEL_PRIVATE -DPRIVATE -DAPPLE -DNeXT -DMACH_BSD -DDEVELOPMENT=1
+-DARM64_BOARD_CONFIG_SWEET -D__arm64__`, run in temp/ios-m8/buildtree/build/xnu.obj/
+DEVELOPMENT_ARM64_SWEET/bsd/DEVELOPMENT with -I. -I<bt>/xnu/bsd and -I<bt>/build/xnu.obj/
+EXPORT_HDRS/{osfmk,libkern,pexpert,iokit} -I<bt>/xnu/EXTERNAL_HEADERS (buildtree = Oct 19,
+pre-merge headers). It flags the 0967-style undeclared call (negative control checked).
+**Test:** CI -> boot image with the standard cmdline + `sweetusb=2 kgpu=3`; start udp-log
+AFTER the USB link is up (replay), watch for "SWEET KGPU" ~60 s after boot. Possible
+outcomes: all three steps print (read access OK under Gunyah); a silent reset right after an
+"about to read" line (that block is hyp-protected: read the tail with
+shim-boot-logview2.img); step 3 refusing because gpu_cfg_ahb is off (then step 3 needs one GCC
+write first). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64

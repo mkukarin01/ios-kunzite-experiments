@@ -1,0 +1,403 @@
+kunzite: Adreno 710 probe, read-only steps 1-3 of the GPU port map (main repo ios/gpu-plan.md),
+after HackiOS redwood_adreno.c. Boot-arg kgpu=N (N<=3) runs them once on a thread, kgpu_delay
+seconds after boot (default 60), announcing each group of reads and waiting kgpu_pause ms
+(default 1500) first. 1: GCC GPU branches + GPLL0 votes, cmd-db ARC gfx.lvl/cx.lvl/mx.lvl with
+their level tables; 2: QFPROM speed/gaming bins -> FDT pwrlevel bin; 3: GPU_CC PLLs, RCGs,
+branches, CX/GX GDSCs (only if GCC gpu_cfg_ahb is on). Writes nothing; off without kgpu,
+refuses gpu=1.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/kunzite_touch.c			standard
++bsd/dev/kunzite_adreno.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/kunzite_adreno.c
+@@ -0,0 +1,360 @@
++/*
++ * kunzite (POCO M8 5G, SM6475 parrot): the Adreno 710, step by step, after
++ * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). This
++ * file has the read-only steps 1-3; nothing here writes a register.
++ *
++ * Boot-arg kgpu=N runs steps 1..N once, on its own thread, kgpu_delay
++ * seconds (default 60) after boot, so the USB live log is up to watch it.
++ * Before each group of reads a step says what it is about to read and waits
++ * kgpu_pause ms (default 1500): if a read ends the run (an access the
++ * hypervisor does not like resets the SoC), the line has reached the USB
++ * log and the persistent log. A step that does not find what the next one
++ * needs ends the run. Never together with gpu=1 (topaz's A610 driver).
++ *
++ *  1  GCC (gcc-parrot.c): GPU_CFG_AHB 0x81004 (Linux keeps it on; GPU_CC is
++ *     only readable with it), MEMNOC_GFX 0x81010, SNOC_DVM_GFX 0x81018, the
++ *     GPLL0 votes 0x62000 bits 15/16. RPMh: the ARC resources the GMU votes
++ *     (gfx.lvl, cx.lvl, mx.lvl: kgsl adreno_gen7_rpmh.c) in cmd-db at
++ *     0x80860000, with their level tables (aux data, 16-bit levels).
++ *  2  QFPROM 0x221c8000 (FDT nvmem cells): gpu_speed_bin at +0x119 bits
++ *     5..12, gpu_gaming_bin at +0x130 bit 6, and the FDT pwrlevel bin the
++ *     speed bin selects.
++ *  3  GPU_CC 0x3d90000 (gpucc-parrot.c, FDT): PLL0/PLL1 (Lucid EVO: MODE +0,
++ *     OPMODE +4, STATUS +0xc, L +0x10, ALPHA +0x14, USER_CTL +0x18), the
++ *     XO/GMU/HUB/FF RCGs, the branches, and the CX GDSC 0x9108 / GX GDSC
++ *     0x905c, as ABL left them.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++void kunzite_adreno_init(void);
++
++#define KG_GCC_PA        0x00100000u
++#define KG_GCC_SIZE      0x00090000u     /* up to the GPU branches at 0x81xxx */
++#define KG_GCC_VOTE      0x62000u        /* bit 15 gpu_gpll0, bit 16 gpu_gpll0_div */
++#define KG_GCC_CFG_AHB   0x81004u
++#define KG_GCC_MEMNOC    0x81010u
++#define KG_GCC_SNOC_DVM  0x81018u
++#define KG_CMDDB_PA      0x80860000u
++#define KG_CMDDB_SIZE    0x20000u
++#define KG_QFPROM_PA     0x221c8000u
++#define KG_QFPROM_SIZE   0x1000u
++#define KG_GPUCC_PA      0x03d90000u
++#define KG_GPUCC_SIZE    0x0000a000u
++#define KG_CBCR_OFF      (1u << 31)      /* branch CLK_OFF */
++#define KG_RCG_ROOT_OFF  (1u << 31)
++#define KG_PLL_LOCK      (1u << 31)
++#define KG_GDSC_PWR_ON   (1u << 31)
++#define KG_GDSC_COLLAPSE (1u << 0)
++#define KG_XO_KHZ        19200u
++
++/* cmd-db (cmd-db.c): header 144 bytes, 8 slave headers at +8, entries 24 bytes */
++#define KG_DB_MAGIC      0x0c0330dbu
++#define KG_DB_HEADER     144u
++#define KG_DB_ENTRY      24u
++#define KG_DB_ARC        3u
++
++static struct {
++	vm_offset_t gcc, db, qfprom, gpucc;
++	unsigned last, pause_ms, delay_s;
++	bool started, ahb_on;
++} kg;
++static int kg_sleep_chan;
++
++static const struct { uint32_t off; const char *name; } kg_branches[] = {
++	{ 0x911c, "ahb" }, { 0x9120, "crc_ahb" }, { 0x914c, "cx_ff" }, { 0x913c, "cx_gmu" },
++	{ 0x9130, "cx_snoc_dvm" }, { 0x9004, "cxo_aon" }, { 0x9144, "cxo" }, { 0x900c, "demet" },
++	{ 0x9008, "freq_measure" }, { 0x7000, "hlos1_vote_gpu_smmu" }, { 0x93e8, "hub_aon" },
++	{ 0x9148, "hub_cx_int" }, { 0x9150, "memnoc_gfx" }, { 0x9288, "mnd1x_0_gfx3d" },
++	{ 0x928c, "mnd1x_1_gfx3d" }, { 0x9134, "sleep" },
++};
++static const struct { uint32_t off; const char *name; } kg_rcgs[] = {
++	{ 0x9010, "xo" }, { 0x9318, "gmu" }, { 0x93ec, "hub" }, { 0x9474, "ff" },
++};
++/* FDT qcom,gpu-pwrlevel-bins: speed bin -> top frequency, number of levels (all start at 295 MHz) */
++static const struct { unsigned bin, max_mhz, levels; } kg_bins[] = {
++	{ 0x00, 940, 9 }, { 0xbe, 900, 9 }, { 0xb2, 844, 8 }, { 0x8f, 676, 6 }, { 0x82, 612, 5 }, { 0xc6, 940, 9 },
++};
++
++static uint32_t
++kg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++kg_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&kg_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* say what is about to be read, then give the line time to leave the phone */
++static void
++kg_announce(unsigned step, const char *what)
++{
++	printf("SWEET KGPU: %u about to read %s\n", step, what);
++	kg_wait(kg.pause_ms);
++}
++
++static vm_offset_t
++kg_map(const char *name, uint32_t pa, uint32_t size)
++{
++	vm_offset_t va = ml_io_map(pa, size);
++	if (va == 0) {
++		printf("SWEET KGPU: mapping %s %#x+%#x failed\n", name, pa, size);
++	}
++	return va;
++}
++
++static const char *
++kg_onoff(uint32_t cbcr)
++{
++	return (cbcr & KG_CBCR_OFF) ? "off" : "on";
++}
++
++/* ---- step 1: GCC and the RPMh ARC resources ---- */
++
++static uint16_t
++kg_db16(uint32_t off)
++{
++	uint32_t v = kg_rd(kg.db, off & ~3u);
++	return (uint16_t)(v >> (8u * (off & 3u)));
++}
++
++static bool
++kg_db_range(uint32_t off, uint32_t size)
++{
++	return off <= KG_CMDDB_SIZE && size <= KG_CMDDB_SIZE - off;
++}
++
++/* one ARC resource: its RPMh address and its level table (cmd-db aux data) */
++static void
++kg_arc(const char *res)
++{
++	uint32_t key[2] = { 0, 0 };
++	unsigned matches = 0;
++
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = kg_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = KG_DB_HEADER + kg_db16(h + 2);
++		uint32_t data = KG_DB_HEADER + kg_db16(h + 4);
++		unsigned count = kg_db16(h + 6);
++		if ((entries & 3u) || !kg_db_range(entries, count * KG_DB_ENTRY) || !kg_db_range(data, 0)) {
++			printf("SWEET KGPU: 1 malformed cmd-db slave header %u\n", i);
++			return;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + KG_DB_ENTRY * j;
++			if (kg_rd(kg.db, e) != key[0] || kg_rd(kg.db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = kg_rd(kg.db, e + 16);
++			unsigned len = kg_db16(e + 20);
++			uint32_t aux = data + kg_db16(e + 22);
++			++matches;
++			if (slave != KG_DB_ARC || (len & 1u) || !kg_db_range(aux, len)) {
++				printf("SWEET KGPU: 1 rpmh %s slave %u addr %#x aux %u bytes: not an ARC entry\n",
++				    res, slave, addr, len);
++				continue;
++			}
++			char levels[96];
++			size_t used = 0;
++			levels[0] = 0;
++			for (unsigned k = 0; k < len / 2 && k < 16 && used < sizeof(levels) - 8; ++k) {
++				used += (size_t)snprintf(levels + used, sizeof(levels) - used, " %u", (unsigned)kg_db16(aux + 2 * k));
++			}
++			printf("SWEET KGPU: 1 rpmh %s addr %#x, %u levels:%s\n", res, addr, len / 2, levels);
++		}
++	}
++	if (matches != 1) {
++		printf("SWEET KGPU: 1 rpmh %s: %u cmd-db entries\n", res, matches);
++	}
++}
++
++static bool
++kg_step1(void)
++{
++	kg_announce(1, "GCC 0x81004/0x81010/0x81018 (GPU branches) and 0x62000 (GPLL0 votes)");
++	kg.gcc = kg_map("GCC", KG_GCC_PA, KG_GCC_SIZE);
++	if (kg.gcc == 0) {
++		return false;
++	}
++	uint32_t ahb = kg_rd(kg.gcc, KG_GCC_CFG_AHB);
++	uint32_t memnoc = kg_rd(kg.gcc, KG_GCC_MEMNOC);
++	uint32_t dvm = kg_rd(kg.gcc, KG_GCC_SNOC_DVM);
++	uint32_t vote = kg_rd(kg.gcc, KG_GCC_VOTE);
++	printf("SWEET KGPU: 1 gcc gpu_cfg_ahb %#x (%s) memnoc_gfx %#x (%s) snoc_dvm_gfx %#x (%s) "
++	    "vote %#x: gpll0 %s, gpll0_div %s\n",
++	    ahb, kg_onoff(ahb), memnoc, kg_onoff(memnoc), dvm, kg_onoff(dvm), vote,
++	    (vote & (1u << 15)) ? "on" : "off", (vote & (1u << 16)) ? "on" : "off");
++	kg.ahb_on = !(ahb & KG_CBCR_OFF);
++
++	kg_announce(1, "cmd-db at 0x80860000 (gfx.lvl, cx.lvl, mx.lvl)");
++	kg.db = kg_map("cmd-db", KG_CMDDB_PA, KG_CMDDB_SIZE);
++	if (kg.db == 0) {
++		return true;            /* the levels are for later steps; step 3 needs only GCC */
++	}
++	uint32_t db_version = kg_rd(kg.db, 0), magic = kg_rd(kg.db, 4), flags = kg_rd(kg.db, 140);
++	printf("SWEET KGPU: 1 cmd-db version %#x magic %#x flags %#x\n", db_version, magic, flags);
++	if (magic != KG_DB_MAGIC || db_version != 1 || (flags & 1u)) {
++		printf("SWEET KGPU: 1 cmd-db not usable; no RPMh names\n");
++		return true;
++	}
++	kg_arc("gfx.lvl");
++	kg_arc("cx.lvl");
++	kg_arc("mx.lvl");
++	return true;
++}
++
++/* ---- step 2: which GPU of this kind (fuses) ---- */
++
++static bool
++kg_step2(void)
++{
++	kg_announce(2, "QFPROM 0x221c8000 +0x118 and +0x130 (gpu speed and gaming bins)");
++	kg.qfprom = kg_map("QFPROM", KG_QFPROM_PA, KG_QFPROM_SIZE);
++	if (kg.qfprom == 0) {
++		return false;
++	}
++	uint32_t w118 = kg_rd(kg.qfprom, 0x118), w130 = kg_rd(kg.qfprom, 0x130);
++	/* the cell is the two bytes at 0x119 (little endian), bits 5..12 */
++	unsigned bin = (((w118 >> 8) & 0xffffu) >> 5) & 0xffu;
++	unsigned gaming = (w130 >> 6) & 1u;
++	unsigned i;
++	for (i = 0; i < sizeof(kg_bins) / sizeof(kg_bins[0]) && kg_bins[i].bin != bin; ++i) {
++	}
++	if (i < sizeof(kg_bins) / sizeof(kg_bins[0])) {
++		printf("SWEET KGPU: 2 qfprom +0x118 %#x +0x130 %#x: speed bin %#x (FDT: %u levels, 295-%u MHz), gaming bin %u\n",
++		    w118, w130, bin, kg_bins[i].levels, kg_bins[i].max_mhz, gaming);
++	} else {
++		printf("SWEET KGPU: 2 qfprom +0x118 %#x +0x130 %#x: speed bin %#x is not in the FDT's bins, gaming bin %u\n",
++		    w118, w130, bin, gaming);
++	}
++	return true;
++}
++
++/* ---- step 3: the GPU's own clock controller, as ABL left it ---- */
++
++static void
++kg_pll(const char *name, uint32_t base)
++{
++	uint32_t mode = kg_rd(kg.gpucc, base), opmode = kg_rd(kg.gpucc, base + 0x4);
++	uint32_t status = kg_rd(kg.gpucc, base + 0xc), l = kg_rd(kg.gpucc, base + 0x10);
++	uint32_t alpha = kg_rd(kg.gpucc, base + 0x14), user = kg_rd(kg.gpucc, base + 0x18);
++	printf("SWEET KGPU: 3 %s mode %#x (%s) opmode %#x status %#x l %u alpha %#x user_ctl %#x: ~%u MHz\n",
++	    name, mode, (mode & KG_PLL_LOCK) ? "locked" : "not locked", opmode, status, l & 0xffffu,
++	    alpha, user, (l & 0xffffu) * KG_XO_KHZ / 1000u);
++}
++
++static bool
++kg_step3(void)
++{
++	if (!kg.ahb_on) {
++		printf("SWEET KGPU: 3 GCC gpu_cfg_ahb is off: GPU_CC is not readable without it, and turning it on is a write; stopping\n");
++		return false;
++	}
++	kg_announce(3, "GPU_CC 0x3d90000: PLL0 +0x0, PLL1 +0x1000");
++	kg.gpucc = kg_map("GPU_CC", KG_GPUCC_PA, KG_GPUCC_SIZE);
++	if (kg.gpucc == 0) {
++		return false;
++	}
++	kg_pll("pll0", 0x0);
++	kg_pll("pll1", 0x1000);
++
++	kg_announce(3, "GPU_CC RCGs, branches and GDSCs");
++	for (unsigned i = 0; i < sizeof(kg_rcgs) / sizeof(kg_rcgs[0]); ++i) {
++		uint32_t cmd = kg_rd(kg.gpucc, kg_rcgs[i].off), cfg = kg_rd(kg.gpucc, kg_rcgs[i].off + 4);
++		printf("SWEET KGPU: 3 rcg %s cmd %#x (%s) cfg %#x: src %u div %u\n", kg_rcgs[i].name, cmd,
++		    (cmd & KG_RCG_ROOT_OFF) ? "root off" : "root on", cfg, (cfg >> 8) & 7u, cfg & 0x1fu);
++	}
++	char line[200];
++	size_t used = 0;
++	line[0] = 0;
++	for (unsigned i = 0; i < sizeof(kg_branches) / sizeof(kg_branches[0]); ++i) {
++		uint32_t cbcr = kg_rd(kg.gpucc, kg_branches[i].off);
++		used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%s", kg_branches[i].name, kg_onoff(cbcr));
++		if (used > 120 || i + 1 == sizeof(kg_branches) / sizeof(kg_branches[0])) {
++			printf("SWEET KGPU: 3 branches%s\n", line);
++			used = 0;
++			line[0] = 0;
++		}
++	}
++	uint32_t cx = kg_rd(kg.gpucc, 0x9108), gx = kg_rd(kg.gpucc, 0x905c);
++	printf("SWEET KGPU: 3 cx gdsc %#x (%s%s) gx gdsc %#x (%s%s) gx_domain %#x cx_hw_ctrl %#x gx_sw_reset %#x\n",
++	    cx, (cx & KG_GDSC_PWR_ON) ? "on" : "off", (cx & KG_GDSC_COLLAPSE) ? ", sw collapse" : "",
++	    gx, (gx & KG_GDSC_PWR_ON) ? "on" : "off", (gx & KG_GDSC_COLLAPSE) ? ", sw collapse" : "",
++	    kg_rd(kg.gpucc, 0x9504), kg_rd(kg.gpucc, 0x953c), kg_rd(kg.gpucc, 0x9058));
++	return true;
++}
++
++static void
++kg_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3 };
++	unsigned done = 0;
++
++	kg_wait(kg.delay_s * 1000u);
++	printf("SWEET KGPU: steps 1..%u, read only, %u ms pause before each group\n", kg.last, kg.pause_ms);
++	while (done < kg.last && steps[done]()) {
++		++done;
++	}
++	printf("SWEET KGPU: %u of %u steps done; nothing was written\n", done, kg.last);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++kunzite_adreno_init(void)
++{
++	int last = 0, delay_s = 60, pause_ms = 1500, gpu = 0;
++	thread_t thread;
++
++	if (kg.started || !PE_parse_boot_argn("kgpu", &last, sizeof(last)) || last <= 0) {
++		return;
++	}
++	kg.started = true;
++	if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
++		printf("SWEET KGPU: not with gpu=%d (topaz's A610 driver); off\n", gpu);
++		return;
++	}
++	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
++	kg.last = last > 3 ? 3u : (unsigned)last;
++	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
++	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
++	if (last > 3) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..3 exist; running those\n", last);
++	}
++	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
++	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET KGPU: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void kunzite_touch_init(void);
++extern void kunzite_adreno_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -847,6 +848,7 @@ sweet_ufs_init(void)
+ 	 * state by default and starts the CDC-ECM device only with sweetusb=2.
+ 	 */
+ 	sweet_usb_probe();
++	kunzite_adreno_init();  /* kgpu=N: read-only Adreno 710 steps (0971), off by default */
+ 	return 0;
+ }
+ 
