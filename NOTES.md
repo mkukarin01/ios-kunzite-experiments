@@ -165,7 +165,21 @@ temp/ios-m8/usblog/live-boot29-20261023-1731.txt. System as before (driverkitd o
   both in gen7_load_pdc_ucode, step 16; a6xx's enable value is 0x80000001, gen7's not in our tree).
 Meaning: GMU, GBIF, CX misc, RSCC and PDC are all reachable with CX on. NEXT: steps 8-9, the GPU
 SMMU (qsmmu-v500 0x3da0000): ID registers, stream matching, first context (read-only), then the
-TrustZone questions (11-12). Any other sandbox_container_path_* caller gets
+TrustZone questions (11-12).
+
+**GPU STEPS 8-9 = 0974 (2026-10-23, written, NOT built/booted), `kgpu=9`, read-only SMMU.** FDT
+kgsl_smmu: qcom,qsmmu-v500 + adreno-smmu at 0x3da0000 (+0x40000), tcu 0x3de6000, TBUs gfx_0
+0x3de9000 (streams 0x0-0x3ff) / gfx_1 0x3ded000 (0x400-), qcom,skip-init, 3-level tables,
+dma-coherent, **qcom,num-context-banks-override = 6, qcom,num-smr-override = 6** (HLOS gets 6 of
+each; 0974 reads only those), vdd = gpu_cc_cx_gdsc. Streams (iommus, mask 0x400): gfx3d_user 0x0,
+gfx3d_secure 0x2, GMU 0x5 (0x7/0x407 = iommu-debug test cases). Step 8: IDR0/IDR1 layout (page
+size, pages, SMRs, contexts; stop unless 2*pages*page == 0x40000), IDR2/IDR7/sCR0/sGFSR, SMR/S2CR
+0-5 decoded, CBAR/CBA2R 0-5, and which entry takes streams 0/2/5. Step 9: CB0 SCTLR/ACTLR/TTBR0/
+TCR/MAIR0/FSR/FAR (+ the CB stream 0 maps to, if another of the 6). Verified: 216 patches, series
+reproduces the file, syntax clean. **Test:** CI -> #29 image with `kgpu=9`. A reset after a
+step 8 "about to read" = Gunyah traps the SMMU's global page (hk: on redwood the hypervisor
+"answers for" it); after step 9's = the context page. Then step 10 (two words into GMU DTCM and
+back: the first GMU write). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64

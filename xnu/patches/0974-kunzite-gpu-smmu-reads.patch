@@ -1,0 +1,228 @@
+kunzite: Adreno 710 steps 8-9, read-only GPU SMMU (kgpu=8/9; 1-7 unchanged).
+8: qsmmu-v500 0x3da0000 (FDT, qcom,skip-init): layout from IDR0/IDR1 checked against the FDT size,
+IDR2/IDR7/sCR0/sGFSR, then SMR/S2CR and CBAR/CBA2R of the first 6 only (qcom,num-smr-override /
+num-context-banks-override = 6: the rest are not HLOS's), and where streams 0 (GPU), 2 (secure),
+5 (GMU) are matched. 9: context 0 (kgsl's GPU context) and, if different, the HLOS context
+stream 0 goes to: SCTLR, ACTLR, TTBR0, TCR, MAIR0, FSR, FAR. Needs CX + SMMU clocks (steps 4-5,
+still undone at the end).
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -2,9 +2,9 @@
+  * kunzite (POCO M8 5G, SM6475 parrot): the Adreno 710, step by step, after
+  * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
+  * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
+- * 6-7 read again, now inside the powered CX half.
++ * 6-9 read again, now inside the powered CX half.
+  *
+- * Boot-arg kgpu=N (N <= 7) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 9) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -45,6 +45,14 @@
+  *     rpmh-rsc layout: status, sequencer, 4 command slots), the GMU's
+  *     rscc_control_ack, and PDC 0xb270000 enable/seq-start (kgsl
+  *     gen7_load_pdc_ucode writes these later; here they are only read).
++ *  8  reads the GPU SMMU (FDT kgsl_smmu: qcom,qsmmu-v500 at 0x3da0000, 0x40000
++ *     long, qcom,skip-init; arm-smmu.h layout): IDR0/IDR1 give the page size,
++ *     page count, stream match and context counts (checked against the FDT
++ *     size), IDR2/IDR7/sCR0/sGFSR; then SMR/S2CR and CBAR/CBA2R of the first
++ *     6 only (qcom,num-smr-override, qcom,num-context-banks-override: the rest
++ *     are not HLOS's), and where streams 0 (GPU), 2 (secure) and 5 (GMU) go.
++ *  9  reads translation context 0 (and the one stream 0 maps to, if another
++ *     of the 6): SCTLR, ACTLR, TTBR0, TCR, MAIR0, FSR, FAR.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -140,6 +148,28 @@ void kunzite_adreno_init(void);
+ #define GEN7_PDC_GPU_ENABLE_PDC          0x1140
+ #define GEN7_PDC_GPU_SEQ_START_ADDR      0x1148
+ 
++/* GPU SMMU (arm-smmu.h, SMMUv2 / MMU-500) */
++#define KG_SMMU_PA       0x03da0000u
++#define KG_SMMU_SIZE     0x00040000u     /* FDT "base" */
++#define KG_SMMU_HLOS     6u              /* FDT qcom,num-smr-override / qcom,num-context-banks-override */
++#define SMMU_SCR0        0x000u
++#define SMMU_IDR0        0x020u          /* [7:0] stream match registers */
++#define SMMU_IDR1        0x024u          /* bit 31 64K pages, [30:28] log2(pages)-1, [7:0] contexts */
++#define SMMU_IDR2        0x028u
++#define SMMU_IDR7        0x03cu
++#define SMMU_SGFSR       0x048u
++#define SMMU_SMR(n)      (0x800u + 4u * (n))     /* bit 31 valid, [30:16] mask, [14:0] stream */
++#define SMMU_S2CR(n)     (0xc00u + 4u * (n))     /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
++#define SMMU_CBAR(n)     (4u * (n))              /* in the second page (GR1) */
++#define SMMU_CBA2R(n)    (0x800u + 4u * (n))     /* GR1 too */
++#define SMMU_CB_SCTLR    0x00u
++#define SMMU_CB_ACTLR    0x04u
++#define SMMU_CB_TTBR0    0x20u
++#define SMMU_CB_TCR      0x30u
++#define SMMU_CB_MAIR0    0x38u
++#define SMMU_CB_FSR      0x58u
++#define SMMU_CB_FAR      0x60u
++
+ /* cmd-db (cmd-db.c): header 144 bytes, 8 slave headers at +8, entries 24 bytes */
+ #define KG_DB_MAGIC      0x0c0330dbu
+ #define KG_DB_HEADER     144u
+@@ -149,7 +179,9 @@ void kunzite_adreno_init(void);
+ enum kg_undo_kind { KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC };
+ 
+ static struct {
+-	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc;
++	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc, smmu;
++	uint32_t smmu_page, smmu_pages, smmu_cbs, smmu_smrs;
++	int gpu_cb;                     /* the HLOS context stream 0 (GPU) is matched to, or -1 */
+ 	unsigned last, pause_ms, delay_s, hold_s, step;
+ 	bool started, ahb_on;
+ 	struct {
+@@ -689,6 +721,116 @@ kg_step7(void)
+ 	return true;
+ }
+ 
++/* ---- step 8: the GPU SMMU's global registers and streams ---- */
++
++/* the register space's layout from IDR0/IDR1; false if it is not what the FDT says */
++static bool
++kg_smmu_layout(unsigned step)
++{
++	uint32_t idr0 = kg_rd(kg.smmu, SMMU_IDR0), idr1 = kg_rd(kg.smmu, SMMU_IDR1);
++
++	kg.smmu_page = (idr1 >> 31) ? 0x10000u : 0x1000u;
++	kg.smmu_pages = 2u << ((idr1 >> 28) & 7u);
++	kg.smmu_cbs = idr1 & 0xffu;
++	kg.smmu_smrs = idr0 & 0xffu;
++	printf("SWEET KGPU: %u smmu idr0 %#x idr1 %#x: %u stream match registers, %u contexts, %u pages of %#x\n", step,
++	    idr0, idr1, kg.smmu_smrs, kg.smmu_cbs, kg.smmu_pages, kg.smmu_page);
++	if (2u * kg.smmu_pages * kg.smmu_page != KG_SMMU_SIZE) {
++		printf("SWEET KGPU: %u that makes %#x of registers, the FDT says %#x: not reading further\n", step,
++		    2u * kg.smmu_pages * kg.smmu_page, KG_SMMU_SIZE);
++		return false;
++	}
++	return true;
++}
++
++/* which of the HLOS stream match entries takes `stream`, or -1 */
++static int
++kg_smmu_match(uint32_t stream)
++{
++	for (uint32_t i = 0; i < kg.smmu_smrs && i < KG_SMMU_HLOS; i++) {
++		uint32_t smr = kg_rd(kg.smmu, SMMU_SMR(i));
++		uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++		if ((smr >> 31) && ((stream ^ id) & ~mask & 0x7fffu) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static bool
++kg_step8(void)
++{
++	if (!kg_cx_ready(8)) {
++		return false;
++	}
++	kg_announce(8, "GPU SMMU 0x3da0000: ID registers, sCR0, sGFSR (global registers)");
++	kg.smmu = kg_map("SMMU", KG_SMMU_PA, KG_SMMU_SIZE);
++	if (kg.smmu == 0 || !kg_smmu_layout(8)) {
++		return false;
++	}
++	printf("SWEET KGPU: 8 smmu idr2 %#x idr7 %#x scr0 %#x sgfsr %#x\n", kg_rd(kg.smmu, SMMU_IDR2),
++	    kg_rd(kg.smmu, SMMU_IDR7), kg_rd(kg.smmu, SMMU_SCR0), kg_rd(kg.smmu, SMMU_SGFSR));
++
++	kg_announce(8, "the SMMU's first 6 stream match entries and contexts' kinds (the HLOS ones)");
++	for (uint32_t i = 0; i < kg.smmu_smrs && i < KG_SMMU_HLOS; i++) {
++		uint32_t smr = kg_rd(kg.smmu, SMMU_SMR(i)), s2cr = kg_rd(kg.smmu, SMMU_S2CR(i));
++		printf("SWEET KGPU: 8 smr%u %#x (%s, stream %#x mask %#x) s2cr %#x (%s, context %u)\n", i, smr,
++		    (smr >> 31) ? "valid" : "unused", smr & 0x7fffu, (smr >> 16) & 0x7fffu, s2cr,
++		    ((s2cr >> 16) & 3u) == 0 ? "translate" : ((s2cr >> 16) & 3u) == 1 ? "bypass" : "fault", s2cr & 0xffu);
++	}
++	for (uint32_t i = 0; i < kg.smmu_cbs && i < KG_SMMU_HLOS; i++) {
++		printf("SWEET KGPU: 8 cbar%u %#x cba2r %#x\n", i, kg_rd(kg.smmu, kg.smmu_page + SMMU_CBAR(i)),
++		    kg_rd(kg.smmu, kg.smmu_page + SMMU_CBA2R(i)));
++	}
++	static const struct { uint32_t stream; const char *name; } users[] = {
++		{ 0x0, "GPU (gfx3d_user)" }, { 0x2, "secure (gfx3d_secure)" }, { 0x5, "GMU" },
++	};
++	kg.gpu_cb = -1;
++	for (unsigned u = 0; u < sizeof(users) / sizeof(users[0]); u++) {
++		int m = kg_smmu_match(users[u].stream);
++		if (m < 0) {
++			printf("SWEET KGPU: 8 stream %#x %s: no HLOS match entry (unmatched streams follow sCR0)\n",
++			    users[u].stream, users[u].name);
++			continue;
++		}
++		uint32_t s2cr = kg_rd(kg.smmu, SMMU_S2CR((uint32_t)m));
++		printf("SWEET KGPU: 8 stream %#x %s: entry %d, s2cr %#x\n", users[u].stream, users[u].name, m, s2cr);
++		if (users[u].stream == 0 && ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) < KG_SMMU_HLOS) {
++			kg.gpu_cb = (int)(s2cr & 0xffu);
++		}
++	}
++	return true;
++}
++
++/* ---- step 9: a translation context ---- */
++
++static void
++kg_smmu_cb(uint32_t cb)
++{
++	uint32_t at = (kg.smmu_pages + cb) * kg.smmu_page;
++	printf("SWEET KGPU: 9 cb%u sctlr %#x actlr %#x ttbr0 %#x:%08x tcr %#x mair0 %#x fsr %#x far %#x:%08x\n", cb,
++	    kg_rd(kg.smmu, at + SMMU_CB_SCTLR), kg_rd(kg.smmu, at + SMMU_CB_ACTLR),
++	    kg_rd(kg.smmu, at + SMMU_CB_TTBR0 + 4), kg_rd(kg.smmu, at + SMMU_CB_TTBR0), kg_rd(kg.smmu, at + SMMU_CB_TCR),
++	    kg_rd(kg.smmu, at + SMMU_CB_MAIR0), kg_rd(kg.smmu, at + SMMU_CB_FSR),
++	    kg_rd(kg.smmu, at + SMMU_CB_FAR + 4), kg_rd(kg.smmu, at + SMMU_CB_FAR));
++}
++
++static bool
++kg_step9(void)
++{
++	if (!kg_cx_ready(9) || kg.smmu == 0 || kg.smmu_pages == 0) {
++		printf("SWEET KGPU: 9 needs step 8\n");
++		return false;
++	}
++	kg_announce(9, "SMMU translation context 0 (the GPU's in kgsl and Linux)");
++	kg_smmu_cb(0);
++	if (kg.gpu_cb > 0) {
++		kg_announce(9, "the context stream 0 is matched to");
++		kg_smmu_cb((uint32_t)kg.gpu_cb);
++	}
++	return true;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -741,14 +883,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-7 read", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -783,12 +925,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 7 ? 7u : (unsigned)last;
++	kg.last = last > 9 ? 9u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 7) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..7 exist; running those\n", last);
++	if (last > 9) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..9 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
