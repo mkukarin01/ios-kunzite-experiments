@@ -357,6 +357,22 @@ kunzite/gmu_gen70000.bin&m=644&mk=1'` (vendor firmware, phone only). **Done 2026
 bytes, 0644 root, read back with /get = identical (sha256 b2d3f0e2...). **Test:** #34 image with
 `kgpu=14`. Success line: "THE GMU FIRMWARE IS LOADED (the CM3 stays in reset)".
 
+**BOOT #35 (2026-10-23 20:45, shim/out/shim-boot-35.img = #34 with `kgpu=14`, kernel CI 39970119367
+@ 7f9dab0 sha256 8e25dc4a...): STEP 14 PASSES, "THE GMU FIRMWARE IS LOADED", UNDO CLEAN, NO PANIC.**
+Log: temp/ios-m8/usblog/live-boot35-20261023-2045.txt. Step 13 with the pool: "8 tables in 2 pages,
+root 0xa2444c000", test page at GMU 0x7ffff000, "THE SMMU TAKES OUR TABLES" again. Step 14: CM3
+in reset (sysreset 0x1, fw_init_result 0); 6 blocks mapped through context 1 (0x4000 14 pages,
+0x100000 9, 0x200000 19, 0x300000 7, 0x60000000 1, 0x60001000 1); TLBIASID+sync; ITCM 119 words via
+register 0x1b400, **0 of 119 differ on readback**; code 0xdcac bytes copied to GMU 0x4000 (first
+word 0xbd1fb51f); DTCM 10 words via 0x1d3e6 and 6 via 0x1d3f7, **0 differ**; versions core
+0x40000007, core_dev 0xffffffff, pwr 0x40000007, pwr_dev 0, hfi 0x20010000 (exactly the Python
+prediction). 17 undo entries all ran: six "gmu firmware memory" frees, smr1 0, s2cr1 0x20000, cb1
+sctlr 0, test page and both table pages freed, then the 5 of steps 4-5; "run over". System as
+before (driverkitd only). **Steps 1-14 proven.** NEXT: step 15, start the GMU (kgsl
+gen7_gmu_first_boot order after load_fw: version_info, itcm_shadow, [scm cx regs], register_config,
+irq enable, bus vote, device_start = CM3_SYSRESET 0 + poll FW_INIT_RESULT bit 8; GBIF_HALT 0
+first): needs a read of gen7_gmu_register_config / gen7_gmu_device_start's preconditions.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
