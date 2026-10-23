@@ -1,0 +1,115 @@
+kunzite: fix the boot #33 panic in step 13's undo (kgpu=13).
+The undo restored CB1 register by register and wrote CBAR1 := 0, its power-up value: type 0 is a
+stage-2 context, which this stage-1-only SMMU (IDR0 S1TS, no S2TS) refuses with a synchronous
+external abort ("Kernel data abort" at kg_undo_pop's store, far = SMMU +0x1004). Now the undo
+releases the context as Linux's arm-smmu does (arm_smmu_write_context_bank: SCTLR = 0 only):
+stream 5 unrouted (SMR 0, S2CR fault), CB1 off (SCTLR 0, not the junk leftover); CBAR, CBA2R,
+TCR, TCR2, TTBR0/1, MAIR0/1 are written as before but kept (kg_set: logged "(kept)", not on the
+undo list). The tables now come from kmem_alloc(KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD), the
+pair topaz_sandbox_container.c allocates and kmem_frees on every op 4, instead of hk's
+KMA_KOBJECT | KMA_DATA, whose kmem_free never ran here.
+
+The "in use" guard no longer looks at CBAR1 (the undo now keeps it, and CX's GDSC has
+qcom,retain-regs, so it can survive into the next boot): free = SMR1 not valid, CB1 SCTLR.M
+clear, stream 5 unmatched.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -69,8 +69,10 @@
+  *  13 routes stream 5 (the GMU) through HLOS SMR/S2CR entry 1 and context 1
+  *     with page tables of ours (3 levels, 4K, 39-bit; one test page at the
+  *     GMU's 0x60000000): arm-smmu context programming as hk did on redwood;
+- *     checks the readbacks, fault status and a TLB sync. All undone at the end
+- *     (stream unrouted, context restored, tables freed last).
++ *     checks the readbacks, fault status and a TLB sync. Undone at the end as
++ *     Linux releases a context: stream 5 unrouted (SMR 0, S2CR fault), CB1
++ *     off (SCTLR 0), its configuration left (CBAR := 0 aborts, boot #33);
++ *     the tables are freed last.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -316,6 +318,14 @@ kg_put(const char *block, vm_offset_t base, uint32_t off, uint32_t val, enum kg_
+ 	kg_wr(base, off, val);
+ }
+ 
++/* a write that is said like kg_put's but never undone (configuration the undo must leave alone) */
++static void
++kg_set(const char *block, vm_offset_t base, uint32_t off, uint32_t val, const char *name)
++{
++	printf("SWEET KGPU: %u write %s %s +%#x: %#x -> %#x (kept)\n", kg.step, block, name, off, kg_rd(base, off), val);
++	kg_wr(base, off, val);
++}
++
+ /* an undo entry without a register write (memory of ours to free at the end) */
+ static void
+ kg_undo_push(enum kg_undo_kind kind, vm_offset_t base, uint32_t off, uint32_t value, const char *name)
+@@ -1162,15 +1172,18 @@ kg_step13(void)
+ 	uint32_t cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page, gr1 = kg.smmu_page;
+ 	kg_announce(13, "SMR/S2CR entry 1 and context 1 before using them");
+ 	uint32_t smr = kg_rd(kg.smmu, SMMU_SMR(KG_GMU_MATCH)), cbar = kg_rd(kg.smmu, gr1 + SMMU_CBAR(KG_GMU_CB));
++	uint32_t sctlr = kg_rd(kg.smmu, cb + SMMU_CB_SCTLR);
+ 	int taken = kg_smmu_match(KG_GMU_STREAM);
+-	printf("SWEET KGPU: 13 smr1 %#x cbar1 %#x cb1 sctlr %#x; stream 5 matched by entry %d\n", smr, cbar,
+-	    kg_rd(kg.smmu, cb + SMMU_CB_SCTLR), taken);
+-	if ((smr & SMMU_SMR_VALID) || cbar != 0 || taken >= 0) {
++	printf("SWEET KGPU: 13 smr1 %#x cbar1 %#x%s cb1 sctlr %#x; stream 5 matched by entry %d\n", smr, cbar,
++	    cbar == SMMU_CBAR_S1 ? " (an earlier run's, kept)" : "", sctlr, taken);
++	/* free = not routed and not on; CBAR says nothing (the undo keeps it, as Linux does) */
++	if ((smr & SMMU_SMR_VALID) || (sctlr & 1u) || taken >= 0) {
+ 		printf("SWEET KGPU: 13 entry 1 / context 1 / stream 5 are in use: not ours to take\n");
+ 		return false;
+ 	}
+ 
+-	if (kmem_alloc(kernel_map, &mem, size, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/* the flags topaz_sandbox_container.c allocates (and kmem_frees) with on every op 4 */
++	if (kmem_alloc(kernel_map, &mem, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+ 		printf("SWEET KGPU: 13 no memory for the tables\n");
+ 		return false;
+ 	}
+@@ -1194,18 +1207,24 @@ kg_step13(void)
+ 	    phys, gmu_va_l1, l1[gmu_va_l1], l2[(KG_GMU_TEST_VA >> 21) & 0x1ffu], l3[(KG_GMU_TEST_VA >> 12) & 0x1ffu],
+ 	    KG_GMU_TEST_VA, phys + 0x3000);
+ 
++	/*
++	 * The context's configuration is kept when the run ends, as Linux's arm-smmu does
++	 * (arm_smmu_write_context_bank: an unassigned context gets SCTLR = 0 only):
++	 * CBAR := 0 is a stage-2 type, which this stage-1-only SMMU refuses with an
++	 * external abort (boot #33). The undo unroutes stream 5 and switches CB1 off.
++	 */
+ 	kg_next(13, "context 1 gets our tables (the first SMMU writes)");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, 0, KG_UNDO_WORD, 0, "cb1 sctlr");
+-	kg_put("SMMU", kg.smmu, gr1 + SMMU_CBA2R(KG_GMU_CB), SMMU_CBA2R_VA64, KG_UNDO_WORD, 0, "cba2r1");
+-	kg_put("SMMU", kg.smmu, gr1 + SMMU_CBAR(KG_GMU_CB), SMMU_CBAR_S1, KG_UNDO_WORD, 0, "cbar1");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TCR2, SMMU_TCR2_VAL, KG_UNDO_WORD, 0, "cb1 tcr2");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TCR, SMMU_TCR_39BIT, KG_UNDO_WORD, 0, "cb1 tcr");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR0, (uint32_t)root, KG_UNDO_WORD, 0, "cb1 ttbr0 lo");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32), KG_UNDO_WORD, 0, "cb1 ttbr0 hi");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR1, 0, KG_UNDO_WORD, 0, "cb1 ttbr1 lo");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR1 + 4, 0, KG_UNDO_WORD, 0, "cb1 ttbr1 hi");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_MAIR0, SMMU_MAIR0_VAL, KG_UNDO_WORD, 0, "cb1 mair0");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_MAIR1, 0, KG_UNDO_WORD, 0, "cb1 mair1");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, 0, "cb1 sctlr");
++	kg_set("SMMU", kg.smmu, gr1 + SMMU_CBA2R(KG_GMU_CB), SMMU_CBA2R_VA64, "cba2r1");
++	kg_set("SMMU", kg.smmu, gr1 + SMMU_CBAR(KG_GMU_CB), SMMU_CBAR_S1, "cbar1");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TCR2, SMMU_TCR2_VAL, "cb1 tcr2");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TCR, SMMU_TCR_39BIT, "cb1 tcr");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR0, (uint32_t)root, "cb1 ttbr0 lo");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32), "cb1 ttbr0 hi");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR1, 0, "cb1 ttbr1 lo");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR1 + 4, 0, "cb1 ttbr1 hi");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_MAIR0, SMMU_MAIR0_VAL, "cb1 mair0");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_MAIR1, 0, "cb1 mair1");
+ 
+ 	kg_next(13, "context 1: clear its fault status, forget ASID 1, TLB sync");
+ 	printf("SWEET KGPU: 13 command fsr <- %#x, tlbiasid <- %u, tlbsync <- 1\n", SMMU_FSR_ALL, KG_GMU_CB);
+@@ -1220,7 +1239,8 @@ kg_step13(void)
+ 	}
+ 
+ 	kg_next(13, "context 1 on, then stream 5 -> entry 1 -> context 1");
+-	kg_put("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON, KG_UNDO_WORD, 0, "cb1 sctlr");
++	kg_undo_push(KG_UNDO_WORD, kg.smmu, cb + SMMU_CB_SCTLR, 0, "cb1 sctlr (off)");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON, "cb1 sctlr");
+ 	kg_put("SMMU", kg.smmu, SMMU_S2CR(KG_GMU_MATCH), KG_GMU_CB, KG_UNDO_WORD, 0, "s2cr1");
+ 	kg_put("SMMU", kg.smmu, SMMU_SMR(KG_GMU_MATCH), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | KG_GMU_STREAM,
+ 	    KG_UNDO_WORD, 0, "smr1");

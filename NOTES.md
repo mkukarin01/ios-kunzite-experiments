@@ -311,6 +311,17 @@ only SMR (0), S2CR (fault), SCTLR (0, not the junk leftover); log but never rest
 TCR/TCR2/TTBR/MAIR; allocate the tables with KMA_DATA|KMA_ZERO (the pair topaz_sandbox_container.c
 already allocates and kmem_frees on every op 4) instead of hk's KMA_KOBJECT|KMA_DATA, whose
 kmem_free has never run here.
+**FIX = 0978 (2026-10-23, written, NOT built/booted):** step 13's undo now releases CB1 the Linux
+way: undo entries only for SMR1 (back to 0), S2CR1 (back to fault 0x20000) and SCTLR (0, pushed
+before enabling, so it pops after S2CR/SMR); CBA2R/CBAR/TCR2/TCR/TTBR0/1/MAIR0/1 are written with
+new kg_set() ("... (kept)" in the log) and never restored. Tables: kmem_alloc(KMA_DATA|KMA_ZERO,
+VM_KERN_MEMORY_BSD). The "in use" guard no longer reads CBAR1: CX's GDSC has qcom,retain-regs, so
+CB1's CBAR = 0x1f300 (#33's rejected store never cleared it) may still be there next boot; free =
+SMR1 invalid + CB1 SCTLR.M clear + stream 5 unmatched. Expected #34 log: "N writes to undo" = 9
+(5 of steps 4-5 + KFREE, SCTLR, S2CR, SMR), undo lines smr1, s2cr1, cb1 sctlr (off), "freed 0x4000
+bytes", then the usual 5, "run over". Verified: 220 patches, series reproduces the file, syntax
+clean, no CBAR/CBA2R/CB undo left. **Test:** reboot the phone (it is on the #33 panic screen) to
+fastboot, CI -> #33 image again with this kernel, `kgpu=13`.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
