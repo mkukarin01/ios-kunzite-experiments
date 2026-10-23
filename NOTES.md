@@ -1,6 +1,34 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> HANDOFF (2026-10-23) - branch kunzite-topaz-gpu - READ FIRST <<<
+## >>> HANDOFF (2026-10-24) - branch kunzite-topaz-gpu - READ FIRST <<<
+
+**State (observed, boot #45):** the GPU probe `kgpu=N` (bsd/dev/kunzite_adreno.c, fork patches
+0971-0989, series of 231 patches) runs all 22 steps of the port map (ios/gpu-plan.md in the main
+repo; kgpu numbers run one ahead of the map from 18) and undoes everything: CX power/clocks,
+GMU firmware load and start through our SMMU context 1, RSC/PDC, HFI (tables, core fw start),
+GX on through OOB_GPU, the GPU's context 0, ring and SQE microcode, zap shader through TrustZone,
+gen7_start, CP start, out of secure mode, a word written, then three 2D fills drawn by the GPU
+and copied to the panel (0xb8000000) for 15 s; undo = slumber + reset + frees, no panic. Last
+booted kernel: CI 40020375539 @ c8685b2 (sha256 530f7bdc...), image shim/out/shim-boot-45.img
+(standard cmdline + `sweetusb=2 kgpu=22`). Boot entries #25-#45 below, newest last.
+
+**Phone-only vendor firmware** (not in git; uploaded with the agent's /put, each read back):
+/usr/share/firmware/kunzite/a710_zap.mdt, a710_zap.b01, gmu_gen70000.bin, a710_sqe.fw (sources
+in the main repo's temp/kunzite-vendor/proprietary/vendor/firmware/).
+
+**Procedure per boot:** CI artifact unzipped to xnu/out/xnu-kernel (check SHA256SUMS and the
+run's head sha); `tools/mkpayload.py <kernel> shim/out/kunzite.adt shim/out/payload-NN.bin
+--cmdline "<standard> sweetusb=2 kgpu=N"`; `shim/build-mac.sh out/payload-NN.bin`; copy
+shim-boot.img to shim-boot-NN.img; `fastboot boot`; then `tools/udp-log.py <file>` once the
+agent at 192.168.7.2:8022 answers. **Stop the previous listener first** (boot #42: a leftover one
+held the UDP port; the log replays from the kernel's first line on reconnect).
+
+**Next:** the plan's "After K1/K2" - wire the GPU path into the display/eagl glue (chip id
+0x07010000, GMEM 512K); Mesa main now has an FD710 entry (a7xx_base + a7xx_gen1, num_ccu 1,
+a710_raw_magic_regs; copy in temp/gpu-plan-review/regdb-2026-10-24/freedreno_devices.py).
+Unverified: whether 2D/3D work beyond solid fills needs Mesa's a710 magic registers.
+
+## Earlier handoff (2026-10-23, superseded by the one above)
 
 **State:** `kunzite-topaz-gpu` = kunzite 39b53a5 + upstream topaz e477291 (the HackiOS batch),
 merge 6cdf249, our patches 0960-0969, build fix 54b61da. **CI run 39923346510 (54b61da)
@@ -753,6 +781,21 @@ rows, still inside the splash region 0xb8000000 + 0x2b00000; mapped, never writt
 ml_io_map_unmappable and ml_io_unmap alike. Nothing else changes. Verified: 231 patches, series
 reproduces the file, syntax clean. **Test:** #44 image with this kernel and `kgpu=22`: expected
 the picture for 15 s, then the undo (picture freed, CP halted, slumber, CX down) and "run over".
+
+**BOOT #45 (2026-10-24 01:40, shim/out/shim-boot-45.img = #44's with the 0989 kernel, CI 40020375539
+@ c8685b2 sha256 530f7bdc...): KGPU 1-22 ALL PASS AND THE UNDO RUNS CLEAN - THE PORT MAP IS DONE.**
+Log: temp/ios-m8/usblog/live-boot45-20261024-0140.txt. Disassembly of the CI kernel checked
+first: ml_io_map_unmappable and ml_io_unmap both get 0x9e4000. Step 22 as #44 (picture
+0xe0200000 -> 0xa2adc4000, 14 of 16 tables; 2D stream consumed in 0.9 ms, idle, CB0 FSR 0x400;
+marker 0x6b677022; orange/white/blue pixels; **0 of 144 samples wrong**; "A PICTURE DRAWN BY THE
+GPU IS ON THE PANEL ... (held 15 s)"), then "22 of 22 steps done; 53 writes to undo", held 5 s
+(GX GDSC 0xf8222800, on), and **all 53 undo entries**: picture freed, CP halted, stream 0
+unrouted, CB0 off, GPU blocks freed, oob_gpu clear, slumber (PREPARE_SLUMBER acked, GX off,
+RPMH_POWER_STATE 0xf, RSC sleep done), CM3s into reset with GBIF halt acked, HFI alias unmapped,
+RSC/PDC words back, GMU memory and tables freed, stream 5 unrouted, CB1 off, clocks, CX GDSC
+0x22f001, GX GDSC 0x222801; "run over"; no panic, agent up. **K1 and K2 of the port map are
+proven on kunzite: from a powered-off GPU, under Gunyah, to a picture drawn by the Adreno 710
+on the panel and everything taken back down.**
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
