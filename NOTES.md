@@ -243,7 +243,27 @@ patches, series reproduces the file, syntax clean. **Before the test, once:** `c
 temp/kunzite-vendor/proprietary/vendor/firmware/a710_zap.mdt
 'http://192.168.7.2:8022/put?p=/usr/share/firmware/kunzite/a710_zap.mdt&m=644&mk=1'` (vendor
 firmware: on the phone only, never in git). **Done 2026-10-23 during boot #31**: 4044 bytes, 0644
-root, read back with /get = identical (sha256 5e2e0c88...); it stays on the root FS. **Test:** #31 image with `kgpu=12`. A reset right
+root, read back with /get = identical (sha256 5e2e0c88...); it stays on the root FS.
+
+**BOOT #32 (2026-10-23 18:33, shim/out/shim-boot-32.img = #31 with `kgpu=12`, kernel CI 39960767848
+@ 39c4977 sha256 158e7a70...): TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL.**
+Log: temp/ios-m8/usblog/live-boot32-20261023-1833.txt. Steps 1-10 as before (step 10 passed again).
+- 11: smc 0x42000601 is_call_available(0x2000601) -> ret 0 res 1: **TZ answers this kernel the
+  way it answers Linux** (through Gunyah, SiP SMC64 yielding). PAS init image / mem setup / auth
+  and reset / shutdown / is_supported: all AVAILABLE (res 1). pas_is_supported(1, 4, 9, 13) ->
+  ret 0 res 0 for ALL, even ADSP and modem which the boot chain starts: on this firmware that
+  question tells nothing (as hk's fallback case), not "13 is unsupported".
+- 12: /usr/share/firmware/kunzite/a710_zap.mdt read (3 phdrs, hash 3896, 4044 bytes), written
+  to 0xdff00000 (no fault: that low-DDR page is ours to write), **smc 0x42000201
+  PAS_INIT_IMAGE(13, 0xdff00000) -> ret 0 res 0: the signature check passes.** TZ now holds a
+  pending PAS 13 image until reboot (nothing loaded/started).
+Then the usual 5-write undo; system as before (driverkitd only, no panic).
+Cosmetic for the next patch: step 11's groups say "about to read nothing; next: ..." (kg_announce
+used where kg_next was meant).
+**Open question 2 ANSWERED: TZ takes PAS calls for the GPU from our kernel.** NEXT: step 13, the
+first SMMU writes: GMU memory through the SMMU (stream 5 -> an HLOS SMR/S2CR/context, our page
+tables, 3-level 4K, 39-bit, as hk/io-pgtable-arm), then 14 (GMU firmware gmu_gen70000.bin into
+ITCM/DTCM + its blocks), 15 (GMU out of reset, GBIF halt cleared first). **Test:** #31 image with `kgpu=12`. A reset right
 after an "smc" line = Gunyah/TZ does not take that call from us.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
