@@ -436,6 +436,28 @@ is the first write outside the GPU block and GCC; a stage-2 refusal would be an 
 (the line before names it). Undo peaks at 39 (KG_UNDO_MAX now 64). Verified: 223 patches, series
 reproduces the file, syntax clean. **Test:** #36 image with `kgpu=16`.
 
+**BOOT #37 (2026-10-23 21:29, shim/out/shim-boot-37.img = #36 with `kgpu=16`, kernel CI 39986193233
+@ fdd113d sha256 b6b32353...): STEP 16 RUNS KGSL'S SEQUENCE WITHOUT A FAULT, BUT ITS CHECK IS TOO
+STRICT; NO PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot37-20261023-2129.txt. Steps 1-15
+as #36 (FW_INIT_RESULT 0x100, 15 log words, now counted over the whole 16384-word log). Step 16
+before: GMU running (sysreset 0), HFI_CTRL_STATUS 1, rscc seq_busy 0, PDC enable 0x101 seq_start 0.
+**RSCC: 14 of 17 words take kgsl's values** (status0 0 -> 1<<24, the 5 sequencer words 0 ->
+eaaae5a0.., cmd2 data 0 -> 0x80000000; slave_id 1, PDC_SEQ_START_ADDR 0x4520, MATCH 0x4510/0x4514
+were already kgsl's values at boot). **The 3 hidden TCS command ADDR words ignore the zeroes**:
+they read 0x82204514 / 0x82204510 / 0x82204520 before and after (cmd0/1/2: the PDC registers
++0x4514 MATCH_HI, +0x4510 MATCH_LO, +0x4520 SEQ_START that the other RSCC words name) - hardwired
+or locked, so kgsl's zero writes do nothing there either. That alone failed the step ("the RSCC
+does not keep kgsl's words"). **PDC: Gunyah allows HLOS writes to the GPU PDC** (0xb270000, the
+first write outside the GPU block and GCC): enable 0x101 -> 0x80000001 read back, seq_start 0.
+HFI: HFI_CTRL_INIT 1, HFI_CTRL_STATUS 1 -> 1 (was set before, as #36 found), no interrupt
+(GMU2HOST_INTR_INFO 0), log 15 -> 15 words, all queues r/w 0/0, CB1 FSR 0x400 (no fault), rscc
+seq_busy 0, control_ack 0. So HFI_CTRL_INIT shows no sign of its own; the proof that HFI works is
+step 17's first message and its reply in the message queue. Undo: 39 entries; pdc enable back to
+0x101, rscc words back (the 3 ADDR words never changed), then step 15's CM3 reset + GBIF halt
+ack, frees, stream 5 unrouted, CX down; "run over". System as #36 (agent up). NEXT: step 17
+(gen7_hfi_start's messages), with step 16's check fixed: a word that still reads its old value
+after the write is "write ignored", printed but not a failure.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
