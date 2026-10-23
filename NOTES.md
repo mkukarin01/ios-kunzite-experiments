@@ -18,6 +18,24 @@ embedded payload equals payload-25-gpu.bin. The old shim-boot-25.img (kernel d5f
 booted) is kept. Boot: `fastboot boot shim/out/shim-boot-25-gpu.img` from the BOOTLOADER
 fastboot, then `tools/kunzite-usbnet-mac.sh` + `tools/udp-log.py FILE` (0969 replay is in this kernel).
 
+**BOOT #25 (2026-10-23 14:37, shim-boot-25-gpu.img): BOOTS, works like #24, one NEW crash loop.**
+Log: temp/ios-m8/usblog/live-boot25-20261023-143802.txt (full replay from kernel start). Seen:
+`SWEET FB: modes published: 1125x2436 at 60 Hz` (0948), `SWEET BATTERY: static fallback` (0148
+dormant), CPUFREQ read-only, GT9916K touch (25 touch events), keys, display off ignored under
+stayon, Spotlight + Settings (Preferences) opened, agent up (pid 89), ue0 rx/tx fine. No panic.
+**New: syncdefaultsd (com.apple.kvsd) aborts on every launch** (12x in the log, 14 .ips on the
+phone; none in #24, where it ran once). Copies: temp/ios-m8/phone-facts/crash-boot25/ (2 .ips +
+the binary). Cause, confirmed by disassembly (syncdefaultsd 0x10001cf0c-0x10001cf44): it calls
+sandbox_container_path_for_audit_token(token, buf, 0x400) on an UNINITIALISED stack buffer and
+only skips the client if the call fails or buf[0]==0. Otherwise it does
++[NSURL fileURLWithPath:isDirectory:YES] -> NSInvalidArgumentException -> abort. Upstream 0936
+(topaz_sandbox_container.c, sandbox op 4) returns 0 WITHOUT writing the buffer when the process
+has no CFFIXED_USER_HOME (most daemons): the not-found fall-through (`error` is still 0 from
+copyin) and the early `return 0` exits. Before the merge op 4 was always ENOENT (0149 weak
+default) -> clean skip. Fix: op 4 must return ENOENT on every no-answer path (a kunzite patch
+after 0969; probably an upstream topaz bug too). Any other sandbox_container_path_* caller gets
+the same garbage "success", so the fix covers more than syncdefaultsd.
+
 **What to expect (read from the merged code, not seen on the phone yet):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
