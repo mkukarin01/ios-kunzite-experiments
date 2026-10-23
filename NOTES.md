@@ -479,6 +479,29 @@ RSC/PDC words go back). Success line: "THE GMU ANSWERS OVER HFI: tables taken, c
 started". Verified: 224 patches, series reproduces the file, syntax clean. **Test:** #37 image with
 `kgpu=17`.
 
+**BOOT #38 (2026-10-23 23:12, shim/out/shim-boot-38.img = #37 with `kgpu=17`, kernel CI 39989602096
+@ 32bd9ec sha256 bf6e0252...): STEP 17 PASSES, "THE GMU ANSWERS OVER HFI: tables taken, core
+firmware started"; NO PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot38-20261023-2312.txt.
+Step 16 with the relaxed check: "14 of 17 words take kgsl's values, 3 ignore the write, 0 read back
+different", PDC 0x101 -> 0x80000001, "HFI IS UP" (bit 0 already set). Step 17: ARC counts gfx 10 /
+cx 14 / mx 15; **perf table exactly as predicted** (gx1 0x380201/295000 .. gx9 0x1a00d09/940000,
+gmu 0x400302/200000 0x800403/500000). cmd-db BCMs: SH0 addr 0x50004 unit 4200000 width 64 vcd 1;
+MC0 0x50000 unit 3200000 width 16 vcd 0; ACV 0x5004c unit 1 width 0 vcd 11; CN0 0x50030 unit
+140000 width 4 vcd 5 (all vcds differ: ddr wait mask 0x7, every command commits). DDR votes
+(SH0/MC0/ACV): ddr0 all 0x40000000 (commit, invalid); ddr1 0x600002e8 0x600003d0 0x60000008 ...
+ddr8 0x60001eff 0x600028af 0x60000008 (rechecked by hand); cnoc 0x40000000 / 0x60000001. HFI
+memory 0xa24fc4000 through the uncached alias; GMU2HOST_INTR_MASK 0. **All six commands acked
+with result 0 within 0.1 ms**: perf table (hdr 0x103b04, ack 0x10304), bw table (0x20a003, 160
+words), IFPC/ACD/BCL off (0x30040b/0x40040b/0x50040b), core fw start (0x60020e, ack 0x51030e);
+GMU2HOST_INTR_INFO bit 0 each time, command queue r = w after each, message queue +4 words per
+ack (acks are 3 words, padded). No F2H error, no debug queue entry, no NMI, CB1 FSR 0x400, rscc
+seq_busy 0, rpmh_power_state 0, gfx_pwr_clk_status 0x3; **GMU log 15 -> 94 words**. Undo: 40
+entries; the new CM3 entry first (gbif halt ack in, sysreset 1), then PDC/RSCC back, step 15's
+CM3 entry again, frees, stream 5 unrouted, CX down; "run over". System as #37 (agent up).
+**Steps 1-17 proven: the GMU runs our tables and talks HFI.** NEXT: the GX power request (kgsl
+after hfi_start: default votes, then gen7_gmu_oob_set(OOB_GPU) - the GMU turns GX on), then step
+18 (3D core SMMU context, ring, SQE microcode).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
