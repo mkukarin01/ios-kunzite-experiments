@@ -747,6 +747,13 @@ does not). Step 17's HFI alias (0x4000) was already page sized. **FIX (0989, to 
 unmap the panel alias with the size rounded to PAGE_SIZE. Nothing of the GPU's undo ran this boot;
 the reboot reset it all.
 
+**FIX 0989 (2026-10-24, written, NOT built/booted), still `kgpu=22`.** The panel alias has one
+size, KG_PANEL_MAP = 0x9e3400 rounded up to PAGE_SIZE = 0x9e4000 (3K past the framebuffer's
+rows, still inside the splash region 0xb8000000 + 0x2b00000; mapped, never written), for
+ml_io_map_unmappable and ml_io_unmap alike. Nothing else changes. Verified: 231 patches, series
+reproduces the file, syntax clean. **Test:** #44 image with this kernel and `kgpu=22`: expected
+the picture for 15 s, then the undo (picture freed, CP halted, slumber, CX down) and "run over".
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still

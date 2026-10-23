@@ -1,0 +1,39 @@
+kunzite: Adreno 710 step 22 fix: the panel alias mapped and unmapped in whole pages (kgpu=22).
+Boot #44: the GPU's picture was on the panel, then "pmap_remove_options() pmap ... end
+0x...f33400 @pmap.c:4296": ml_io_unmap(panel, 4320 * 2400 = 0x9e3400) passes the raw size to
+pmap_remove, which panics on an end that is not page aligned (ml_io_map_unmappable rounded the
+mapping up, and kmem_free rounds too; pmap_remove does not). The alias now has one size,
+KG_PANEL_MAP = 0x9e3400 rounded up to PAGE_SIZE (0x9e4000: 3K more, still inside the splash
+region 0xb8000000 + 0x2b00000, mapped but never written), for the map and the unmap alike.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 99e76b4..3b7b812 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -3235,6 +3235,8 @@ kg_step21(void)
+ #define KG_GPU_PIC_VA    (KG_GPU_VA + 0x200000u)
+ #define KG_PANEL_PA      0xb8000000u     /* the ABL splash framebuffer AppleCLCD presents into */
+ #define KG_PANEL_ROW     4320u
++/* the alias's size: whole pages, for the map and the unmap alike (pmap_remove panics on a ragged end, boot #44) */
++#define KG_PANEL_MAP     (((vm_size_t)KG_PANEL_ROW * KG_PIC_H + PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1))
+ #define KG_SHOW_S        15u             /* the picture copied to the panel again every 250 ms for this long */
+ #define KG_A2D_SOLID_8888 (1u << 7 | 0x30u << 8 | 0xfu << 20)  /* solid, FMT6_8_8_8_8_UNORM, mask 0xf, R2D_UNORM8 */
+ #define KG_GPU_MARK      0x6b677022u     /* written after the picture, as step 21's word */
+@@ -3391,7 +3393,7 @@ kg_step22(void)
+ 	}
+ 
+ 	kg_next(22, "the picture into the panel memory 0xb8000000 (row by row), again every 250 ms for 15 s");
+-	vm_offset_t panel = ml_io_map_unmappable(KG_PANEL_PA, (vm_size_t)KG_PANEL_ROW * KG_PIC_H, VM_WIMG_WCOMB);
++	vm_offset_t panel = ml_io_map_unmappable(KG_PANEL_PA, KG_PANEL_MAP, VM_WIMG_WCOMB);
+ 	if (panel == 0) {
+ 		printf("SWEET KGPU: 22 no mapping of the panel memory\n");
+ 		return false;
+@@ -3408,7 +3410,7 @@ kg_step22(void)
+ 		}
+ 		kg_wait(250);
+ 	}
+-	ml_io_unmap(panel, (vm_size_t)KG_PANEL_ROW * KG_PIC_H);
++	ml_io_unmap(panel, KG_PANEL_MAP);
+ 	return true;
+ }
+ 
