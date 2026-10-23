@@ -77,7 +77,26 @@ AFTER the USB link is up (replay), watch for "SWEET KGPU" ~60 s after boot. Poss
 outcomes: all three steps print (read access OK under Gunyah); a silent reset right after an
 "about to read" line (that block is hyp-protected: read the tail with
 shim-boot-logview2.img); step 3 refusing because gpu_cfg_ahb is off (then step 3 needs one GCC
-write first). Any other sandbox_container_path_* caller gets
+write first).
+
+**BOOT #27 (2026-10-23 16:44, shim/out/shim-boot-27.img = #26 + `kgpu=3`, kernel CI 39946814897
+@ 8637d28 sha256 1b857603...): PROBE RAN, ALL THREE STEPS, NO RESET.** Log:
+temp/ios-m8/usblog/live-boot27-20261023-1645.txt (listener started after the agent answered:
+full replay). System as #26 (no panic, only the usual driverkitd kill). Results:
+- 1 GCC: gpu_cfg_ahb 0x9 ON; memnoc_gfx 0x80000003 and snoc_dvm_gfx 0x80000001 enabled but
+  CLK_OFF; GPLL0 votes (0x62000 bits 15/16) off (vote word 0x60257f). cmd-db OK (v1): gfx.lvl
+  addr 0x30050, levels 0 56 64 128 192 224 256 320 384 416; cx.lvl 0x30000, 0 16 64 128 192 224
+  256 288 320 336 384 400 416 432; mx.lvl 0x30010, 0 16 56 64 128 192 224 256 288 320 336 384
+  400 416 432 (aux = 16 slots, zero-padded).
+- 2 QFPROM +0x118 = 0x18c000 -> **speed bin 0xc6** (FDT: 9 levels, 295-940 MHz); gaming bin 1.
+- 3 GPU_CC: **the GPU is entirely off, as ABL left it**: PLL0/PLL1 mode 0x100, L 0 (unconfigured,
+  not locked); RCG xo/hub root on, gmu/ff root off (cfg 0); branches on: ahb, crc_ahb, cxo_aon,
+  demet, hub_aon; everything else off; CX GDSC 0x22f001 and GX GDSC 0x22f001 = off, SW_COLLAPSE;
+  gx_domain 0x3c0001, cx_hw_ctrl 0x5ff4, gx_sw_reset 0.
+Meaning: GCC, cmd-db, QFPROM and GPU_CC are readable from our kernel under Gunyah (open
+question 1, the read half, for these blocks). NEXT = steps 4-5, the first writes: CX GDSC on
+(SW_COLLAPSE off, poll PWR_ON) and the CX-side clocks (GMU RCG/PLL, cx_gmu, cxo, hub_cx_int,
+hlos1_vote_gpu_smmu, GCC memnoc/snoc_dvm), each behind kgpu=N with the same announce/pause. Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
