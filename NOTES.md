@@ -397,6 +397,26 @@ AO_AHB_FENCE_CTRL 0, CM3_SYSRESET 1, GBIF_HALT ARB (bit 1) + wait HALT_ACK, then
 Success line: "THE GMU'S FIRMWARE RUNS"; worth reading even on failure: CB1 FSR/FAR (the GMU
 fetching an address we did not map), the log count (the GMU writing through our tables).
 
+**BOOT #36 (2026-10-23 21:11, shim/out/shim-boot-36.img = #35 with `kgpu=15`, kernel CI 39983029309
+@ b1e32e0 sha256 9d29069b...): STEP 15 PASSES, "THE GMU'S FIRMWARE RUNS", UNDO CLEAN, NO PANIC.**
+Log: temp/ios-m8/usblog/live-boot36-20261023-2112.txt. Steps 1-14 as #35 (same 6 blocks, 0 words
+differ, versions 4.0.7). Step 15: log 0x60002000 (16 pages) and HFI 0x60012000 (4 pages) mapped,
+queues at 0x60012350/0x60013350/0x60014350, TLB sync. Values before the writes: FAL/FALNEXT 0,
+CM3_CFG already 0x4052, QSB sides 0x70620 (-> 0x71620), GBIF halt 0x8 (-> 0; halt_ack stays 0x3,
+as in step 6), the rest 0. Then CM3_SYSRESET 1 -> 0 and **FW_INIT_RESULT 0x100** (kgsl's success
+value); HFI_CTRL_STATUS 0x1 (0 in step 6: the firmware set it), GMU2HOST_INTR_INFO 0,
+AO_HOST_INTERRUPT_STATUS 0. CB1 FSR 0x400 = only the FORMAT field (AArch64), same as step 13's
+readback: **no SMMU fault** (FAR/FSYNR0 are stale, not latched). **The GMU wrote its log through
+our tables**: 15 non-zero words in the first page, starting 0x21 0x31dd9759 0x1 0. HFI queues
+r/w all 0 (HFI not started, expected). So the CM3 fetched its vectors from ITCM, ran the code at
+GMU 0x4000 (memory of ours, through context 1) and wrote to 0x60002000. 20 undo entries ran:
+"undo gbif halt (cx traffic): ack in", cm3_sysreset -> 1, eight memory frees, smr1/s2cr1/cb1
+sctlr, test page and tables freed, steps 4-5; CX back to 0x22f001; "run over". System as #35
+(fairplayd/bluetoothd relaunches as before, agent up). **Steps 1-15 proven.** NEXT: step 16, GMU
+<-> RPMh and HFI start: PDC (SEQ_START_ADDR 0, ENABLE_PDC) and RSC (handshake regs + microcode)
+as kgsl gen7_load_pdc_ucode / gen7_load_rsc_ucode, then gen7_gmu_hfi_start (HFI_CTRL_INIT 1, poll
+HFI_CTRL_STATUS bit 0 - already 1 here, so check what kgsl expects first).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
