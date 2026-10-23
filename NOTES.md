@@ -43,6 +43,16 @@ t03 after. T0.1 FINDING (agent, phone): **the "black wallpaper" is no wallpaper 
 False) - set one in Settings to close that mystery; the red-until-wake tint is still open.
 shim-boot-25.img (panic region) is unbuilt-by-CI but ready to boot any time.
 
+**HackiOS OPEN-SOURCED (2026-10-22) - the GPU path is public.** github.com/oosexgang/hackios-xnu-kernel
+(APSL 2.0; device "redwood", Adreno 642L, includes redwood_adreno.c + docs/PORTING.md) and
+hackios-xnu-userland (MIT; Mesa freedreno behind CoreAnimation's GL renderer, ElleKit injection).
+Upstream topaz merged from it 2026-10-22 (GPU, AMP all-core, sound, panel sleep, wallpapers,
+widgets, tweak injection; their patches 0140-0152 + 0948/0949 display modes 60 Hz, 0950 touch).
+Cloned to temp/kunzite-research/hackios-xnu-{kernel,userland}. Our gpu-plan Tier structure is
+superseded: proven path = CA GL renderer <- Mesa <- kernel Adreno driver; our 0911-0913 branches
+overlap their panel-sleep/display work. Scout workflow running (porting, adreno ABI, userland,
+topaz delta). Lilu question answered: the lineage's "Lilu" is ElleKit (userland tweak injection).
+
 **ROADMAP FACTS (2026-10-22, live FDT/dmesg):** battery = `qcom,battery-charger` under
 `qcom,pmic_glink` (ADSP firmware owns gauge/charger; a proper driver needs ADSP PAS boot + GLINK +
 battmgr protocol; quick option = estimate from raw PMIC values over SPMI if readable; open: does
