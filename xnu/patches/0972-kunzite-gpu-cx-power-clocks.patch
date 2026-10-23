@@ -1,0 +1,385 @@
+kunzite: Adreno 710 steps 4-5, the first GPU writes (kgpu=4/5; steps 1-3 unchanged, 0971).
+4: CX GDSC on (gpu_cc_cx_gdsc 0x3d99108: SW_COLLAPSE off, PWR_ON in GDSCR or hw-ctrl 0x3d9953c),
+only under software control and with GX off. 5: in kgsl's order, GCC GPLL0 div vote + ddrss_gpu_axi,
+gmu_clk_src 200 MHz / hub_clk_src 150 MHz from GPLL0 div, then cxo/cx_gmu/hub_cx_int (must run)
+and hlos1_vote_gpu_smmu. Each write is printed before it is made and recorded; after kgpu_hold s
+(default 5) all of them are undone in reverse (CX collapse last). Facts: gpucc-parrot.c,
+gcc-parrot.c, live FDT (GMU clock list, GDSC nodes), HackiOS redwood_adreno.c steps 4-5.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -1,9 +1,9 @@
+ /*
+  * kunzite (POCO M8 5G, SM6475 parrot): the Adreno 710, step by step, after
+- * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). This
+- * file has the read-only steps 1-3; nothing here writes a register.
++ * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
++ * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks).
+  *
+- * Boot-arg kgpu=N runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 5) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -23,6 +23,20 @@
+  *     OPMODE +4, STATUS +0xc, L +0x10, ALPHA +0x14, USER_CTL +0x18), the
+  *     XO/GMU/HUB/FF RCGs, the branches, and the CX GDSC 0x9108 / GX GDSC
+  *     0x905c, as ABL left them.
++ *  4  writes the CX GDSC on (gpu_cc_cx_gdsc: the GMU, the bus interface, the
++ *     GPU SMMU): only if it is under software control and both GDSCs are off;
++ *     clears SW_COLLAPSE and waits for PWR_ON in GDSCR or in hw-ctrl-addr
++ *     0x953c (the vendor's gdsc-regulator.c watches the latter).
++ *  5  writes the CX-side clocks on, in kgsl's order (gen7_gmu_enable_clks):
++ *     GCC: the GPLL0 div tap vote (0x62000 bit 16), ddrss_gpu_axi 0x81154;
++ *     GPU_CC: gmu_clk_src 0x9318 -> 200 MHz and hub_clk_src 0x93ec -> 150 MHz,
++ *     both GPLL0_OUT_MAIN_DIV (source 6; gpucc-parrot.c freq tables), then
++ *     the FDT's GMU/SMMU branches: cxo, cx_gmu, hub_cx_int (BRANCH_HALT: must
++ *     report running), hlos1_vote_gpu_smmu (voted: reported only).
++ * Every write is printed before it is made and kept on an undo list. After
++ * the last step the state is shown for kgpu_hold seconds (default 5), then
++ * the list is undone in reverse (branches, sources, GCC, CX collapse last):
++ * nothing of the GPU block outlives the run.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -56,7 +70,20 @@ void kunzite_adreno_init(void);
+ #define KG_PLL_LOCK      (1u << 31)
+ #define KG_GDSC_PWR_ON   (1u << 31)
+ #define KG_GDSC_COLLAPSE (1u << 0)
++#define KG_GDSC_HW_CTRL  (1u << 1)
+ #define KG_XO_KHZ        19200u
++#define KG_GCC_DIV_VOTE  (1u << 16)      /* gcc_gpu_gpll0_div_clk_src */
++#define KG_GCC_DDRSS_AXI 0x81154u        /* gcc_ddrss_gpu_axi_clk (BRANCH_HALT_SKIP) */
++#define KG_CX_GDSCR      0x9108u
++#define KG_CX_HW_CTRL    0x953cu
++#define KG_GX_GDSCR      0x905cu
++#define KG_GMU_RCGR      0x9318u
++#define KG_HUB_RCGR      0x93ecu
++#define KG_RCG_UPDATE    (1u << 0)
++#define KG_RCG_CFG_MASK  0x371fu         /* [4:0] 2*div-1, [10:8] source, [13:12] mode */
++#define KG_RCG_GPLL0_DIV(twice) (6u << 8 | ((twice) - 1u))
++#define KG_CBCR_ENABLE   (1u << 0)
++#define KG_UNDO_MAX      16u
+ 
+ /* cmd-db (cmd-db.c): header 144 bytes, 8 slave headers at +8, entries 24 bytes */
+ #define KG_DB_MAGIC      0x0c0330dbu
+@@ -64,10 +91,19 @@ void kunzite_adreno_init(void);
+ #define KG_DB_ENTRY      24u
+ #define KG_DB_ARC        3u
+ 
++enum kg_undo_kind { KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC };
++
+ static struct {
+ 	vm_offset_t gcc, db, qfprom, gpucc;
+-	unsigned last, pause_ms, delay_s;
++	unsigned last, pause_ms, delay_s, hold_s, step;
+ 	bool started, ahb_on;
++	struct {
++		enum kg_undo_kind kind;
++		vm_offset_t base;
++		uint32_t off, value;    /* WORD: value back; CLEAR: bits to clear; RCG: old cfg */
++		const char *name;
++	} undo[KG_UNDO_MAX];
++	unsigned nundo;
+ } kg;
+ static int kg_sleep_chan;
+ 
+@@ -94,6 +130,47 @@ kg_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++static void
++kg_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* every write: said before it is made (the last line before a reset names it), and how to undo it */
++static void
++kg_put(const char *block, vm_offset_t base, uint32_t off, uint32_t val, enum kg_undo_kind kind, uint32_t undo,
++    const char *name)
++{
++	uint32_t was = kg_rd(base, off);
++	printf("SWEET KGPU: %u write %s %s +%#x: %#x -> %#x\n", kg.step, block, name, off, was, val);
++	if (kg.nundo < KG_UNDO_MAX) {
++		kg.undo[kg.nundo].kind = kind;
++		kg.undo[kg.nundo].base = base;
++		kg.undo[kg.nundo].off = off;
++		kg.undo[kg.nundo].value = kind == KG_UNDO_WORD ? was : undo;
++		kg.undo[kg.nundo].name = name;
++		kg.nundo++;
++	} else {
++		printf("SWEET KGPU: %u undo list full: %s stays as written\n", kg.step, name);
++	}
++	kg_wr(base, off, val);
++}
++
++/* poll until (reg & mask) == want, for up to ms milliseconds */
++static bool
++kg_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10u; ++i) {
++		if ((kg_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return (kg_rd(base, off) & mask) == want;
++}
++
+ static void
+ kg_wait(unsigned ms)
+ {
+@@ -111,6 +188,14 @@ kg_announce(unsigned step, const char *what)
+ 	kg_wait(kg.pause_ms);
+ }
+ 
++/* the same, for a group of writes */
++static void
++kg_next(unsigned step, const char *what)
++{
++	printf("SWEET KGPU: %u next: %s\n", step, what);
++	kg_wait(kg.pause_ms);
++}
++
+ static vm_offset_t
+ kg_map(const char *name, uint32_t pa, uint32_t size)
+ {
+@@ -309,20 +394,190 @@ kg_step3(void)
+ 	return true;
+ }
+ 
++/* ---- step 4: the CX GDSC on ---- */
++
++static bool
++kg_cx_on(void)
++{
++	return ((kg_rd(kg.gpucc, KG_CX_GDSCR) | kg_rd(kg.gpucc, KG_CX_HW_CTRL)) & KG_GDSC_PWR_ON) != 0;
++}
++
++static bool
++kg_step4(void)
++{
++	if (kg.gpucc == 0 || !kg.ahb_on) {
++		printf("SWEET KGPU: 4 GPU_CC not readable (step 3)\n");
++		return false;
++	}
++	kg_announce(4, "the CX and GX GDSCs before switching CX on");
++	uint32_t cx = kg_rd(kg.gpucc, KG_CX_GDSCR), gx = kg_rd(kg.gpucc, KG_GX_GDSCR);
++	printf("SWEET KGPU: 4 cx gdsc %#x hw_ctrl %#x, gx gdsc %#x\n", cx, kg_rd(kg.gpucc, KG_CX_HW_CTRL), gx);
++	if (cx & KG_GDSC_HW_CTRL) {
++		printf("SWEET KGPU: 4 the CX GDSC is under hardware control: not ours to switch\n");
++		return false;
++	}
++	if (gx & KG_GDSC_PWR_ON) {
++		printf("SWEET KGPU: 4 the GX GDSC (3D core) has power already: something else runs the GPU; stopping\n");
++		return false;
++	}
++	if (kg_cx_on()) {
++		printf("SWEET KGPU: 4 CX is on already (not by this run): going on without switching it\n");
++		return true;
++	}
++	kg_next(4, "CX GDSC SW_COLLAPSE off (the first write to the GPU block)");
++	kg_put("GPU_CC", kg.gpucc, KG_CX_GDSCR, cx & ~KG_GDSC_COLLAPSE, KG_UNDO_GDSC, 0, "cx_gdscr");
++	bool on = false;
++	for (unsigned i = 0; i < 500 && !(on = kg_cx_on()); ++i) {
++		delay(100);
++	}
++	printf("SWEET KGPU: 4 cx gdsc %#x hw_ctrl %#x: CX %s\n", kg_rd(kg.gpucc, KG_CX_GDSCR),
++	    kg_rd(kg.gpucc, KG_CX_HW_CTRL), on ? "ON" : "does not come on in 50 ms");
++	return on;
++}
++
++/* ---- step 5: the CX-side clocks ---- */
++
++static bool
++kg_rcg(const char *name, uint32_t rcgr, uint32_t source)
++{
++	uint32_t cfg = kg_rd(kg.gpucc, rcgr + 4);
++	if ((cfg & KG_RCG_CFG_MASK) == source) {
++		printf("SWEET KGPU: 5 %s already at cfg %#x\n", name, cfg);
++		return true;
++	}
++	kg_put("GPU_CC", kg.gpucc, rcgr + 4, (cfg & ~KG_RCG_CFG_MASK) | source, KG_UNDO_RCG, cfg, name);
++	kg_wr(kg.gpucc, rcgr, kg_rd(kg.gpucc, rcgr) | KG_RCG_UPDATE);
++	if (!kg_poll(kg.gpucc, rcgr, KG_RCG_UPDATE, 0, 10)) {
++		printf("SWEET KGPU: 5 %s does not take its new source (cmd %#x)\n", name, kg_rd(kg.gpucc, rcgr));
++		return false;
++	}
++	printf("SWEET KGPU: 5 %s cmd %#x cfg %#x\n", name, kg_rd(kg.gpucc, rcgr), kg_rd(kg.gpucc, rcgr + 4));
++	return true;
++}
++
++/* enable a branch; `must`: its status bit is one to believe (BRANCH_HALT) and has to show it running */
++static bool
++kg_branch(const char *block, vm_offset_t base, uint32_t cbcr, const char *name, bool must)
++{
++	uint32_t was = kg_rd(base, cbcr);
++	if (!(was & KG_CBCR_ENABLE)) {
++		kg_put(block, base, cbcr, was | KG_CBCR_ENABLE, KG_UNDO_WORD, 0, name);
++	}
++	bool runs = kg_poll(base, cbcr, KG_CBCR_OFF, 0, 10);
++	printf("SWEET KGPU: 5 %s %s %#x: %s\n", block, name, kg_rd(base, cbcr),
++	    runs ? "running" : must ? "STAYS OFF" : "off (status not reliable for this one)");
++	return runs || !must;
++}
++
++static bool
++kg_step5(void)
++{
++	if (!kg_cx_on()) {
++		printf("SWEET KGPU: 5 CX is off (step 4)\n");
++		return false;
++	}
++	kg_next(5, "GCC GPLL0 div vote (0x62000 bit 16) and ddrss_gpu_axi 0x81154 on");
++	uint32_t vote = kg_rd(kg.gcc, KG_GCC_VOTE);
++	if (!(vote & KG_GCC_DIV_VOTE)) {
++		kg_put("GCC", kg.gcc, KG_GCC_VOTE, vote | KG_GCC_DIV_VOTE, KG_UNDO_CLEAR, KG_GCC_DIV_VOTE, "gpll0_div vote");
++		delay(10);
++	}
++	(void)kg_branch("GCC", kg.gcc, KG_GCC_DDRSS_AXI, "ddrss_gpu_axi", false);
++	printf("SWEET KGPU: 5 GCC memnoc_gfx %#x snoc_dvm_gfx %#x\n", kg_rd(kg.gcc, KG_GCC_MEMNOC),
++	    kg_rd(kg.gcc, KG_GCC_SNOC_DVM));
++
++	kg_next(5, "gmu_clk_src -> 200 MHz, hub_clk_src -> 150 MHz (GPLL0 div)");
++	if (!kg_rcg("gmu_clk_src", KG_GMU_RCGR, KG_RCG_GPLL0_DIV(3)) ||       /* 300 MHz / 1.5 */
++	    !kg_rcg("hub_clk_src", KG_HUB_RCGR, KG_RCG_GPLL0_DIV(4))) {       /* 300 MHz / 2 */
++		return false;
++	}
++
++	kg_next(5, "GPU_CC cxo, cx_gmu, hub_cx_int, hlos1_vote_gpu_smmu on");
++	if (!kg_branch("GPU_CC", kg.gpucc, 0x9144, "cxo", true) ||
++	    !kg_branch("GPU_CC", kg.gpucc, 0x913c, "cx_gmu", true) ||
++	    !kg_branch("GPU_CC", kg.gpucc, 0x9148, "hub_cx_int", true) ||
++	    !kg_branch("GPU_CC", kg.gpucc, 0x7000, "hlos1_vote_gpu_smmu", false)) {
++		return false;
++	}
++	printf("SWEET KGPU: 5 gmu_clk_src cmd %#x (%s), hub_clk_src cmd %#x (%s)\n",
++	    kg_rd(kg.gpucc, KG_GMU_RCGR), (kg_rd(kg.gpucc, KG_GMU_RCGR) & KG_RCG_ROOT_OFF) ? "root off" : "root on",
++	    kg_rd(kg.gpucc, KG_HUB_RCGR), (kg_rd(kg.gpucc, KG_HUB_RCGR) & KG_RCG_ROOT_OFF) ? "root off" : "root on");
++	return true;
++}
++
++/* ---- end of the run: undo every write, in reverse ---- */
++
++static void
++kg_teardown(void)
++{
++	if (kg.nundo == 0) {
++		return;
++	}
++	kg.step = 0;
++	if (kg.gpucc != 0) {
++		printf("SWEET KGPU: held %u s: cx gdsc %#x hw_ctrl %#x gx gdsc %#x gmu_rcg %#x/%#x hub_rcg %#x/%#x "
++		    "cxo %#x cx_gmu %#x hub_cx_int %#x smmu_vote %#x\n", kg.hold_s,
++		    kg_rd(kg.gpucc, KG_CX_GDSCR), kg_rd(kg.gpucc, KG_CX_HW_CTRL), kg_rd(kg.gpucc, KG_GX_GDSCR),
++		    kg_rd(kg.gpucc, KG_GMU_RCGR), kg_rd(kg.gpucc, KG_GMU_RCGR + 4),
++		    kg_rd(kg.gpucc, KG_HUB_RCGR), kg_rd(kg.gpucc, KG_HUB_RCGR + 4),
++		    kg_rd(kg.gpucc, 0x9144), kg_rd(kg.gpucc, 0x913c), kg_rd(kg.gpucc, 0x9148), kg_rd(kg.gpucc, 0x7000));
++	}
++	printf("SWEET KGPU: undoing %u writes, in reverse\n", kg.nundo);
++	kg_wait(kg.pause_ms);
++	while (kg.nundo > 0) {
++		--kg.nundo;
++		vm_offset_t base = kg.undo[kg.nundo].base;
++		uint32_t off = kg.undo[kg.nundo].off, value = kg.undo[kg.nundo].value;
++		const char *name = kg.undo[kg.nundo].name;
++		switch (kg.undo[kg.nundo].kind) {
++		case KG_UNDO_WORD:
++			kg_wr(base, off, value);
++			break;
++		case KG_UNDO_CLEAR:
++			kg_wr(base, off, kg_rd(base, off) & ~value);
++			break;
++		case KG_UNDO_RCG:               /* off = the CFG register; CMD is 4 before it */
++			kg_wr(base, off, value);
++			kg_wr(base, off - 4, kg_rd(base, off - 4) | KG_RCG_UPDATE);
++			(void)kg_poll(base, off - 4, KG_RCG_UPDATE, 0, 10);
++			break;
++		case KG_UNDO_GDSC:              /* the vendor's driver does not check the status on disable */
++			kg_wr(base, off, kg_rd(base, off) | KG_GDSC_COLLAPSE);
++			(void)kg_poll(base, off, KG_GDSC_PWR_ON, 0, 100);
++			break;
++		}
++		printf("SWEET KGPU: undo %s +%#x: now %#x\n", name, off, kg_rd(base, off));
++	}
++	if (kg.gpucc != 0) {
++		printf("SWEET KGPU: after undo: cx gdsc %#x hw_ctrl %#x gx gdsc %#x\n", kg_rd(kg.gpucc, KG_CX_GDSCR),
++		    kg_rd(kg.gpucc, KG_CX_HW_CTRL), kg_rd(kg.gpucc, KG_GX_GDSCR));
++	}
++}
++
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	(void)arg;
+-	(void)result;
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5 };
+ 	unsigned done = 0;
+ 
++	(void)arg;
++	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+-	printf("SWEET KGPU: steps 1..%u, read only, %u ms pause before each group\n", kg.last, kg.pause_ms);
+-	while (done < kg.last && steps[done]()) {
++	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end", kg.pause_ms);
++	while (done < kg.last) {
++		kg.step = done + 1;
++		if (!steps[done]()) {
++			break;
++		}
+ 		++done;
+ 	}
+-	printf("SWEET KGPU: %u of %u steps done; nothing was written\n", done, kg.last);
++	printf("SWEET KGPU: %u of %u steps done; %u writes to undo\n", done, kg.last, kg.nundo);
++	if (kg.nundo > 0) {
++		kg_wait(kg.hold_s * 1000u);
++	}
++	kg_teardown();
++	printf("SWEET KGPU: run over\n");
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -330,7 +585,7 @@ kg_thread(void *arg, wait_result_t result)
+ void
+ kunzite_adreno_init(void)
+ {
+-	int last = 0, delay_s = 60, pause_ms = 1500, gpu = 0;
++	int last = 0, delay_s = 60, pause_ms = 1500, hold_s = 5, gpu = 0;
+ 	thread_t thread;
+ 
+ 	if (kg.started || !PE_parse_boot_argn("kgpu", &last, sizeof(last)) || last <= 0) {
+@@ -343,11 +598,13 @@ kunzite_adreno_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+-	kg.last = last > 3 ? 3u : (unsigned)last;
++	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
++	kg.last = last > 5 ? 5u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+-	if (last > 3) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..3 exist; running those\n", last);
++	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
++	if (last > 5) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..5 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -848,7 +848,7 @@ sweet_ufs_init(void)
+ 	 * state by default and starts the CDC-ECM device only with sweetusb=2.
+ 	 */
+ 	sweet_usb_probe();
+-	kunzite_adreno_init();  /* kgpu=N: read-only Adreno 710 steps (0971), off by default */
++	kunzite_adreno_init();  /* kgpu=N: Adreno 710 bring-up steps (0971, 0972), off by default */
+ 	return 0;
+ }
+ 

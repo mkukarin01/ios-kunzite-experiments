@@ -96,7 +96,25 @@ full replay). System as #26 (no panic, only the usual driverkitd kill). Results:
 Meaning: GCC, cmd-db, QFPROM and GPU_CC are readable from our kernel under Gunyah (open
 question 1, the read half, for these blocks). NEXT = steps 4-5, the first writes: CX GDSC on
 (SW_COLLAPSE off, poll PWR_ON) and the CX-side clocks (GMU RCG/PLL, cx_gmu, cxo, hub_cx_int,
-hlos1_vote_gpu_smmu, GCC memnoc/snoc_dvm), each behind kgpu=N with the same announce/pause. Any other sandbox_container_path_* caller gets
+hlos1_vote_gpu_smmu, GCC memnoc/snoc_dvm), each behind kgpu=N with the same announce/pause.
+
+**GPU STEPS 4-5 = 0972 (2026-10-23, written, NOT built/booted): the first GPU writes, `kgpu=5`.**
+Step 4: CX GDSC (0x3d99108) SW_COLLAPSE off, PWR_ON awaited in GDSCR or hw-ctrl 0x3d9953c
+(<=50 ms); refuses if CX is under HW control or GX already has power; CX already on = left
+alone. Step 5 (kgsl gen7_gmu_enable_clks order; FDT GMU clocks decoded: gmu_clk = gpucc
+cx_gmu, cxo_clk = cxo, axi_clk = GCC ddrss_gpu_axi 0x81154, memnoc_clk = GCC gpu_memnoc_gfx,
+ahb_clk = gpucc ahb, hub_clk = hub_cx_int, smmu_vote = hlos1_vote_gpu_smmu, apb_pclk = aoss):
+GCC 0x62000 bit 16 (GPLL0 div tap vote), ddrss_gpu_axi on; gmu_clk_src cfg 0x602 (200 MHz),
+hub_clk_src cfg 0x603 (150 MHz), both GPLL0_OUT_MAIN_DIV (source 6, as hk on redwood: no
+GPU PLL needed); cxo, cx_gmu, hub_cx_int must show running (BRANCH_HALT), smmu vote reported
+only. Every write prints "SWEET KGPU: N write <block> <name> +<off>: old -> new" BEFORE it
+happens and goes on an undo list; after kgpu_hold s (default 5) a state line, then everything
+is undone in reverse (branches, RCGs, GCC, CX collapse last; "SWEET KGPU: undo ..."). Verified:
+214 patches, the series reproduces both files, syntax check 0 diagnostics. **Test:** CI ->
+#27 image with `kgpu=5` instead of `kgpu=3`. Outcomes: a reset right after a "write" line =
+Gunyah forbids that write (persistent log); "STAYS OFF" / "does not take its new source" = a
+clock prerequisite is missing (the line says which); all running + undo lines = CX power and
+clocks work, next are steps 6-7 (first GMU register reads, RSCC). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
