@@ -337,6 +337,25 @@ load_fw / itcm_shadow, its blocks into ITCM/DTCM and the VMAs the blob asks for 
 1), then 15 (GBIF_HALT = 0, CM3_SYSRESET = 0, wait FW_INIT_RESULT): the first proof that the GMU
 reads through our SMMU tables.
 
+**GPU STEP 14 = 0979 (2026-10-23, written, NOT built/booted), `kgpu=14`: the GMU firmware.**
+gmu_gen70000.bin (57272 bytes, 15 blocks): 11 size-0 requests (ITCM 0x0/0x200, DTCM 0x10004000/
+0x10007000/0x10007fdc: nothing to do; ICACHE 0x4000+0xdcac, 0x100000+0x88b0, 0x200000+0x12a80,
+0x300000+0x6e28; PERSIST 0x60000000+0x1000, 0x60001000+0x1000) and 4 data blocks of type
+0xefbeadde (ITCM 0x0+0x1dc = vector table, SP 0x10007f80; code ICACHE 0x4000+0xdcac; DTCM
+0x10007f98+0x28 and 0x10007fdc+0x18, the latter holding the versions). kgsl gen7 GMU VAs: ITCM 0
+(16K), ICACHE 16K..16M, DTCM 0x10004000 (16K), uncached kernel 0x60000000 (512M), extended
+0xc0000000. 0979: step 13's tables now come from a pool of 8 (two 16K pages, made before the
+context is on, freed after stream 5 is unrouted), test page moved to GMU 0x7ffff000; step 14 =
+parse (6 blocks allocated KMA_DATA|KMA_ZERO, mapped page by page through context 1, PTE_GMU),
+tables committed, TLBIASID+sync, load (ITCM/DTCM via registers, each word read back; the code
+memcpy'd + cache-cleaned), versions at DTCM+0xff8 (expected core 0x40000007 >= 0x40000000, hfi
+0x20010000). Python simulation against the real file: 6 allocs, 7 tables, all loads resolve.
+Undo peaks at 17 entries. CM3 stays in reset; TCMs not restored. Verified: 221 patches, series
+reproduces the file, syntax clean. **Before the test, once:** `curl -s -T temp/kunzite-vendor/
+proprietary/vendor/firmware/gmu_gen70000.bin 'http://192.168.7.2:8022/put?p=/usr/share/firmware/
+kunzite/gmu_gen70000.bin&m=644&mk=1'` (vendor firmware, phone only). **Test:** #34 image with
+`kgpu=14`. Success line: "THE GMU FIRMWARE IS LOADED (the CM3 stays in reset)".
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still

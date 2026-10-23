@@ -1,0 +1,442 @@
+kunzite: Adreno 710 step 14, the GMU firmware (kgpu=14; 1-12 unchanged, 13 reworked).
+13 now builds its tables with a small page-table builder (3 levels of 4K, 39-bit) whose 8 tables
+come from a pool made before the context is on (freed at the end, after stream 5 is unrouted);
+its test page moves to GMU 0x7ffff000, since the firmware wants 0x60000000. 14 reads
+/usr/share/firmware/kunzite/gmu_gen70000.bin (uploaded once) and does what kgsl's
+gen7_gmu_parse_fw / gen7_gmu_load_fw / gen7_gmu_version_info do: the size-0 PREALLOC/PERSIST
+blocks outside ITCM/DTCM get zeroed memory of ours mapped at their GMU addresses through context 1
+(ICACHE 0x4000, 0x100000, 0x200000, 0x300000; 0x60000000, 0x60001000), then TLBIASID+sync; data
+blocks go into ITCM (0x0) / DTCM (0x10004000) through the GMU's registers (CM3 held in reset), each
+read back word by word, or are copied into that memory (the code at 0x4000); finally the version
+words at DTCM +0xff8 (kgsl wants core >= 0x40000000). TCM contents are not restored; the memory
+is freed at the end.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -3,9 +3,10 @@
+  * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
+  * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+- * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write.
++ * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write;
++ * 14 loads the GMU's firmware.
+  *
+- * Boot-arg kgpu=N (N <= 13) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 14) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -67,12 +68,18 @@
+  *     signature (qcom_mdt_pas_init / qcom_scm_pas_init_image). Nothing is
+  *     loaded or started; the page is not touched again.
+  *  13 routes stream 5 (the GMU) through HLOS SMR/S2CR entry 1 and context 1
+- *     with page tables of ours (3 levels, 4K, 39-bit; one test page at the
+- *     GMU's 0x60000000): arm-smmu context programming as hk did on redwood;
++ *     with page tables of ours (3 levels, 4K, 39-bit, from a pool of 8 made
++ *     here; one test page at the GMU's 0x7ffff000): arm-smmu context programming as hk did on redwood;
+  *     checks the readbacks, fault status and a TLB sync. Undone at the end as
+  *     Linux releases a context: stream 5 unrouted (SMR 0, S2CR fault), CB1
+  *     off (SCTLR 0), its configuration left (CBAR := 0 aborts, boot #33);
+  *     the tables are freed last.
++ *  14 loads gmu_gen70000.bin (KG_GMU_FW on the root FS) as kgsl does
++ *     (gen7_gmu_parse_fw, gen7_gmu_load_fw, gen7_gmu_version_info): the
++ *     memory blocks it asks for are allocated and mapped at their GMU
++ *     addresses through context 1, its ITCM/DTCM data written through the
++ *     GMU's registers (read back word by word), the rest copied into that
++ *     memory; then the version words in DTCM. The CM3 stays in reset.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -218,7 +225,7 @@ void kunzite_adreno_init(void);
+ #define KG_GMU_STREAM    5u              /* FDT gmu iommus */
+ #define KG_GMU_MATCH     1u              /* SMR/S2CR entry (0 is the GPU's) */
+ #define KG_GMU_CB        1u              /* context (0 is the GPU's in Linux's adreno-smmu) */
+-#define KG_GMU_TEST_VA   0x60000000ull   /* where the GMU's firmware wants its first pages (hk) */
++#define KG_GMU_TEST_VA   0x7ffff000ull   /* top of the GMU's uncached kernel range; its firmware wants 0x60000000 */
+ #define PTE_TABLE        3ull
+ #define PTE_PAGE         3ull
+ #define PTE_GMU          (2ull << 8 | 1ull << 10 | 1ull << 11)  /* outer shareable, accessed, not global; attr 0 */
+@@ -1150,10 +1157,88 @@ kg_to_memory(vm_offset_t start, vm_size_t size)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * The GMU's page tables: 3 levels of 4K tables, 39-bit addresses, table 0 the
++ * root. All of them come from a pool made in step 13, before the context is
++ * on, so no table is allocated (or freed) while the SMMU may walk them; the
++ * pool's pages are freed at the end, after stream 5 is unrouted.
++ */
++#define KG_SPACE_TABLES  8u
++static struct {
++	uint64_t *table[KG_SPACE_TABLES];
++	uint64_t phys[KG_SPACE_TABLES];
++	vm_offset_t page[KG_SPACE_TABLES];
++	unsigned npages, ntables, used;
++} kg_space;
++
++static bool
++kg_space_pool(void)
++{
++	unsigned per_page = (unsigned)(PAGE_SIZE / 0x1000);
++
++	while (kg_space.ntables < KG_SPACE_TABLES) {
++		vm_offset_t page = 0;
++		if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++			return false;
++		}
++		kg_undo_push(KG_UNDO_KFREE, page, 0, (uint32_t)PAGE_SIZE, "gmu page tables");
++		kg_space.page[kg_space.npages++] = page;
++		for (unsigned i = 0; i < per_page && kg_space.ntables < KG_SPACE_TABLES; i++) {
++			kg_space.table[kg_space.ntables] = (uint64_t *)(page + 0x1000u * i);
++			kg_space.phys[kg_space.ntables] = kvtophys(page + 0x1000u * i);
++			kg_space.ntables++;
++		}
++	}
++	kg_space.used = 1;              /* table 0 is the root */
++	return true;
++}
++
++/* the table an entry leads to, made (from the pool) if the entry is empty */
++static uint64_t *
++kg_space_next(uint64_t *entry)
++{
++	if (*entry & 1u) {
++		for (unsigned i = 0; i < kg_space.used; i++) {
++			if (kg_space.phys[i] == (*entry & 0x0000fffffffff000ull)) {
++				return kg_space.table[i];
++			}
++		}
++		return NULL;
++	}
++	if (kg_space.used == kg_space.ntables) {
++		return NULL;
++	}
++	*entry = kg_space.phys[kg_space.used] | PTE_TABLE;
++	return kg_space.table[kg_space.used++];
++}
++
++/* one 4K page of the GMU's address space */
++static bool
++kg_space_map(uint64_t va, uint64_t pa, uint64_t attrs)
++{
++	uint64_t *l2 = (va >> 39) ? NULL : kg_space_next(&kg_space.table[0][(va >> 30) & 0x1ffu]);
++	uint64_t *l3 = l2 != NULL ? kg_space_next(&l2[(va >> 21) & 0x1ffu]) : NULL;
++
++	if (l3 == NULL) {
++		printf("SWEET KGPU: %u no page table for GMU %#llx (pool of %u used up?)\n", kg.step, va, kg_space.ntables);
++		return false;
++	}
++	l3[(va >> 12) & 0x1ffu] = pa | attrs | PTE_PAGE;
++	return true;
++}
++
++static void
++kg_space_commit(void)
++{
++	for (unsigned i = 0; i < kg_space.npages; i++) {
++		kg_to_memory(kg_space.page[i], PAGE_SIZE);
++	}
++}
++
+ /*
+  * Stream 5 (the GMU) through HLOS entry 1 and context 1, with tables of
+  * ours (3 levels of 4K pages, 39-bit addresses), mapping one test page at the
+- * GMU's 0x60000000. This SMMU has no address translation operations (IDR0
++ * GMU's 0x7ffff000. This SMMU has no address translation operations (IDR0
+  * ATOSNS), so what is checked here is that it takes and keeps the
+  * configuration and finishes a TLB sync; the GMU reading through it (steps
+  * 14-15) is the proof of the translation.
+@@ -1161,9 +1246,7 @@ kg_to_memory(vm_offset_t start, vm_size_t size)
+ static bool
+ kg_step13(void)
+ {
+-	static const uint32_t gmu_va_l1 = (uint32_t)(KG_GMU_TEST_VA >> 30) & 0x1ffu;
+-	vm_offset_t mem = 0;
+-	vm_size_t size = PAGE_SIZE >= 0x4000 ? PAGE_SIZE : 0x4000;
++	vm_offset_t test = 0;
+ 
+ 	if (!kg_cx_ready(13) || kg.smmu == 0 || kg.smmu_pages == 0) {
+ 		printf("SWEET KGPU: 13 needs steps 4-8\n");
+@@ -1183,29 +1266,27 @@ kg_step13(void)
+ 	}
+ 
+ 	/* the flags topaz_sandbox_container.c allocates (and kmem_frees) with on every op 4 */
+-	if (kmem_alloc(kernel_map, &mem, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+-		printf("SWEET KGPU: 13 no memory for the tables\n");
++	if (!kg_space_pool()) {
++		printf("SWEET KGPU: 13 no memory for the page tables\n");
+ 		return false;
+ 	}
+-	kg_undo_push(KG_UNDO_KFREE, mem, 0, (uint32_t)size, "gmu tables and test page");
+-	uint64_t phys = kvtophys(mem);
+-	if (kvtophys(mem + 0x3000) != phys + 0x3000) {
+-		printf("SWEET KGPU: 13 the tables' memory is not in one piece\n");
++	if (kmem_alloc(kernel_map, &test, PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET KGPU: 13 no memory for the test page\n");
+ 		return false;
+ 	}
+-	uint64_t *l1 = (uint64_t *)mem, *l2 = (uint64_t *)(mem + 0x1000), *l3 = (uint64_t *)(mem + 0x2000);
+-	uint32_t *test = (uint32_t *)(mem + 0x3000);
+-	l1[gmu_va_l1] = (phys + 0x1000) | PTE_TABLE;
+-	l2[(KG_GMU_TEST_VA >> 21) & 0x1ffu] = (phys + 0x2000) | PTE_TABLE;
+-	l3[(KG_GMU_TEST_VA >> 12) & 0x1ffu] = (phys + 0x3000) | PTE_GMU | PTE_PAGE;
++	kg_undo_push(KG_UNDO_KFREE, test, 0, (uint32_t)PAGE_SIZE, "gmu test page");
++	uint64_t test_phys = kvtophys(test);
+ 	for (uint32_t i = 0; i < 1024; i++) {
+-		test[i] = 0x6a000000u | i;
++		((uint32_t *)test)[i] = 0x6a000000u | i;
++	}
++	kg_to_memory(test, 0x1000);
++	if (!kg_space_map(KG_GMU_TEST_VA, test_phys, PTE_GMU)) {
++		return false;
+ 	}
+-	kg_to_memory(mem, 0x4000);
+-	uint64_t root = phys | (uint64_t)KG_GMU_CB << 48;      /* tagged with the context's ASID */
+-	printf("SWEET KGPU: 13 tables at %#llx (l1[%u] %#llx, l2 %#llx, l3 %#llx), GMU %#llx -> test page %#llx\n",
+-	    phys, gmu_va_l1, l1[gmu_va_l1], l2[(KG_GMU_TEST_VA >> 21) & 0x1ffu], l3[(KG_GMU_TEST_VA >> 12) & 0x1ffu],
+-	    KG_GMU_TEST_VA, phys + 0x3000);
++	kg_space_commit();
++	uint64_t root = kg_space.phys[0] | (uint64_t)KG_GMU_CB << 48;  /* tagged with the context's ASID */
++	printf("SWEET KGPU: 13 %u tables in %u pages, root %#llx; GMU %#llx -> test page %#llx\n", kg_space.ntables,
++	    kg_space.npages, kg_space.phys[0], KG_GMU_TEST_VA, test_phys);
+ 
+ 	/*
+ 	 * The context's configuration is kept when the run ends, as Linux's arm-smmu does
+@@ -1260,10 +1341,202 @@ kg_step13(void)
+ 		return false;
+ 	}
+ 	printf("SWEET KGPU: 13 THE SMMU TAKES OUR TABLES: stream 5 (GMU) -> entry 1 -> context 1, GMU %#llx -> %#llx "
+-	    "(no ATOS here: the GMU's own reads are the proof)\n", KG_GMU_TEST_VA, phys + 0x3000);
++	    "(no ATOS here: the GMU's own reads are the proof)\n", KG_GMU_TEST_VA, test_phys);
++	return true;
++}
++
++/* ---- step 14: the GMU's firmware ---- */
++
++#define KG_GMU_FW        "/usr/share/firmware/kunzite/gmu_gen70000.bin"
++#define KG_GMU_ITCM_VA   0x00000000u     /* kgsl gen7_gmu_vma: ITCM 16K at 0 */
++#define KG_GMU_DTCM_VA   0x10004000u     /* DTCM 16K at 256M + 16K */
++#define KG_GMU_TCM_SIZE  0x4000u
++#define KG_GMU_FW_MIN    0x40000000u     /* gen7_3_0 gmu_fw_version: GMU_VERSION(4, 0, 0) */
++#define KG_GMU_BLOCKS    8u
++#define KG_BLK_PREALLOC  1u              /* GMU_BLK_TYPE_PREALLOC_REQ */
++#define KG_BLK_PERSIST   7u              /* GMU_BLK_TYPE_PREALLOC_PERSIST_REQ */
++
++/* memory of ours the GMU sees, one per block the firmware asks for */
++static struct {
++	uint32_t addr, size;
++	vm_offset_t mem;
++} kg_gmu_mem[KG_GMU_BLOCKS];
++static unsigned kg_gmu_nmem;
++
++/* [a, a + s) inside [base, base + len) */
++static bool
++kg_inside(uint32_t a, uint32_t s, uint32_t base, uint32_t len)
++{
++	return a >= base && s <= len && a - base <= len - s;
++}
++
++/* a block the firmware asks for (kgsl gen7_gmu_process_prealloc): zeroed memory of ours at its GMU address */
++static bool
++kg_gmu_alloc(uint32_t addr, uint32_t len)
++{
++	vm_offset_t mem = 0;
++	uint32_t size = (len + 0xfffu) & ~0xfffu;
++	vm_size_t alloc = ((vm_size_t)size + PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
++
++	if ((addr & 0xfffu) || len == 0 || kg_gmu_nmem == KG_GMU_BLOCKS) {
++		printf("SWEET KGPU: 14 cannot place GMU %#x+%#x\n", addr, len);
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &mem, alloc, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET KGPU: 14 no memory for GMU %#x+%#x\n", addr, len);
++		return false;
++	}
++	kg_undo_push(KG_UNDO_KFREE, mem, 0, (uint32_t)alloc, "gmu firmware memory");
++	for (uint32_t o = 0; o < size; o += 0x1000u) {
++		if (!kg_space_map(addr + o, kvtophys(mem + o), PTE_GMU)) {
++			return false;
++		}
++	}
++	kg_gmu_mem[kg_gmu_nmem].addr = addr;
++	kg_gmu_mem[kg_gmu_nmem].size = size;
++	kg_gmu_mem[kg_gmu_nmem].mem = mem;
++	kg_gmu_nmem++;
++	printf("SWEET KGPU: 14 GMU %#x..%#x -> memory %#llx (%u pages)\n", addr, addr + size, kvtophys(mem), size >> 12);
+ 	return true;
+ }
+ 
++/* a block for a TCM, through the GMU's registers (kgsl load_tcm), read back word by word */
++static bool
++kg_load_tcm(const char *name, uint32_t reg_start, uint32_t base, uint32_t addr, const uint8_t *src, uint32_t size)
++{
++	uint32_t first = reg_start + (addr - base) / 4u, words = size / 4u, bad = 0, w;
++
++	printf("SWEET KGPU: 14 write GMU %s %#x..%#x: %u words from register %#x\n", name, addr, addr + size, words, first);
++	for (uint32_t i = 0; i < words; i++) {
++		memcpy(&w, src + 4u * i, 4);
++		kg_wr(kg.gmu, KG_GMU_OFF(first + i), w);
++	}
++	for (uint32_t i = 0; i < words; i++) {
++		memcpy(&w, src + 4u * i, 4);
++		bad += kg_gmu(first + i) != w;
++	}
++	printf("SWEET KGPU: 14   read back: %u of %u words differ\n", bad, words);
++	return bad == 0;
++}
++
++/*
++ * kgsl gen7_gmu_parse_fw + gen7_gmu_load_fw + gen7_gmu_version_info. The
++ * file is a chain of blocks {addr, size, type, value} + size bytes: size 0
++ * blocks are requests (PREALLOC / PERSIST: value bytes at addr), the others
++ * data for ITCM/DTCM (written through registers while the CM3 is held in
++ * reset) or for memory the requests made. The TCMs are not restored at the
++ * end (SRAM; the CM3 stays in reset and CX collapses); the memory is freed.
++ */
++static bool
++kg_step14(void)
++{
++	struct { uint32_t addr, size, type, value; } b;
++	void *data = NULL;
++	size_t size = 0, off;
++	unsigned blocks = 0, loads = 0;
++	bool ok = false;
++
++	if (!kg_cx_ready(14) || kg.gmu == 0 || kg_space.ntables == 0) {
++		printf("SWEET KGPU: 14 needs steps 4-13\n");
++		return false;
++	}
++	kg_announce(14, "the GMU's reset state, then " KG_GMU_FW);
++	uint32_t sysreset = kg_gmu(GEN7_GMU_CM3_SYSRESET), init = kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT);
++	printf("SWEET KGPU: 14 cm3 sysreset %#x fw_init_result %#x\n", sysreset, init);
++	if (!(sysreset & 1u) || (init & (1u << 8))) {
++		printf("SWEET KGPU: 14 the GMU's processor is running (or has run firmware): not loading\n");
++		return false;
++	}
++	if (!topaz_root_mounted()) {
++		printf("SWEET KGPU: 14 the root filesystem is not mounted yet: raise kgpu_delay\n");
++		return false;
++	}
++	int err = topaz_fw_read(KG_GMU_FW, &data, &size);
++	if (err != 0) {
++		printf("SWEET KGPU: 14 cannot read " KG_GMU_FW " (error %d): upload the phone's "
++		    "/vendor/firmware/gmu_gen70000.bin there\n", err);
++		return false;
++	}
++	const uint8_t *fw = data;
++
++	/* pass 1: the chain, and the memory it asks for, through context 1 */
++	for (off = 0; off + 16 <= size; off += 16 + b.size) {
++		memcpy(&b, fw + off, 16);
++		if (b.size > size - off - 16 || (b.size & 3u)) {
++			printf("SWEET KGPU: 14 block %u at %#lx: size %#x does not fit the file\n", blocks, (unsigned long)off, b.size);
++			goto out;
++		}
++		blocks++;
++		if (b.size != 0) {
++			loads++;
++		} else if (b.type == KG_BLK_PREALLOC || b.type == KG_BLK_PERSIST) {
++			bool tcm = kg_inside(b.addr, b.value, KG_GMU_ITCM_VA, KG_GMU_TCM_SIZE) ||
++			    kg_inside(b.addr, b.value, KG_GMU_DTCM_VA, KG_GMU_TCM_SIZE);
++			if (!tcm && !kg_gmu_alloc(b.addr, b.value)) {
++				goto out;
++			}
++		}
++	}
++	if (off != size) {
++		printf("SWEET KGPU: 14 %lu bytes after the last block\n", (unsigned long)(size - off));
++		goto out;
++	}
++	printf("SWEET KGPU: 14 %s: %lu bytes, %u blocks, %u to load, %u memory blocks mapped\n", KG_GMU_FW,
++	    (unsigned long)size, blocks, loads, kg_gmu_nmem);
++	kg_space_commit();
++	uint32_t cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page;
++	printf("SWEET KGPU: 14 command tlbiasid <- %u, tlbsync <- 1 (new mappings in context 1)\n", KG_GMU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBIASID, KG_GMU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBSYNC, 1);
++	if (!kg_poll(kg.smmu, cb + SMMU_CB_TLBSTATUS, 1u, 0, 100)) {
++		printf("SWEET KGPU: 14 TLB sync does not finish\n");
++		goto out;
++	}
++
++	/* pass 2: the data */
++	kg_next(14, "the firmware's data into ITCM/DTCM (registers) and into its memory");
++	for (off = 0; off + 16 <= size; off += 16 + b.size) {
++		memcpy(&b, fw + off, 16);
++		if (b.size == 0) {
++			continue;
++		}
++		const uint8_t *src = fw + off + 16;
++		if (kg_inside(b.addr, b.size, KG_GMU_ITCM_VA, KG_GMU_TCM_SIZE)) {
++			if (!kg_load_tcm("itcm", GEN7_GMU_CM3_ITCM_START, KG_GMU_ITCM_VA, b.addr, src, b.size)) {
++				goto out;
++			}
++		} else if (kg_inside(b.addr, b.size, KG_GMU_DTCM_VA, KG_GMU_TCM_SIZE)) {
++			if (!kg_load_tcm("dtcm", GEN7_GMU_CM3_DTCM_START, KG_GMU_DTCM_VA, b.addr, src, b.size)) {
++				goto out;
++			}
++		} else {
++			unsigned m;
++			for (m = 0; m < kg_gmu_nmem && !kg_inside(b.addr, b.size, kg_gmu_mem[m].addr, kg_gmu_mem[m].size); m++) {
++			}
++			if (m == kg_gmu_nmem) {
++				printf("SWEET KGPU: 14 no memory for the block GMU %#x+%#x\n", b.addr, b.size);
++				goto out;
++			}
++			vm_offset_t dst = kg_gmu_mem[m].mem + (b.addr - kg_gmu_mem[m].addr);
++			memcpy((void *)dst, src, b.size);
++			kg_to_memory(dst, b.size);
++			printf("SWEET KGPU: 14 copied %#x bytes to GMU %#x (memory %#llx), first word %#x\n", b.size, b.addr,
++			    kvtophys(dst), *(const uint32_t *)dst);
++		}
++	}
++
++	/* kgsl gen7_gmu_version_info: five words at a fixed place in DTCM */
++	uint32_t core = kg_gmu(GEN7_GMU_CM3_DTCM_START + 0xff8);
++	printf("SWEET KGPU: 14 versions core %#x core_dev %#x pwr %#x pwr_dev %#x hfi %#x (kgsl wants core >= %#x)\n", core,
++	    kg_gmu(GEN7_GMU_CM3_DTCM_START + 0xff9), kg_gmu(GEN7_GMU_CM3_DTCM_START + 0xffa),
++	    kg_gmu(GEN7_GMU_CM3_DTCM_START + 0xffb), kg_gmu(GEN7_GMU_CM3_DTCM_START + 0xffc), KG_GMU_FW_MIN);
++	ok = core >= KG_GMU_FW_MIN;
++	printf("SWEET KGPU: 14 %s\n", ok ? "THE GMU FIRMWARE IS LOADED (the CM3 stays in reset)" : "version check FAILED");
++out:
++	topaz_fw_free(data, size);
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -1295,14 +1568,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -1337,12 +1610,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 13 ? 13u : (unsigned)last;
++	kg.last = last > 14 ? 14u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 13) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..13 exist; running those\n", last);
++	if (last > 14) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..14 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
