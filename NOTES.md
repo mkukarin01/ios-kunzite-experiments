@@ -528,6 +528,27 @@ entry before its CM3 entry). Undo peaks at 43. H2F_MSG_START is left for kgpu 19
 "GX IS ON: the GMU powered the 3D core". Verified: 225 patches, series reproduces the file,
 syntax clean. **Test:** #38 image with `kgpu=18`.
 
+**BOOT #39 (2026-10-23 23:46, shim/out/shim-boot-39.img = #38 with `kgpu=18`, kernel CI 40003719080
+@ c918ccb sha256 8f34a9e5...): STEP 18 PASSES, "GX IS ON: the GMU powered the 3D core"; THE SLUMBER
+TAKES IT DOWN AGAIN; NO PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot39-20261023-2346.txt.
+Steps 1-17 as #38 (six HFI acks, result 0). Step 18: before, gfx_pwr_clk_status 0x3 (GDSC off,
+clock off), GX GDSCR 0x22f001, rpmh_power_state 0, cx_busy 0x30000000. Default perf vote (hdr
+0x70041e, ack 0x61031e) and bus vote (0x80041e, ack 0x71031e) both result 0 in 0.1-0.2 ms; GX
+still off after them. **OOB_GPU acked** (GMU2HOST_INTR_INFO 0x80000000) -> **gfx_pwr_clk_status 0
+(GDSC on, clock on), GX GDSCR 0xf8222800** (PWR_ON, collapse bit cleared by the GMU). GX register
+reads fine: RBBM_STATUS 0x1, CP_STATUS_1 0, CP2GMU_STATUS 0 (no CP running). CB1 FSR 0x400, rscc
+seq_busy 0; GMU log 290 words. Held 5 s with GX on. Undo (43 entries): oob_gpu clear; slumber:
+rpmh_power_state 0, the 10 TCSes idle, **PREPARE_SLUMBER acked result 0** (hdr 0x900321) -> GX off
+(0x3, GDSCR 0x222801), **rpmh_power_state 0xf (GPU_HW_SLUMBER)**; GPU idle; CM3 into reset (log
+wptr 92); **RSC sleep done** (STATUS0 0x1010006: bit 16 set; RSCC_CONTROL_ACK 1); cx_busy
+0x71000000 after it; the GX-collapse fallback was not needed. Then step 17's CM3 entry (GBIF halt
+acked), the HFI alias unmapped, PDC/RSCC words back, step 15's CM3 entry, frees, stream 5 unrouted,
+CX down: after undo cx gdsc 0x22f001, gx gdsc 0x222801 (off); "run over". System as #38 (agent
+up). Cosmetic: kg.step is 0 during the undo, so the HFI lines sent from the slumber print step
+"0". **Steps 1-18 proven: the GMU turns GX on and off for us.** NEXT (kgpu 19 = the port map's 18):
+H2F_MSG_START after OOB_GPU as gen7_gpu_boot does, then the GPU's own SMMU context (stream 0 ->
+an HLOS context bank with our tables, kgsl_mmu_start), the ringbuffer and a710_sqe.fw.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
