@@ -283,6 +283,22 @@ unroutes stream 5, restores CB1/CBAR1/CBA2R1, frees the page last. Also step 11'
 "next:". Verified: 219 patches, series reproduces the file, syntax clean. **Test:** #32 image
 with `kgpu=13`. A reset right after a "write SMMU" line = Gunyah forbids that SMMU write.
 
+**BOOT #33 (2026-10-23 18:53, shim/out/shim-boot-33.img = #32 with `kgpu=13`, kernel CI 39963657778
+@ b0fcc04 sha256 94fc689f...): STEP 13 WORKS, THEN A KERNEL PANIC DURING THE UNDO.** Log:
+temp/ios-m8/usblog/live-boot33-20261023-1853.txt (ends at the panic). Steps 1-12 as #32 (zap
+signature accepted again). Step 13: entry 1 / CB1 / stream 5 free (CB1 leftovers: sctlr 0x1a2112,
+tcr2 0x20060, tcr 0x41f0203, ttbr0 0x233bc8a:08009662, mair0 0x24042 ...); tables at 0xa2c7c8000
+(above 4 GiB, 36-bit OK); all 11 context writes + FSR/TLBIASID/TLBSYNC (tlbstatus 0: sync done) +
+SCTLR/S2CR/SMR taken; read back smr1 0x84000005, s2cr1 0x1, cbar1 0x1f300, cba2r1 0x1, sctlr
+0x27 (ASIDPNE bit 12 not kept), tcr 0x803519, tcr2 0x38071 (bits 5-6 read as 1), ttbr0
+0x1000a:2c7c8000, mair0 0xf404ff44, fsr 0x400 (format bit only), sgfsr 0 => **"THE SMMU TAKES OUR
+TABLES": Gunyah lets HLOS program the GPU SMMU (open question 1, write half: SMMU yes).** Then
+"held 5 s" (CX/clocks as always), "undoing 20 writes, in reverse", the 1.5 s pause, and NO "undo"
+line ever arrived: **kernel panic** (user: on screen, ~1 min at the lock screen). A panic stops the
+USB log, so the culprit is not in it. Suspects: (1) kmem_free of the KMA_KOBJECT|KMA_DATA table
+page (new path: hk never freed its tables), (2) one of the 13 SMMU restores writing CB1's junk
+leftovers back. The panic screen's text (keepsyms=1 => names) decides.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
