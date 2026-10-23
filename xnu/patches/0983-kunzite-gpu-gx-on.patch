@@ -1,0 +1,377 @@
+kunzite: Adreno 710 step 18, GX on through the GMU, slumber in the undo (kgpu=18; 1-17 unchanged).
+18 is the second half of the port map's 17: what kgsl does after gen7_hfi_start. First
+kgsl_pwrctrl_setup_default_votes: the default perf level (qcom,initial-pwrlevel 7 = 345 MHz, perf
+index 10 - 7 - 1 = 2) and the bus level (that level's qcom,bus-freq-ddr7 = 2), each an
+H2F_MSG_GX_BW_PERF_VOTE (30; ack_type block; the other field 0xff; no GMU AB vote, so the AB half
+is 0xffff). Then gen7_gpu_boot's gen7_gmu_oob_set(oob_gpu): HOST2GMU_INTR_SET bit 30,
+GMU2HOST_INTR_INFO bit 31 for up to 100 ms, cleared. GX is judged by GFX_PWR_CLK_STATUS (bit 0 GDSC
+off, bit 1 clock off; kgsl gen7_gmu_gx_is_on); only when it says on are RBBM_STATUS, CP_STATUS_1
+and CP2GMU_STATUS read (the GPU block's first 16K, mapped here). The undo, in kgsl's power-off
+order: the OOB clear (bit 31), then gen7_gmu_power_off: lowest idle (GPU_HW_ACTIVE, IFPC off), the
+RSCC's ten TCS DRV0 status bits, H2F_MSG_PREPARE_SLUMBER (33; bw 2, freq 2), fence allow and FAL
+next, CX busy bit 30 clear, gen7_rscc_sleep_sequence (CM3 into reset, RSCC_CONTROL_REQ 1, RSCC
+STATUS0 bit 16, REQ 0), and if GX still reads on, its GDSC collapsed from here
+(gen7_gmu_pwrctrl_suspend's last resort). Two new undo kinds: SLUMBER, and UNMAP for step 17's HFI
+alias, which now stays mapped until the undo (pushed before its CM3 entry, so it goes after the
+GMU is stopped). The HFI helpers print the running step's number (the slumber message is sent from
+the undo).
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index b3b3369..76be103 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -5,9 +5,9 @@
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+  * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write;
+  * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
+- * channel and starts HFI; 17 talks to it.
++ * channel and starts HFI; 17 talks to it; 18 has it power GX.
+  *
+- * Boot-arg kgpu=N (N <= 17) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 18) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -97,7 +97,12 @@
+  *     the perf table (legacy, HFI 2.1; ARC votes from cmd-db, FDT bin 0xc6
+  *     levels), the bus table (BCMs SH0/MC0/ACV and CN0 from cmd-db, FDT
+  *     LPDDR4X table), IFPC/ACD/BCL off, core fw start; each acked with
+- *     result 0. Undo: the CM3 into reset before step 16's words go back.
++ *     result 0. Undo: the CM3 into reset before step 16's words go back;
++ *     the HFI alias stays mapped until then (step 18 needs it).
++ *  18 the port map's 17, second half: kgsl's default votes (perf 2 = 345
++ *     MHz, bus 2) as H2F_MSG_GX_BW_PERF_VOTE, then OOB_GPU set: the GMU
++ *     powers GX; RBBM/CP registers read only once GFX_PWR_CLK_STATUS says
++ *     on. Undo: OOB clear, then slumber (kgsl gen7_gmu_power_off).
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -283,10 +288,13 @@ void kunzite_adreno_init(void);
+ #define KG_DB_ENTRY      24u
+ #define KG_DB_ARC        3u
+ 
+-enum kg_undo_kind { KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC, KG_UNDO_KFREE, KG_UNDO_CM3 };
++enum kg_undo_kind {
++	KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC, KG_UNDO_KFREE, KG_UNDO_CM3, KG_UNDO_UNMAP,
++	KG_UNDO_SLUMBER,
++};
+ 
+ static struct {
+-	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc, smmu;
++	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc, smmu, gpu;
+ 	uint32_t smmu_page, smmu_pages, smmu_cbs, smmu_smrs;
+ 	int gpu_cb;                     /* the HLOS context stream 0 (GPU) is matched to, or -1 */
+ 	unsigned last, pause_ms, delay_s, hold_s, step, speed_bin;
+@@ -389,6 +397,8 @@ kg_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned m
+ 	return (kg_rd(base, off) & mask) == want;
+ }
+ 
++static void kg_slumber(void);
++
+ /* undo the newest write on the list (the end of the run does all of them, in reverse) */
+ static void
+ kg_undo_pop(void)
+@@ -429,6 +439,13 @@ kg_undo_pop(void)
+ 		kmem_free(kernel_map, base, value);
+ 		printf("SWEET KGPU: undo %s: freed %#x bytes\n", name, value);
+ 		return;
++	case KG_UNDO_UNMAP:             /* an alias of ours (ml_io_map_unmappable): base = address, value = size */
++		ml_io_unmap(base, value);
++		printf("SWEET KGPU: undo %s: unmapped %#x bytes\n", name, value);
++		return;
++	case KG_UNDO_SLUMBER:           /* the GMU powers the GPU down (step 18) */
++		kg_slumber();
++		return;
+ 	}
+ 	printf("SWEET KGPU: undo %s +%#x: now %#x\n", name, off, kg_rd(base, off));
+ }
+@@ -1419,6 +1436,7 @@ static unsigned kg_gmu_nmem;
+ static bool kg_gmu_loaded;               /* step 14 got through, in this run */
+ static bool kg_gmu_runs;                 /* step 15 got FW_INIT_RESULT 0x100 */
+ static bool kg_hfi_up;                   /* step 16 got through */
++static bool kg_hfi_talks;                /* step 17 got through: the HFI alias stays until the undo */
+ 
+ /* [a, a + s) inside [base, base + len) */
+ static bool
+@@ -2162,8 +2180,8 @@ kg_hfi_read(unsigned qi, uint32_t *m)
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	uint32_t n = r < size ? (kg_hfi_queue[qi][r] >> 8) & 0xffu : 0;
+ 	if (size != 0x1000u / 4 || n == 0 || n > KG_HFI_RCVD_MAX) {
+-		printf("SWEET KGPU: 17 hfi queue %u: r/w %u/%u size %u, message of %u words: dropping what is queued\n",
+-		    qi, r, w, size, n);
++		printf("SWEET KGPU: %u hfi queue %u: r/w %u/%u size %u, message of %u words: dropping what is queued\n",
++		    kg.step, qi, r, w, size, n);
+ 		h->read_index = w;
+ 		return false;
+ 	}
+@@ -2182,7 +2200,7 @@ kg_hfi_show(unsigned qi, const uint32_t *m)
+ 	uint32_t id = m[0] & 0xffu, type = (m[0] >> 16) & 0xfu;
+ 
+ 	if (type == KG_HFI_TYPE_ACK) {
+-		printf("SWEET KGPU: 17   q%u ack %#x for %#x: result %#x %#x\n", qi, m[0], m[1], m[2], m[3]);
++		printf("SWEET KGPU: %u   q%u ack %#x for %#x: result %#x %#x\n", kg.step, qi, m[0], m[1], m[2], m[3]);
+ 	} else if (id == KG_F2H_ERR) {
+ 		char text[17];
+ 		memcpy(text, &m[2], 16);
+@@ -2190,11 +2208,11 @@ kg_hfi_show(unsigned qi, const uint32_t *m)
+ 			text[i] = text[i] >= 0x20 && text[i] < 0x7f ? text[i] : (text[i] == 0 ? 0 : '.');
+ 		}
+ 		text[16] = 0;
+-		printf("SWEET KGPU: 17   q%u GMU ERROR %u %u \"%s\"\n", qi, m[1] >> 16, m[1] & 0xffffu, text);
++		printf("SWEET KGPU: %u   q%u GMU ERROR %u %u \"%s\"\n", kg.step, qi, m[1] >> 16, m[1] & 0xffffu, text);
+ 	} else if (id == KG_F2H_DEBUG) {
+-		printf("SWEET KGPU: 17   q%u debug type %u timestamp %#x data %#x\n", qi, m[1], m[2], m[3]);
++		printf("SWEET KGPU: %u   q%u debug type %u timestamp %#x data %#x\n", kg.step, qi, m[1], m[2], m[3]);
+ 	} else {
+-		printf("SWEET KGPU: 17   q%u message %#x: %#x %#x %#x\n", qi, m[0], m[1], m[2], m[3]);
++		printf("SWEET KGPU: %u   q%u message %#x: %#x %#x %#x\n", kg.step, qi, m[0], m[1], m[2], m[3]);
+ 	}
+ }
+ 
+@@ -2221,7 +2239,7 @@ kg_hfi_cmd(const char *what, uint32_t *cmd, uint32_t dwords)
+ 	uint32_t space = w >= r ? size - (w - r) : r - w;
+ 
+ 	if (w >= size || space <= align) {
+-		printf("SWEET KGPU: 17 %s: no room in the command queue (r/w %u/%u)\n", what, r, w);
++		printf("SWEET KGPU: %u %s: no room in the command queue (r/w %u/%u)\n", kg.step, what, r, w);
+ 		return false;
+ 	}
+ 	kg_hfi_seq = (kg_hfi_seq + 1u) & 0xfffu;
+@@ -2233,8 +2251,8 @@ kg_hfi_cmd(const char *what, uint32_t *cmd, uint32_t dwords)
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	h->write_index = w;
+-	printf("SWEET KGPU: 17 send %s: hdr %#x, %u words, command queue w %u; HOST2GMU_INTR_SET 1\n", what, sent,
+-	    dwords, w);
++	printf("SWEET KGPU: %u send %s: hdr %#x, %u words, command queue w %u; HOST2GMU_INTR_SET 1\n", kg.step, what,
++	    sent, dwords, w);
+ 	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_HOST2GMU_INTR_SET), 1);
+ 
+ 	uint32_t info = 0, init = 0;
+@@ -2248,8 +2266,8 @@ kg_hfi_cmd(const char *what, uint32_t *cmd, uint32_t dwords)
+ 		delay(100);
+ 	}
+ 	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_GMU2HOST_INTR_CLR), KG_HFI_MSGQ);
+-	printf("SWEET KGPU: 17   after %u.%u ms: gmu2host_intr_info %#x fw_init_result %#x; command queue r %u, "
+-	    "message queue r/w %u/%u\n", t / 10, t % 10, info, init, h->read_index, kg_hfi->q[1].read_index,
++	printf("SWEET KGPU: %u   after %u.%u ms: gmu2host_intr_info %#x fw_init_result %#x; command queue r %u, "
++	    "message queue r/w %u/%u\n", kg.step, t / 10, t % 10, info, init, h->read_index, kg_hfi->q[1].read_index,
+ 	    kg_hfi->q[1].write_index);
+ 
+ 	uint32_t m[KG_HFI_RCVD_MAX], result = ~0u;
+@@ -2263,7 +2281,7 @@ kg_hfi_cmd(const char *what, uint32_t *cmd, uint32_t dwords)
+ 	}
+ 	kg_hfi_drain(2);
+ 	if (!acked || result != 0) {
+-		printf("SWEET KGPU: 17 %s: %s\n", what, !acked ? "NO ACK" : "the GMU refuses it (result not 0)");
++		printf("SWEET KGPU: %u %s: %s\n", kg.step, what, !acked ? "NO ACK" : "the GMU refuses it (result not 0)");
+ 	}
+ 	return acked && result == 0;
+ }
+@@ -2312,6 +2330,7 @@ kg_step17(void)
+ 	for (unsigned i = 0; i < 3; i++) {
+ 		kg_hfi_queue[i] = (volatile uint32_t *)(alias + KG_HFI_QOFF(i));
+ 	}
++	kg_undo_push(KG_UNDO_UNMAP, alias, 0, KG_GMU_HFI_SIZE, "hfi uncached alias");
+ 	kg_undo_push(KG_UNDO_CM3, kg.gmu, KG_GMU_OFF(GEN7_GMU_CM3_SYSRESET), 1,
+ 	    "cm3_sysreset (into reset before the RSC/PDC words go back)");
+ 	printf("SWEET KGPU: 17 hfi memory %#llx, uncached alias; hfi_ctrl_status %#x gmu2host_intr_info %#x mask %#x; "
+@@ -2358,11 +2377,163 @@ out:;
+ 	ok = ok && (init & 0xe00u) == 0 && !(kg_rd(kg.smmu, cb + SMMU_CB_FSR) & SMMU_FSR_ALL);
+ 	printf("SWEET KGPU: 17 %s\n", ok ? "THE GMU ANSWERS OVER HFI: tables taken, core firmware started" :
+ 	    "HFI did not get through (see above)");
+-	kg_hfi = NULL;
+-	ml_io_unmap(alias, KG_GMU_HFI_SIZE);
++	kg_hfi_talks = ok;
+ 	return ok;
+ }
+ 
++/* ---- step 18: GX on (the port map's 17, its second half) ---- */
++
++#define GEN7_GMU_CX_GMU_POWER_COUNTER_ENABLE 0x1f840
++#define GEN7_GMU_RSCC_CONTROL_REQ        0x23b07
++#define GEN7_CP_CP2GMU_STATUS            0x812
++#define GEN7_CP_STATUS_1                 0x825
++#define GEN7_RBBM_STATUS                 0x210
++#define KG_GPU_REGS      0x4000u         /* RBBM/CP registers (GX side), read only while GX is on */
++#define KG_H2F_GX_BW_PERF_VOTE 30u
++#define KG_H2F_PREPARE_SLUMBER 33u
++#define KG_DCVS_ACK_BLOCK 1u
++#define KG_DCVS_NONE     0xffu           /* INVALID_DCVS_IDX */
++#define KG_BW_NO_AB      0xffff0000u     /* adreno_gmu_bus_ab_quantize without a GMU AB vote */
++#define KG_PERF_DEFAULT  2u              /* gpu_level_num 10 - qcom,initial-pwrlevel 7 - 1: 345 MHz */
++#define KG_BUS_DEFAULT   2u              /* pwrlevel 7's qcom,bus-freq-ddr7 */
++#define KG_OOB_GPU_SET   (1u << 30)      /* kgsl gen7_gmu_oob_set(oob_gpu): HOST2GMU_INTR_SET BIT(30 - 2 req) */
++#define KG_OOB_GPU_ACK   (1u << 31)      /* GMU2HOST_INTR_INFO BIT(31 - req) */
++#define KG_OOB_GPU_CLEAR (1u << 31)      /* gen7_gmu_oob_clear: BIT(31 - 2 req) */
++
++/* GEN7_RSCC_TCS0..9_DRV0_STATUS */
++static const uint32_t kg_rscc_tcs_status[10] = {
++	0x346, 0x3ee, 0x496, 0x53e, 0x5e6, 0x68e, 0x736, 0x7de, 0x886, 0x92e,
++};
++
++/* kgsl gen7_gmu_gx_is_on: GFX_PWR_CLK_STATUS bit 0 = GX GDSC off, bit 1 = GX clock off */
++static bool
++kg_gx_on(void)
++{
++	return (kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS) & 3u) == 0;
++}
++
++static void
++kg_gx_state(const char *when)
++{
++	uint32_t s = kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS);
++	printf("SWEET KGPU: %u gx %s: gfx_pwr_clk_status %#x (gdsc %s, clock %s), gx gdscr %#x, rpmh_power_state %#x, "
++	    "cx_busy %#x\n", kg.step, when, s, (s & 1u) ? "off" : "on", (s & 2u) ? "off" : "on",
++	    kg_rd(kg.gpucc, KG_GX_GDSCR), kg_gmu(GEN7_GMU_RPMH_POWER_STATE), kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS));
++}
++
++/*
++ * The undo of step 18, after the OOB clear: kgsl gen7_gmu_power_off. The
++ * lowest idle level (GPU_HW_ACTIVE: IFPC off), the RSC's TCSes done,
++ * H2F_MSG_PREPARE_SLUMBER (the GMU takes GX down and its votes to the
++ * slumber levels), the GPU idle, then gen7_rscc_sleep_sequence: the CM3
++ * into reset and the RSC handing the votes to the PDC. If GX still reads on,
++ * gen7_gmu_pwrctrl_suspend's last resort: its GDSC collapsed from here. The
++ * GBIF halt, the HFI alias, clocks and CX follow from the rest of the undo.
++ */
++static void
++kg_slumber(void)
++{
++	unsigned busy = 0;
++
++	printf("SWEET KGPU: undo slumber: rpmh_power_state %#x (lowest idle: 0, GPU_HW_ACTIVE)\n",
++	    kg_gmu(GEN7_GMU_RPMH_POWER_STATE));
++	for (unsigned i = 0; i < 10; i++) {
++		busy += !kg_poll(kg.rscc, 4u * kg_rscc_tcs_status[i], 1u, 1u, 2);
++	}
++	printf("SWEET KGPU: undo slumber: rscc tcs %u of 10 still busy after 2 ms each\n", busy);
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_CX_GMU_POWER_COUNTER_ENABLE), 0);
++	if (kg_hfi != NULL) {
++		uint32_t req[3] = { KG_H2F_PREPARE_SLUMBER, KG_BW_NO_AB | KG_BUS_DEFAULT, KG_PERF_DEFAULT };
++		(void)kg_hfi_cmd("prepare slumber", req, 3);
++	}
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_AO_AHB_FENCE_CTRL), 0);
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_CX_FALNEXT_INTF), 1);
++	bool idle = kg_poll(kg.gmu, KG_GMU_OFF(GEN7_GMU_AO_GPU_CX_BUSY_STATUS), 1u << 30, 0, 100);
++	kg_gx_state("after prepare slumber");
++
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_CM3_SYSRESET), 1);
++	uint32_t wptr = kg_gmu(GEN7_GMU_GENERAL_9);
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_RSCC_CONTROL_REQ), 1);
++	bool slept = kg_poll(kg.rscc, 4u * GEN7_RSCC_RSC_STATUS0_DRV0, 1u << 16, 1u << 16, 100);
++	uint32_t status0 = kg_rd(kg.rscc, 4u * GEN7_RSCC_RSC_STATUS0_DRV0);
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_RSCC_CONTROL_REQ), 0);
++	printf("SWEET KGPU: undo slumber: gpu %s; cm3 into reset (log wptr %u); rsc sleep %s (status0 %#x, "
++	    "control_ack %#x)\n", idle ? "idle" : "STILL BUSY", wptr, slept ? "done" : "NOT DONE", status0,
++	    kg_gmu(GEN7_GMU_RSCC_CONTROL_ACK));
++	kg_gx_state("after the rsc sleep");
++	if (kg_gx_on()) {
++		printf("SWEET KGPU: undo slumber: GX STILL ON: its GDSC collapsed from here\n");
++		kg_wr(kg.gpucc, KG_GX_GDSCR, kg_rd(kg.gpucc, KG_GX_GDSCR) | KG_GDSC_COLLAPSE);
++		(void)kg_poll(kg.gpucc, KG_GX_GDSCR, KG_GDSC_PWR_ON, 0, 100);
++		kg_gx_state("after the collapse");
++	}
++}
++
++/*
++ * kgsl after gen7_hfi_start: kgsl_pwrctrl_setup_default_votes (the default
++ * perf level, then the bus level, as H2F_MSG_GX_BW_PERF_VOTE), then
++ * gen7_gpu_boot's gen7_gmu_oob_set(oob_gpu): the GMU powers GX. GX
++ * registers are read only once GFX_PWR_CLK_STATUS says on. Undo, in this
++ * order: the OOB clear, then the slumber above.
++ */
++static bool
++kg_step18(void)
++{
++	if (!kg_hfi_talks || kg_hfi == NULL) {
++		printf("SWEET KGPU: 18 needs steps 1-17 (the GMU talking HFI in this run)\n");
++		return false;
++	}
++	kg_announce(18, "the GX state before the GMU is asked for it");
++	kg_gx_state("before");
++	if (kg_gx_on()) {
++		printf("SWEET KGPU: 18 GX is already on: not asking for it\n");
++		return false;
++	}
++	kg.gpu = kg_map("GPU", KG_GPU_PA, KG_GPU_REGS);
++	if (kg.gpu == 0) {
++		return false;
++	}
++
++	kg_next(18, "kgsl_pwrctrl_setup_default_votes: H2F_MSG_GX_BW_PERF_VOTE perf 2 (345 MHz), then bus 2 "
++	    "(DDR 2136718 KBps)");
++	uint32_t perf[4] = { KG_H2F_GX_BW_PERF_VOTE, KG_DCVS_ACK_BLOCK, KG_PERF_DEFAULT, KG_BW_NO_AB | KG_DCVS_NONE };
++	uint32_t bus[4] = { KG_H2F_GX_BW_PERF_VOTE, KG_DCVS_ACK_BLOCK, KG_DCVS_NONE, KG_BW_NO_AB | KG_BUS_DEFAULT };
++	if (!kg_hfi_cmd("default perf vote", perf, 4) || !kg_hfi_cmd("default bus vote", bus, 4)) {
++		return false;
++	}
++	kg_gx_state("after the votes");
++
++	kg_next(18, "OOB_GPU (kgsl gen7_gmu_oob_set: HOST2GMU_INTR_SET bit 30, then GMU2HOST_INTR_INFO bit 31 for up "
++	    "to 100 ms): THE GMU POWERS GX");
++	kg_undo_push(KG_UNDO_SLUMBER, kg.gmu, 0, 0, "slumber");
++	kg_undo_push(KG_UNDO_WORD, kg.gmu, KG_GMU_OFF(GEN7_GMU_HOST2GMU_INTR_SET), KG_OOB_GPU_CLEAR,
++	    "oob_gpu clear (host2gmu_intr_set bit 31)");
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_HOST2GMU_INTR_SET), KG_OOB_GPU_SET);
++	bool acked = kg_poll(kg.gmu, KG_GMU_OFF(GEN7_GMU_GMU2HOST_INTR_INFO), KG_OOB_GPU_ACK, KG_OOB_GPU_ACK, 100);
++	uint32_t info = kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO);
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_GMU2HOST_INTR_CLR), KG_OOB_GPU_ACK);
++	printf("SWEET KGPU: 18 oob_gpu %s: gmu2host_intr_info %#x fw_init_result %#x\n", acked ? "acked" :
++	    "NOT ACKED in 100 ms", info, kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT));
++	kg_hfi_drain(1);
++	kg_hfi_drain(2);
++	kg_gx_state("after oob_gpu");
++
++	bool gx = kg_gx_on();
++	if (gx) {
++		kg_announce(18, "GX registers (GX is on): RBBM_STATUS, CP_STATUS_1, CP2GMU_STATUS");
++		printf("SWEET KGPU: 18 rbbm_status %#x cp_status_1 %#x cp2gmu_status %#x\n",
++		    kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_STATUS_1),
++		    kg_rd(kg.gpu, 4u * GEN7_CP_CP2GMU_STATUS));
++	}
++	uint32_t cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page;
++	printf("SWEET KGPU: 18 rscc seq_busy %#x control_ack %#x; cb1 fsr %#x; gmu log %u words\n",
++	    kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0), kg_gmu(GEN7_GMU_RSCC_CONTROL_ACK),
++	    kg_rd(kg.smmu, cb + SMMU_CB_FSR), kg_gmu_log_words());
++	printf("SWEET KGPU: 18 %s\n", acked && gx ? "GX IS ON: the GMU powered the 3D core" :
++	    acked ? "the GMU acks OOB_GPU, but GX reads off" : "the GMU does not ack OOB_GPU");
++	return acked && gx;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -2394,14 +2565,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -2436,12 +2607,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 17 ? 17u : (unsigned)last;
++	kg.last = last > 18 ? 18u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 17) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..17 exist; running those\n", last);
++	if (last > 18) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..18 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);

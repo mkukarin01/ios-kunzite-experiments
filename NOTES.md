@@ -502,6 +502,32 @@ CM3 entry again, frees, stream 5 unrouted, CX down; "run over". System as #37 (a
 after hfi_start: default votes, then gen7_gmu_oob_set(OOB_GPU) - the GMU turns GX on), then step
 18 (3D core SMMU context, ring, SQE microcode).
 
+**GPU STEP 18 = 0983 (2026-10-23, written, NOT built/booted), `kgpu=18`: GX on, slumber at the end.**
+kgpu numbers now run one ahead of the port map: kgpu 18 = port map 17's second half (power the 3D
+core); the port map's 18 (3D core SMMU context, ring, SQE) becomes kgpu 19. Read from kgsl:
+gen7_hfi_start ends with kgsl_pwrctrl_setup_default_votes = gpu_clock_set(default_pwrlevel) ->
+gen7_gmu_dcvs_set(perf idx = gpu_level_num - level - 1) and kgsl_pwrctrl_axi(on) ->
+kgsl_bus_update(VOTE_ON): buslevel = min(pwrlevels[0].bus_max, pwrlevels[default].bus_freq), ab
+= 25% of ib (MBps; goes to Linux icc, not the GMU, without gmu_ab) -> gen7_gmu_bus_set ->
+dcvs_set; both as H2F_MSG_GX_BW_PERF_VOTE {hdr, ack_type 1, freq, bw} with bw = level |
+0xffff0000 (adreno_gmu_bus_ab_quantize without gmu_ab). Bin 0xc6: initial-pwrlevel 7 (345 MHz),
+bus-freq-ddr7 2, bus-max-ddr7 of level 0 = 8 -> perf {freq 2, bw 0xffff00ff}, bus {freq 0xff, bw
+0xffff0002}. gen7_gpu_boot: kgsl_mmu_start, gen7_gmu_oob_set(oob_gpu) = HOST2GMU_INTR_SET BIT(30),
+poll GMU2HOST_INTR_INFO BIT(31) 100 ms, clear BIT(31); then H2F_MSG_START (10), gen7_start,
+rb_start ... oob_clear = HOST2GMU_INTR_SET BIT(31). Power off (gen7_power_off ->
+gen7_gmu_power_off): wait_for_lowest_idle (RPMH_POWER_STATE == idle_level, 0 = ACTIVE without
+IFPC), complete_rpmh_votes (RSCC TCS0..9 DRV0 STATUS bit 0, 2 ms), notify_slumber
+(POWER_COUNTER_ENABLE 0x1f840 = 0, H2F_MSG_PREPARE_SLUMBER {hdr, bw, freq} = {.., 0xffff0002, 2},
+AO_AHB_FENCE_CTRL 0, FALNEXT 1), wait_for_idle (AO_GPU_CX_BUSY_STATUS bit 30 clear, 100 ms),
+rscc_sleep_sequence (CM3_SYSRESET 1, read GENERAL_9, RSCC_CONTROL_REQ 0x23b07 = 1, RSCC STATUS0
+bit 16 within 100 ms, REQ 0), gen7_halt_gbif, irq off, clocks, CX off. 0983 does the votes, the
+OOB set (undo: the OOB clear, then this power-off as a SLUMBER undo entry; GX GDSC collapsed from
+our side if GX still reads on), reads RBBM_STATUS 0x210 / CP_STATUS_1 0x825 / CP2GMU_STATUS 0x812
+only if GFX_PWR_CLK_STATUS bits 1:0 are 0. Step 17's HFI alias now stays until the undo (UNMAP
+entry before its CM3 entry). Undo peaks at 43. H2F_MSG_START is left for kgpu 19. Success line:
+"GX IS ON: the GMU powered the 3D core". Verified: 225 patches, series reproduces the file,
+syntax clean. **Test:** #38 image with `kgpu=18`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
