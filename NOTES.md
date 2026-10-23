@@ -35,7 +35,23 @@ copyin) and the early `return 0` exits. Before the merge op 4 was always ENOENT 
 default) -> clean skip. **Fix = 0970-kunzite-sandbox-container-enoent.patch** (2026-10-23): op 4
 returns ENOENT on every no-answer path. Applied in series order (only 0936 touches the file),
 the result matches the edit; xnu/patches now holds 212 patches. NOT compiled locally (no swiftlang clang, no CI log for xnu-cc.py) and NOT built by CI yet.
-Probably an upstream topaz bug too. Any other sandbox_container_path_* caller gets
+Probably an upstream topaz bug too.
+
+**BOOT #26 (2026-10-23 15:55, shim/out/shim-boot-26.img = #25 shim + ADT + cmdline, kernel CI
+39941218932 @ aca67b0 sha256 87e73ec0..., 0970 confirmed in the binary: every no-answer exit
+loads w21=2 before returning): 0970 WORKS.** Log: temp/ios-m8/usblog/live-boot26-20261023-1556.txt
+(starts mid-boot; a manual "replay" request appended the kernel start from line ~2184; a
+listener started BEFORE fastboot boot misses the replay, because its requests go out before ue0
+is up). In 12+ min: syncdefaultsd and webbookmarksd ran without a crash (agent /ps: still their
+first pids, 115 and 225; #25 had 12 syncdefaultsd aborts within 2 min and the first
+webbookmarksd one at ~5 min). Only new report: **Preferences SIGSEGV at pc 0** in Settings ->
+Notifications (crash-boot26/): MobileIcons -> +[CIContext _MI_sharedIconCompositorContext] ->
+internalContextWithEAGLContext -> CI::GLContext::GLContext calls a NULL GL entry point. That is
+CoreImage taking the OpenGL ES road with no GL behind it (no GPU, empty IOAcceleratorES 0138).
+Not container-path related. Unknown whether pre-merge kernels crash the same way; untested.
+The GPU port (or HackiOS's eagl) is the real fix. Report counter suffixes (.000N) restart each
+boot, and the epoch clock repeats (16:03 = launchd start every boot): tell boots apart by
+file set, not by name. Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
