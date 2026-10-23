@@ -35,6 +35,11 @@ copyin) and the early `return 0` exits. Before the merge op 4 was always ENOENT 
 default) -> clean skip. Fix: op 4 must return ENOENT on every no-answer path (a kunzite patch
 after 0969; probably an upstream topaz bug too). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
+Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
++[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
+slice 0x10000b9cc-0x10000b9e4: the path is _SFSafariIconImageCacheDirectoryPath(), derived from
+_SFSafariContainerPath; the binary imports sandbox_container_path_for_pid. Very likely the same
+cause; not traced inside the dyld-cache framework. Copies are in the same crash-boot25/ dir.
 
 **What to expect (read from the merged code, not seen on the phone yet):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
