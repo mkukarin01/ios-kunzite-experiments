@@ -670,6 +670,28 @@ the GPU runs commands and writes memory, out of secure mode, on this kernel unde
 NEXT (kgpu 22 = the port map's 22): a picture - the GPU fills a buffer (CP_MEM_WRITE runs, or a
 blit/2D clear) that ends up on the splash framebuffer (0xb8000000), as hk did on redwood.
 
+**GPU STEP 22 = 0987 (2026-10-24, written, NOT built/booted), `kgpu=22` (the port map's 22): a
+picture.** hk's redwood_adreno.c step 22 (temp/kunzite-research/hackios-xnu-kernel/.../
+redwood_adreno.c: 2D solid fill x3 with the a6xx register names, CP_BLIT, flushes, then
+MiniIOMobileFramebufferShow). For a7xx the register database and Mesa's a7xx paths were fetched to
+temp/gpu-plan-review/regdb-2026-10-24/ (Linux a6xx.xml, adreno_pm4.xml, a6xx_enums.xml,
+adreno_common.xml; Mesa fd6_emit.h/.cc, fd6_gmem.cc, freedreno_devices.py, fd6_gmem_cache.h,
+freedreno_gpu_event.h). a7xx differences from hk's a6xx code: SP_A2D_OUTPUT_INFO at 0xa9bf (not
+0xacc0); TPL1_A2D_BLT_CNTL 0xb2d2 (type 2D) is new; RB_CCU_CNTL lost its cache fields to
+RB_CCU_CACHE_CNTL 0x88e5; events are CP_EVENT_WRITE7 (0x46) with CCU_CLEAN_COLOR 0x21,
+CACHE_CLEAN 0x31, CCU_INVALIDATE_COLOR 0x19, DEBUG_LABEL 0x3f (Mesa's FD_LABEL before CP_BLIT);
+the a2d IFMT field is 3 bits with R2D_UNORM8 = 0 (hk's 0x10 << 24 is the older 5-bit encoding).
+Mesa's FD710 (chip 0x07010000): a7xx_base + a7xx_gen1, num_ccu 1, hbb 15; sysmem CCU: depth 256K
+at 0, colour 64K at 256K -> RB_CCU_CACHE_CNTL 0x20000000. Mesa also writes a710_raw_magic_regs
+at context setup; hk did not on a6xx and 0987 does not either (first thing to add if the blit
+hangs or draws garbage). The panel: AppleCLCD 1080x2400 stride 4320 at 0xb8000000, scanned out
+directly (VIG0/CTL0 unmapped on kunzite, no flipping); 4320 is not a multiple of 64 (the 2D
+pitch's unit), so the GPU draws into rows of 4352 and the CPU copies. Pool 16 tables (14 used
+expected). Undo peaks at 53. Success lines: "22 ... 0 of N samples wrong" and "A PICTURE DRAWN
+BY THE GPU IS ON THE PANEL: orange, white, blue from the top (held 15 s)" - **watch or film the
+panel during those 15 s**. Verified: 229 patches, series reproduces the file, syntax clean.
+**Test:** #42 image with `kgpu=22`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still

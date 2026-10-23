@@ -1,0 +1,357 @@
+kunzite: Adreno 710 step 22, a picture drawn by the GPU on the panel (kgpu=22; the port map's 22).
+hk's redwood step 22 (three 2D solid fills, then the framebuffer shows the result), redone for
+a7xx after Mesa's fd6_blitter.cc (fd6_clear_surface, emit_blit_setup, emit_blit_fini with CHIP =
+A7XX) and Linux's registers/adreno/a6xx.xml + adreno_pm4.xml (copies of both, and of the Mesa
+sources used, in the main repo's temp/gpu-plan-review/regdb-2026-10-24): a 1080x2400 picture of
+ours (rows of 4352 bytes) mapped for the GPU at 0xe0200000 (5 more tables: the pool grows to 16),
+TLBIASID + sync on context 0. Command stream (type4/type7 packets built with
+pm4_calc_odd_parity_bit): CP_EVENT_WRITE7 CCU_INVALIDATE_COLOR; CP_SET_MARKER RM6_BLIT2DSCALE;
+RB_CCU_CACHE_CNTL 0x20000000 (sysmem: 1 CCU, depth cache 256K at 0, colour at 256K, both full);
+per band RB/GRAS_A2D_BLT_CNTL 0x00f03080 (solid, FMT6_8_8_8_8_UNORM, mask 0xf, R2D_UNORM8),
+TPL1_A2D_BLT_CNTL 0x20000000 (a7xx), SP_A2D_OUTPUT_INFO 0xf180 at its a7xx offset 0xa9bf,
+RB_A2D_PIXEL_CNTL 0, the TPL1 source and GRAS source registers zeroed, RB_A2D_CLEAR_COLOR_DW0-3
+= R, G, B, 255, RB_A2D_DEST_BUFFER_INFO 0x430 (8888, linear, WXYZ: blue first), BASE, PITCH
+4352/64, GRAS_A2D_DEST_TL/BR, CP_EVENT_WRITE7 DEBUG_LABEL, CP_BLIT BLIT_OP_SCALE; three bands
+(orange 0-800, white 800-1600, blue 1600-2400, hk's); then CCU_CLEAN_COLOR, CACHE_CLEAN,
+CP_WAIT_FOR_IDLE and a CP_MEM_WRITE marker 0x6b677022 (scratch +0x104) + CP_WAIT_MEM_WRITES,
+submitted with step 21's helper (now printing the running step). Checked from our side: the
+marker, three named pixels, and every 50th row at 3 columns against its band's colour. Then the
+picture is copied row by row (4320 bytes of each 4352) into the panel memory 0xb8000000 (the ABL
+splash buffer that AppleCLCD presents into and the display controller scans out; an unmappable
+write-combining alias, unmapped after), again every 250 ms for 15 s since iOS's presenter draws
+there too. Undo: the picture's memory freed; the panel keeps it until iOS draws again.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 69ea14c..5f483ff 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -7,9 +7,10 @@
+  * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
+  * channel and starts HFI; 17 talks to it; 18 has it power GX; 19 gives the
+  * GPU its SMMU context, ring and microcode; 20 loads the zap shader and
+- * starts the CP; 21 takes it out of secure mode and has it write a word.
++ * starts the CP; 21 takes it out of secure mode and has it write a word;
++ * 22 has it draw a picture, shown on the panel.
+  *
+- * Boot-arg kgpu=N (N <= 21) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 22) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -71,7 +72,7 @@
+  *     signature (qcom_mdt_pas_init / qcom_scm_pas_init_image). Nothing is
+  *     loaded or started; the page is not touched again.
+  *  13 routes stream 5 (the GMU) through HLOS SMR/S2CR entry 1 and context 1
+- *     with page tables of ours (3 levels, 4K, 39-bit, from a pool of 12 made
++ *     with page tables of ours (3 levels, 4K, 39-bit, from a pool of 16 made
+  *     here; one test page at the GMU's 0x7ffff000): arm-smmu context programming as hk did on redwood;
+  *     checks the readbacks, fault status and a TLB sync. Undone at the end as
+  *     Linux releases a context: stream 5 unrouted (SMR 0, S2CR fault), CB1
+@@ -117,6 +118,9 @@
+  *  21 the port map's 21: CP_SET_SECURE_MODE 0 through the ring, then
+  *     CP_MEM_WRITE 0x6b677021 to the scratch page + CP_WAIT_MEM_WRITES,
+  *     RPTR = WPTR and idle after each, the word read back. No new undo.
++ *  22 the port map's 22: three 2D fills (Mesa's a7xx clear path) into a
++ *     1080x2400 picture at GPU 0xe0200000, caches cleaned, samples checked,
++ *     then copied to the panel memory 0xb8000000 for 15 s.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -1252,7 +1256,7 @@ kg_to_memory(vm_offset_t start, vm_size_t size)
+  * on, so no table is allocated (or freed) while the SMMU may walk them; the
+  * pool's pages are freed at the end, after stream 5 is unrouted.
+  */
+-#define KG_SPACE_TABLES  12u             /* the GMU's 7 (boot #35) and the GPU's from step 19 */
++#define KG_SPACE_TABLES  16u             /* the GMU's 7 (boot #35), the GPU's 2 (step 19), 5 for the picture (22) */
+ static struct {
+ 	uint64_t *table[KG_SPACE_TABLES];
+ 	uint64_t phys[KG_SPACE_TABLES];
+@@ -2580,7 +2584,7 @@ kg_gpu_alloc(const char *what, uint64_t va, uint32_t len)
+ 	vm_size_t alloc = ((vm_size_t)size + PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
+ 
+ 	if (kmem_alloc(kernel_map, &mem, alloc, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+-		printf("SWEET KGPU: 19 no memory for the %s\n", what);
++		printf("SWEET KGPU: %u no memory for the %s\n", kg.step, what);
+ 		return 0;
+ 	}
+ 	kg_undo_push(KG_UNDO_KFREE, mem, 0, (uint32_t)alloc, what);
+@@ -2589,7 +2593,7 @@ kg_gpu_alloc(const char *what, uint64_t va, uint32_t len)
+ 			return 0;
+ 		}
+ 	}
+-	printf("SWEET KGPU: 19 GPU %#llx..%#llx -> memory %#llx (%s)\n", va, va + size, kvtophys(mem), what);
++	printf("SWEET KGPU: %u GPU %#llx..%#llx -> memory %#llx (%s)\n", kg.step, va, va + size, kvtophys(mem), what);
+ 	return mem;
+ }
+ 
+@@ -3108,6 +3112,8 @@ kg_step20(void)
+ #define KG_GPU_WORD_OFF  0x100u          /* in the scratch page, after the rptr shadow */
+ #define KG_GPU_WORD      0x6b677021u     /* "!pgk" */
+ 
++static bool kg_gpu_wrote;               /* step 21 got through */
++
+ /*
+  * Words appended to the ring at WPTR (no wrap: the ring is 8K words), WPTR
+  * moved past them (gen7_ringbuffer_submit; the fence is in allow mode),
+@@ -3122,7 +3128,7 @@ kg_cp_submit(const char *what, const uint32_t *cmds, uint32_t n)
+ 	unsigned t;
+ 
+ 	if (rb == 0 || kg_rb_wptr == 0 || kg_rb_wptr + n > KG_RB_SIZE / 4) {
+-		printf("SWEET KGPU: 21 no room in the ring for %s\n", what);
++		printf("SWEET KGPU: %u no room in the ring for %s\n", kg.step, what);
+ 		return false;
+ 	}
+ 	memcpy((uint32_t *)rb + kg_rb_wptr, cmds, 4u * n);
+@@ -3139,8 +3145,8 @@ kg_cp_submit(const char *what, const uint32_t *cmds, uint32_t n)
+ 		delay(100);
+ 	}
+ 	kg_wr(kg.gpu, 4u * GEN7_CP_SQE_STAT_ADDR, 1);
+-	printf("SWEET KGPU: 21   after %u.%u ms: rptr %u wptr %u, cx_busy %#x, fence status %#x; rbbm_status %#x int_0 %#x; "
+-	    "cp interrupt %#x hw_fault %#x protect %#x sqe_stat %#x; cb0 fsr %#x\n", t / 10, t % 10, rptr, kg_rb_wptr,
++	printf("SWEET KGPU: %u   after %u.%u ms: rptr %u wptr %u, cx_busy %#x, fence status %#x; rbbm_status %#x int_0 %#x; "
++	    "cp interrupt %#x hw_fault %#x protect %#x sqe_stat %#x; cb0 fsr %#x\n", kg.step, t / 10, t % 10, rptr, kg_rb_wptr,
+ 	    busy, fence, kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_RBBM_INT_0_STATUS),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_PROTECT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_SQE_STAT_DATA),
+@@ -3189,11 +3195,208 @@ kg_step21(void)
+ 	uint32_t got = *word;
+ 	printf("SWEET KGPU: 21 scratch word %#x (rptr shadow %u)\n", got, *(volatile uint32_t *)scratch);
+ 	bool ok = idle && got == KG_GPU_WORD;
++	kg_gpu_wrote = ok;
+ 	printf("SWEET KGPU: 21 %s\n", ok ? "THE GPU WROTE A WORD: 0x6b677021 at 0xe0008100, out of secure mode" :
+ 	    got == KG_GPU_WORD ? "the word is there, but the GPU does not go idle" : "the word is not there");
+ 	return ok;
+ }
+ 
++/* ---- step 22: a picture drawn by the GPU, on the panel (the port map's 22) ---- */
++
++/*
++ * hk's step 22 on redwood, for a7xx: the 2D engine fills a rectangle with one
++ * colour three times (Mesa fd6_blitter.cc fd6_clear_surface / emit_blit_setup
++ * / emit_blit_fini with CHIP = A7XX; register numbers and fields from Linux's
++ * registers/adreno/a6xx.xml), into memory of ours; we copy it to the panel.
++ * a7xx moves SP_A2D_OUTPUT_INFO (0xacc0 -> 0xa9bf), adds TPL1_A2D_BLT_CNTL,
++ * keeps the CCU's sysmem placement in RB_CCU_CACHE_CNTL, and takes its events
++ * as CP_EVENT_WRITE7. The panel memory (0xb8000000, 1080x2400, 4320-byte rows:
++ * not a multiple of 64, which the 2D engine's pitch must be) is what the
++ * display controller scans out; iOS's presenter writes there too.
++ */
++#define KG_PIC_W         1080u
++#define KG_PIC_H         2400u
++#define KG_PIC_ROW       4352u           /* 1088 pixels: the next multiple of 64 bytes */
++#define KG_GPU_PIC_VA    (KG_GPU_VA + 0x200000u)
++#define KG_PANEL_PA      0xb8000000u     /* the ABL splash framebuffer AppleCLCD presents into */
++#define KG_PANEL_ROW     4320u
++#define KG_SHOW_S        15u             /* the picture copied to the panel again every 250 ms for this long */
++#define KG_A2D_SOLID_8888 (1u << 7 | 0x30u << 8 | 0xfu << 20)  /* solid, FMT6_8_8_8_8_UNORM, mask 0xf, R2D_UNORM8 */
++#define KG_GPU_MARK      0x6b677022u     /* written after the picture, as step 21's word */
++
++static uint32_t kg_cs[256];
++static unsigned kg_cs_n;
++
++/* pm4_calc_odd_parity_bit, cp_type7_packet, cp_type4_packet (adreno_pm4types.h) */
++static uint32_t
++kg_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28))) & 1u;
++}
++
++static void
++kg_cs_pkt7(uint32_t op, uint32_t cnt)
++{
++	kg_cs[kg_cs_n++] = 7u << 28 | cnt | kg_parity(cnt) << 15 | (op & 0x7fu) << 16 | kg_parity(op) << 23;
++}
++
++static void
++kg_cs_word(uint32_t w)
++{
++	kg_cs[kg_cs_n++] = w;
++}
++
++static void
++kg_cs_reg(uint32_t reg, uint32_t val)
++{
++	kg_cs[kg_cs_n++] = 4u << 28 | 1u | kg_parity(1) << 7 | (reg & 0x3ffffu) << 8 | kg_parity(reg) << 27;
++	kg_cs[kg_cs_n++] = val;
++}
++
++/* one band: fd6_clear_surface's registers for a linear 8888 target, then emit_blit_fini */
++static void
++kg_cs_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
++{
++	kg_cs_reg(0x8c00, KG_A2D_SOLID_8888);           /* RB_A2D_BLT_CNTL */
++	kg_cs_reg(0x8400, KG_A2D_SOLID_8888);           /* GRAS_A2D_BLT_CNTL */
++	kg_cs_reg(0xb2d2, 1u << 29);                    /* TPL1_A2D_BLT_CNTL (a7xx): type A6XX_TEX_2D */
++	kg_cs_reg(0xa9bf, 0x30u << 3 | 0xfu << 12);     /* SP_A2D_OUTPUT_INFO (a7xx): float, 8888, mask */
++	kg_cs_reg(0x8c01, 0);                           /* RB_A2D_PIXEL_CNTL: no blending */
++	for (uint32_t reg = 0xb2c0; reg <= 0xb2c4; reg++) {
++		kg_cs_reg(reg, 0);                      /* TPL1_A2D_SRC_TEXTURE_*: no source */
++	}
++	kg_cs_reg(0x8c2c, r);                           /* RB_A2D_CLEAR_COLOR_DW0..3: R, G, B, A in 0..255 */
++	kg_cs_reg(0x8c2d, g);
++	kg_cs_reg(0x8c2e, b);
++	kg_cs_reg(0x8c2f, 255);
++	for (uint32_t reg = 0x8401; reg <= 0x8404; reg++) {
++		kg_cs_reg(reg, 0);                      /* GRAS_A2D_SRC_XMIN..YMAX */
++	}
++	kg_cs_reg(0x8c17, 0x30u | 1u << 10);            /* RB_A2D_DEST_BUFFER_INFO: 8888, linear, WXYZ (blue first) */
++	kg_cs_reg(0x8c18, (uint32_t)KG_GPU_PIC_VA);     /* RB_A2D_DEST_BUFFER_BASE */
++	kg_cs_reg(0x8c19, (uint32_t)(KG_GPU_PIC_VA >> 32));
++	kg_cs_reg(0x8c1a, KG_PIC_ROW >> 6);             /* RB_A2D_DEST_BUFFER_PITCH, 64-byte units */
++	kg_cs_reg(0x8405, top << 16);                   /* GRAS_A2D_DEST_TL */
++	kg_cs_reg(0x8406, (KG_PIC_W - 1) | (bottom - 1) << 16);  /* GRAS_A2D_DEST_BR */
++	kg_cs_pkt7(0x46, 1);                            /* CP_EVENT_WRITE7 DEBUG_LABEL (Mesa's FD_LABEL) */
++	kg_cs_word(0x3f);
++	kg_cs_pkt7(0x2c, 1);                            /* CP_BLIT BLIT_OP_SCALE */
++	kg_cs_word(3);
++}
++
++static bool
++kg_pixel_is(const volatile uint8_t *p, uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b)
++{
++	const volatile uint8_t *q = p + (size_t)y * KG_PIC_ROW + 4u * x;
++	return q[0] == b && q[1] == g && q[2] == r && q[3] == 0xff;
++}
++
++/*
++ * Three bands (orange, white, blue from the top), drawn by the 2D engine
++ * into a 1080x2400 picture of ours at GPU 0xe0200000; then the CCU and the
++ * cache cleaned to memory, a wait for idle and a marker word, checked from
++ * our side: every 50th row at three columns against its band's colour. Then
++ * copied into the panel memory, again every 250 ms for 15 s (iOS's own
++ * frames would draw over it). Undo: the picture's memory freed; the panel
++ * keeps it until iOS draws its next frame.
++ */
++static bool
++kg_step22(void)
++{
++	static const struct {
++		uint32_t top, bottom;
++		uint8_t r, g, b;
++	} band[3] = { { 0, 800, 255, 128, 0 }, { 800, 1600, 255, 255, 255 }, { 1600, KG_PIC_H, 0, 128, 255 } };
++	vm_offset_t scratch = kg_undo_mem("gpu scratch page");
++
++	if (!kg_gpu_wrote || scratch == 0 || !kg_gx_on()) {
++		printf("SWEET KGPU: 22 needs steps 1-21 (the CP running out of secure mode, in this run)\n");
++		return false;
++	}
++	kg_announce(22, "nothing: memory for a 1080x2400 picture, mapped for the GPU at 0xe0200000");
++	vm_offset_t pic = kg_gpu_alloc("gpu picture", KG_GPU_PIC_VA, KG_PIC_ROW * KG_PIC_H);
++	if (pic == 0) {
++		return false;
++	}
++	kg_to_memory(pic, KG_PIC_ROW * KG_PIC_H);
++	kg_space_commit();
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBIASID, KG_GPU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBSYNC, 1);
++	if (!kg_poll(kg.smmu, cb + SMMU_CB_TLBSTATUS, 1u, 0, 100)) {
++		printf("SWEET KGPU: 22 TLB sync does not finish\n");
++		return false;
++	}
++	printf("SWEET KGPU: 22 %u of %u tables used\n", kg_space.used, kg_space.ntables);
++
++	kg_cs_n = 0;
++	kg_cs_pkt7(0x46, 1);                            /* CCU_INVALIDATE_COLOR */
++	kg_cs_word(0x19);
++	kg_cs_pkt7(0x65, 1);                            /* CP_SET_MARKER RM6_BLIT2DSCALE */
++	kg_cs_word(12);
++	kg_cs_reg(0x88e5, 0x40u << 23);                 /* RB_CCU_CACHE_CNTL, sysmem: colour cache at 256K (1 CCU) */
++	for (unsigned i = 0; i < 3; i++) {
++		kg_cs_fill(band[i].top, band[i].bottom, band[i].r, band[i].g, band[i].b);
++	}
++	kg_cs_pkt7(0x46, 1);                            /* CCU_CLEAN_COLOR: the colour cache to memory */
++	kg_cs_word(0x21);
++	kg_cs_pkt7(0x46, 1);                            /* CACHE_CLEAN: UCHE to memory */
++	kg_cs_word(0x31);
++	kg_cs_pkt7(0x26, 0);                            /* CP_WAIT_FOR_IDLE */
++	uint64_t mark = KG_GPU_SCRATCH_VA + KG_GPU_WORD_OFF + 4;
++	kg_cs_pkt7(0x3d, 3);                            /* CP_MEM_WRITE: the marker, after it all */
++	kg_cs_word((uint32_t)mark);
++	kg_cs_word((uint32_t)(mark >> 32));
++	kg_cs_word(KG_GPU_MARK);
++	kg_cs_pkt7(0x12, 0);                            /* CP_WAIT_MEM_WRITES */
++
++	kg_next(22, "three 2D fills (orange, white, blue), the caches to memory, a marker word: the GPU DRAWS");
++	bool idle = kg_cp_submit("cp_rb_wptr (2d fills)", kg_cs, kg_cs_n);
++	kg_to_memory(scratch, 0x1000);
++	kg_to_memory(pic, KG_PIC_ROW * KG_PIC_H);
++	const volatile uint8_t *p = (const volatile uint8_t *)pic;
++	unsigned bad = 0, seen = 0;
++	for (unsigned i = 0; i < 3; i++) {
++		for (uint32_t y = band[i].top; y < band[i].bottom; y += 50) {
++			for (uint32_t x = 0; x < KG_PIC_W; x += KG_PIC_W / 2 - 1) {
++				seen++;
++				bad += !kg_pixel_is(p, x, y, band[i].r, band[i].g, band[i].b);
++			}
++		}
++	}
++	printf("SWEET KGPU: 22 marker %#x (%#x wanted); first pixel %02x %02x %02x %02x, middle %02x %02x %02x %02x, last "
++	    "row %02x %02x %02x %02x (blue green red alpha); %u of %u samples wrong\n",
++	    *(volatile uint32_t *)(scratch + KG_GPU_WORD_OFF + 4), KG_GPU_MARK, p[0], p[1], p[2], p[3],
++	    p[1200 * KG_PIC_ROW + 2160], p[1200 * KG_PIC_ROW + 2161], p[1200 * KG_PIC_ROW + 2162],
++	    p[1200 * KG_PIC_ROW + 2163], p[2399 * KG_PIC_ROW + 4316], p[2399 * KG_PIC_ROW + 4317],
++	    p[2399 * KG_PIC_ROW + 4318], p[2399 * KG_PIC_ROW + 4319], bad, seen);
++	if (!idle || bad != 0) {
++		printf("SWEET KGPU: 22 the picture is not what the GPU was told to draw\n");
++		return false;
++	}
++
++	kg_next(22, "the picture into the panel memory 0xb8000000 (row by row), again every 250 ms for 15 s");
++	vm_offset_t panel = ml_io_map_unmappable(KG_PANEL_PA, (vm_size_t)KG_PANEL_ROW * KG_PIC_H, VM_WIMG_WCOMB);
++	if (panel == 0) {
++		printf("SWEET KGPU: 22 no mapping of the panel memory\n");
++		return false;
++	}
++	for (unsigned n = 0; n < KG_SHOW_S * 4u; n++) {
++		for (uint32_t y = 0; y < KG_PIC_H; y++) {
++			memcpy((void *)(panel + (vm_offset_t)y * KG_PANEL_ROW), (const void *)(pic + (vm_offset_t)y * KG_PIC_ROW),
++			    KG_PANEL_ROW);
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (n == 0) {
++			printf("SWEET KGPU: 22 A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top "
++			    "(held %u s)\n", KG_SHOW_S);
++		}
++		kg_wait(250);
++	}
++	ml_io_unmap(panel, (vm_size_t)KG_PANEL_ROW * KG_PIC_H);
++	return true;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -3224,14 +3427,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21, kg_step22 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -3266,12 +3469,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 21 ? 21u : (unsigned)last;
++	kg.last = last > 22 ? 22u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 21) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..21 exist; running those\n", last);
++	if (last > 22) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..22 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
