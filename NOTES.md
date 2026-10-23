@@ -179,7 +179,25 @@ TCR/MAIR0/FSR/FAR (+ the CB stream 0 maps to, if another of the 6). Verified: 21
 reproduces the file, syntax clean. **Test:** CI -> #29 image with `kgpu=9`. A reset after a
 step 8 "about to read" = Gunyah traps the SMMU's global page (hk: on redwood the hypervisor
 "answers for" it); after step 9's = the context page. Then step 10 (two words into GMU DTCM and
-back: the first GMU write). Any other sandbox_container_path_* caller gets
+back: the first GMU write).
+
+**BOOT #30 (2026-10-23 17:53, shim/out/shim-boot-30.img = #29 with `kgpu=9`, kernel CI 39955079762
+@ da7eb39 sha256 8a20353d...): STEPS 8-9 READ THE SMMU CLEAN, UNDO CLEAN, NO RESET.** Log:
+temp/ios-m8/usblog/live-boot30-20261023-1753.txt. System as before (driverkitd only).
+- 8 IDR0 0x4c017e18 / IDR1 0x40000016: **24 SMRs, 22 contexts, 32 pages of 4K** = 0x40000 as the
+  FDT says (22 matches the dossier). IDR2 0x5511, IDR7 0x24, **sCR0 0x250406** (CLIENTPD clear =
+  SMMU on; USFCFG set = unmatched streams FAULT; GFRE/GFIE on), sGFSR 0. **The 6 HLOS entries are
+  empty**: SMR0-5 = 0 (unused), S2CR0-5 = 0x20000 (fault), CBAR/CBA2R0-5 = 0. So streams 0 (GPU),
+  2 (secure), 5 (GMU) have no route and would fault today: setting SMR/S2CR/CB is ours (step 13,
+  like kgsl's arm-smmu attach; skip-init keeps whatever the boot chain set, and it set nothing).
+- 9 CB0: SCTLR 0x70e (M=0, translation off), ACTLR 0x3, TTBR0 0x2e01032f:40804030, TCR 0x588253aa,
+  MAIR0 0xf020241, FSR 0, FAR 0x350:82232b1d: leftovers (CB registers are not reset), not a
+  configuration.
+Meaning (open question 1, read half): **every GPU block is readable from our kernel under Gunyah**
+(GCC, cmd-db, QFPROM, GPU_CC, GMU, GBIF, CX misc, RSCC, PDC, SMMU global + CB0). Whether the
+SMMU's values are the hardware's or the hypervisor's own, they are consistent with an MMU-500.
+NEXT: step 10, the first write to the GMU (two words into DTCM and back, restored), then the
+TrustZone questions (11: SCM availability, 12: zap .mdt signature check). Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
