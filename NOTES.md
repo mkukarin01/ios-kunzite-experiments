@@ -8,8 +8,15 @@ SUCCEEDED** (xnu-kernel artifact 61 MB). NOT booted yet: the last booted kernel 
 (boot #24). The previous run 39919704364 failed on a hunk lost when 0908 became 0967 (details in
 the merge notes below).
 
-**Boot #25 (next) needs a NEW boot image:** shim-boot-25.img already exists and holds kernel
-d5f0c370 + the /pram ADT. Build one from the new artifact + the same kunzite.adt, under a new name.
+**Boot #25 (next) = `shim/out/shim-boot-25-gpu.img`** (built 2026-10-23, sha256 2f81806b...).
+It is shim-boot-25.img with only the kernel swapped. Kernel = CI 39923346510 artifact (sha256
+3f103d50..., SHA256SUMS OK; has kunzite_touch_init + topaz_adreno_init). ADT = the same
+shim/out/kunzite.adt (/pram). Cmdline = the standard one + `sweetusb=2`. payload-25-gpu.bin was
+built with mkpayload.py, the image with shim/build-mac.sh (shim/ and tools/ unchanged since
+69446d0). Checked: the shim bytes equal shim-boot-25.img's except the image_size field, and the
+embedded payload equals payload-25-gpu.bin. The old shim-boot-25.img (kernel d5f0c370, never
+booted) is kept. Boot: `fastboot boot shim/out/shim-boot-25-gpu.img` from the BOOTLOADER
+fastboot, then `tools/kunzite-usbnet-mac.sh` + `tools/udp-log.py FILE` (0969 replay is in this kernel).
 
 **What to expect (read from the merged code, not seen on the phone yet):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
