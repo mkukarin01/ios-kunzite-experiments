@@ -32,8 +32,10 @@ only skips the client if the call fails or buf[0]==0. Otherwise it does
 (topaz_sandbox_container.c, sandbox op 4) returns 0 WITHOUT writing the buffer when the process
 has no CFFIXED_USER_HOME (most daemons): the not-found fall-through (`error` is still 0 from
 copyin) and the early `return 0` exits. Before the merge op 4 was always ENOENT (0149 weak
-default) -> clean skip. Fix: op 4 must return ENOENT on every no-answer path (a kunzite patch
-after 0969; probably an upstream topaz bug too). Any other sandbox_container_path_* caller gets
+default) -> clean skip. **Fix = 0970-kunzite-sandbox-container-enoent.patch** (2026-10-23): op 4
+returns ENOENT on every no-answer path. Applied in series order (only 0936 touches the file),
+the result matches the edit; xnu/patches now holds 212 patches. NOT compiled locally (no swiftlang clang, no CI log for xnu-cc.py) and NOT built by CI yet.
+Probably an upstream topaz bug too. Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
