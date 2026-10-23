@@ -736,7 +736,10 @@ stream consumed in 0.9 ms, idle, no interrupt, **CB0 FSR 0x400 (no fault)**, **m
 (blue), 0 of 144 samples wrong**; "A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white,
 blue from the top (held 15 s)". **Milestone K2 of the port map: the GPU's 2D engine draws through
 our SMMU tables, out of secure mode, and the picture is shown.** The panic, after the show (the
-USB log stops; panic screen not transcribed): ml_io_unmap(panel, 4320 * 2400) - its
+USB log stops; **confirmed by the panic screen**, user's transcription: "panic(cpu 1 caller
+0xfffffe0007498588): pmap_remove_options() pmap 0xfffffe0007c49738 start 0x...d955000 end
+0x...f33400 @pmap.c:4296", panicked thread tid 206 in kernel_task, the other cores idle):
+ml_io_unmap(panel, 4320 * 2400) - its
 pmap_remove(addr, addr + 0x9e3400) panics in pmap_remove_options when the end is not page
 aligned (osfmk/arm/pmap/pmap.c: "pmap_remove_options() pmap %p start 0x%llx end 0x%llx");
 ml_io_map_unmappable had rounded the mapping up to 0x9e4000 (kmem_free rounds too; pmap_remove
