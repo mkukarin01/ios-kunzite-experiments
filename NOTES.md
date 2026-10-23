@@ -639,6 +639,19 @@ first, stream 0 unrouted, CB0 off, frees, oob clear, slumber (PREPARE_SLUMBER ac
 (CP_SET_SECURE_MODE 0 through the ring, as gen7_rb_start does once the zap is loaded) and a word
 written by the GPU (CP_MEM_WRITE to the scratch page), both with WPTR/RPTR and idle checks.
 
+**GPU STEP 21 = 0986 (2026-10-24, written, NOT built/booted), `kgpu=21` (the port map's 21): out of
+secure mode, a word written by the GPU.** Read from kgsl: gen7_rb_start after
+adreno_zap_shader_load: zap loaded -> CP_SET_SECURE_MODE (0x66, 1 dword, payload 0) through the
+ring + gen7_ringbuffer_submit + adreno_spin_idle(2000); without a zap it writes
+RBBM_SECVID_TRUST_CNTL (0xf400) = 0. CP_MEM_WRITE (0x3d) on gen7 = 3 dwords lo, hi, value.
+Packets: 0x70e60001 0; 0x703d8003 0xe0008100 0 0x6b677021, then CP_WAIT_MEM_WRITES (0x12, 0
+dwords) 0x70928000. Ring after step 20: WPTR = RPTR = 10; these go to words 10-11 (WPTR 12) and
+12-16 (WPTR 17). Shared submit helper: append at WPTR, clean, WPTR, poll RPTR = WPTR and CX busy
+bit 23 clear for 2 s, print CP/RBBM/CB0 status. The word is read back after a cache invalidate of
+the scratch page. Nothing new to undo (step 20's CP halt runs first). Success line: "THE GPU WROTE
+A WORD: 0x6b677021 at 0xe0008100, out of secure mode". Verified: 228 patches, series reproduces
+the file, syntax clean. **Test:** #41 image with `kgpu=21`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still

@@ -1,0 +1,218 @@
+kunzite: Adreno 710 step 21, out of secure mode and a word written by the GPU (kgpu=21; the port map's 21).
+21 continues gen7_rb_start after adreno_zap_shader_load, with the CP running from step 20 (WPTR =
+RPTR = 10): CP_SET_SECURE_MODE 0 (cp_type7_packet 0x70e60001, payload 0) through the ring, as
+kgsl does when the zap is loaded (it writes RBBM_SECVID_TRUST_CNTL directly only without one),
+then adreno_spin_idle; RBBM_SECVID_TRUST_CNTL printed before and after. Then the port map's
+proof: CP_MEM_WRITE (0x703d8003: lo, hi, value, as kgsl's gen7 ringbuffer uses it) of
+0x6b677021 to GPU 0xe0008100 in the scratch page, followed by CP_WAIT_MEM_WRITES (0x70928000),
+idle again, and the word read back from our side (cache invalidated first). A shared submit
+helper appends to the ring at WPTR (no wrap), moves WPTR, waits for RPTR = WPTR and CX busy bit
+23 clear for up to 2 s, and prints the CP/RBBM/context 0 status. Step 20 now records the ring's
+WPTR, and step 19's blocks are found by a shared lookup of their undo entries. Nothing new to
+undo: step 20's entry halts the CP first, and its registers go with GX in the slumber.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 331ba6d..69ea14c 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -7,9 +7,9 @@
+  * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
+  * channel and starts HFI; 17 talks to it; 18 has it power GX; 19 gives the
+  * GPU its SMMU context, ring and microcode; 20 loads the zap shader and
+- * starts the CP.
++ * starts the CP; 21 takes it out of secure mode and has it write a word.
+  *
+- * Boot-arg kgpu=N (N <= 20) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 21) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -114,6 +114,9 @@
+  *     into 0x89e1a000, AUTH_AND_RESET), gen7_start's registers for
+  *     gen7_3_0, gen7_rb_start: RPTR_ADDR, RB_CNTL, CP_SQE_CNTL 1, CP_ME_INIT,
+  *     RPTR = WPTR and idle. Undo: the CP halted (CP_SQE_CNTL 0) first.
++ *  21 the port map's 21: CP_SET_SECURE_MODE 0 through the ring, then
++ *     CP_MEM_WRITE 0x6b677021 to the scratch page + CP_WAIT_MEM_WRITES,
++ *     RPTR = WPTR and idle after each, the word read back. No new undo.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -2829,6 +2832,20 @@ static const struct kg_reg kg_ao_hwcg[] = {
+ 	{ 0x23b09, 0x00020000 }, { 0x23b0a, 0x00010111 }, { 0x23b0b, 0x00005555 },
+ };
+ 
++/* the memory of ours an undo entry will free, by the entry's name (step 19's blocks), or 0 */
++static vm_offset_t
++kg_undo_mem(const char *name)
++{
++	for (unsigned i = 0; i < kg.nundo; i++) {
++		if (kg.undo[i].kind == KG_UNDO_KFREE && strcmp(kg.undo[i].name, name) == 0) {
++			return kg.undo[i].base;
++		}
++	}
++	return 0;
++}
++
++static uint32_t kg_rb_wptr;              /* the ring's write pointer in words, once step 20 ran the CP */
++
+ /* a block of GPU registers, announced as one, written, then read back */
+ static unsigned
+ kg_gpu_regs(const char *what, const struct kg_reg *r, unsigned n)
+@@ -3021,14 +3038,7 @@ kg_step20(void)
+ 	    kg_rd(kg.smmu, (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page + SMMU_CB_FSR));
+ 
+ 	/* gen7_rb_start; the CP_ME_INIT stream of gen7_cp_init_cmds at the ring's head */
+-	vm_offset_t rb = 0, scratch = 0;
+-	for (unsigned i = 0; i < kg.nundo; i++) {
+-		if (kg.undo[i].kind == KG_UNDO_KFREE && strcmp(kg.undo[i].name, "gpu ringbuffer") == 0) {
+-			rb = kg.undo[i].base;
+-		} else if (kg.undo[i].kind == KG_UNDO_KFREE && strcmp(kg.undo[i].name, "gpu scratch page") == 0) {
+-			scratch = kg.undo[i].base;
+-		}
+-	}
++	vm_offset_t rb = kg_undo_mem("gpu ringbuffer"), scratch = kg_undo_mem("gpu scratch page");
+ 	if (rb == 0 || scratch == 0) {
+ 		printf("SWEET KGPU: 20 step 19's ring or scratch page is gone\n");
+ 		return false;
+@@ -3082,12 +3092,108 @@ kg_step20(void)
+ 	    kg_rd(kg.smmu, cb + SMMU_CB_FAR + 4), kg_rd(kg.smmu, cb + SMMU_CB_FAR), kg_rd(kg.smmu, cb + SMMU_CB_FSYNR0),
+ 	    kg_rd(kg.smmu, SMMU_SGFSR));
+ 	bool ok = rptr == 10 && !(busy & (1u << 23));
++	kg_rb_wptr = ok ? 10 : 0;
+ 	printf("SWEET KGPU: 20 %s\n", ok ? "THE CP RUNS: CP_ME_INIT consumed, the GPU idle (microcode fetched through "
+ 	    "context 0)" : rptr == 10 ? "the CP took CP_ME_INIT but the GPU does not go idle" :
+ 	    "the CP does not consume CP_ME_INIT");
+ 	return ok;
+ }
+ 
++/* ---- step 21: out of secure mode, a word written by the GPU (the port map's 21) ---- */
++
++#define GEN7_RBBM_SECVID_TRUST_CNTL      0xf400
++#define KG_PKT_SET_SECURE_MODE 0x70e60001u  /* cp_type7_packet(CP_SET_SECURE_MODE 0x66, 1) */
++#define KG_PKT_MEM_WRITE       0x703d8003u  /* cp_type7_packet(CP_MEM_WRITE 0x3d, 3): lo, hi, value */
++#define KG_PKT_WAIT_MEM_WRITES 0x70928000u  /* cp_type7_packet(CP_WAIT_MEM_WRITES 0x12, 0) */
++#define KG_GPU_WORD_OFF  0x100u          /* in the scratch page, after the rptr shadow */
++#define KG_GPU_WORD      0x6b677021u     /* "!pgk" */
++
++/*
++ * Words appended to the ring at WPTR (no wrap: the ring is 8K words), WPTR
++ * moved past them (gen7_ringbuffer_submit; the fence is in allow mode),
++ * then adreno_spin_idle's test for up to 2 s: RPTR = WPTR, CX busy bit 23
++ * clear. CP, RBBM and context 0 status printed after.
++ */
++static bool
++kg_cp_submit(const char *what, const uint32_t *cmds, uint32_t n)
++{
++	vm_offset_t rb = kg_undo_mem("gpu ringbuffer");
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page, rptr = 0, busy = 0;
++	unsigned t;
++
++	if (rb == 0 || kg_rb_wptr == 0 || kg_rb_wptr + n > KG_RB_SIZE / 4) {
++		printf("SWEET KGPU: 21 no room in the ring for %s\n", what);
++		return false;
++	}
++	memcpy((uint32_t *)rb + kg_rb_wptr, cmds, 4u * n);
++	kg_to_memory(rb + 4u * kg_rb_wptr, 4u * n);
++	kg_rb_wptr += n;
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_WPTR, kg_rb_wptr, what);
++	uint32_t fence = kg_gmu(GEN7_GMU_AHB_FENCE_STATUS);
++	for (t = 0; t < 20000; t++) {
++		rptr = kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR);
++		busy = kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS);
++		if (rptr == kg_rb_wptr && !(busy & (1u << 23))) {
++			break;
++		}
++		delay(100);
++	}
++	kg_wr(kg.gpu, 4u * GEN7_CP_SQE_STAT_ADDR, 1);
++	printf("SWEET KGPU: 21   after %u.%u ms: rptr %u wptr %u, cx_busy %#x, fence status %#x; rbbm_status %#x int_0 %#x; "
++	    "cp interrupt %#x hw_fault %#x protect %#x sqe_stat %#x; cb0 fsr %#x\n", t / 10, t % 10, rptr, kg_rb_wptr,
++	    busy, fence, kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_RBBM_INT_0_STATUS),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_PROTECT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_SQE_STAT_DATA),
++	    kg_rd(kg.smmu, cb + SMMU_CB_FSR));
++	return rptr == kg_rb_wptr && !(busy & (1u << 23));
++}
++
++/*
++ * gen7_rb_start after adreno_zap_shader_load: CP_SET_SECURE_MODE 0 through
++ * the ring (kgsl writes RBBM_SECVID_TRUST_CNTL directly only when no zap is
++ * loaded), adreno_spin_idle. Then the port map's proof: CP_MEM_WRITE of a
++ * known word to the scratch page (GPU 0xe0008100), CP_WAIT_MEM_WRITES, idle,
++ * and the word read back from our side. Nothing new to undo: the CP is
++ * halted (step 20's entry) and its registers go with GX.
++ */
++static bool
++kg_step21(void)
++{
++	vm_offset_t scratch = kg_undo_mem("gpu scratch page");
++
++	if (kg_rb_wptr == 0 || scratch == 0 || !kg_gx_on()) {
++		printf("SWEET KGPU: 21 needs steps 1-20 (the CP running, in this run)\n");
++		return false;
++	}
++	volatile uint32_t *word = (volatile uint32_t *)(scratch + KG_GPU_WORD_OFF);
++	kg_to_memory(scratch, 0x1000);
++	kg_announce(21, "RBBM_SECVID_TRUST_CNTL and the scratch word before");
++	printf("SWEET KGPU: 21 secvid_trust_cntl %#x; scratch rptr shadow %u, word %#x\n",
++	    kg_rd(kg.gpu, 4u * GEN7_RBBM_SECVID_TRUST_CNTL), *(volatile uint32_t *)scratch, *word);
++
++	kg_next(21, "CP_SET_SECURE_MODE 0 through the ring (gen7_rb_start with the zap loaded): out of secure mode");
++	static const uint32_t secure[2] = { KG_PKT_SET_SECURE_MODE, 0 };
++	bool secure_ok = kg_cp_submit("cp_rb_wptr (cp_set_secure_mode 0)", secure, 2);
++	printf("SWEET KGPU: 21 secvid_trust_cntl %#x after: %s\n", kg_rd(kg.gpu, 4u * GEN7_RBBM_SECVID_TRUST_CNTL),
++	    secure_ok ? "the CP left secure mode and is idle" : "the CP did not get through CP_SET_SECURE_MODE");
++	if (!secure_ok) {
++		return false;
++	}
++
++	kg_next(21, "CP_MEM_WRITE 0x6b677021 to GPU 0xe0008100 (the scratch page), CP_WAIT_MEM_WRITES");
++	uint64_t va = KG_GPU_SCRATCH_VA + KG_GPU_WORD_OFF;
++	const uint32_t write[5] = { KG_PKT_MEM_WRITE, (uint32_t)va, (uint32_t)(va >> 32), KG_GPU_WORD,
++	    KG_PKT_WAIT_MEM_WRITES };
++	bool idle = kg_cp_submit("cp_rb_wptr (cp_mem_write)", write, 5);
++	kg_to_memory(scratch, 0x1000);
++	uint32_t got = *word;
++	printf("SWEET KGPU: 21 scratch word %#x (rptr shadow %u)\n", got, *(volatile uint32_t *)scratch);
++	bool ok = idle && got == KG_GPU_WORD;
++	printf("SWEET KGPU: 21 %s\n", ok ? "THE GPU WROTE A WORD: 0x6b677021 at 0xe0008100, out of secure mode" :
++	    got == KG_GPU_WORD ? "the word is there, but the GPU does not go idle" : "the word is not there");
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -3118,14 +3224,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -3160,12 +3266,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 20 ? 20u : (unsigned)last;
++	kg.last = last > 21 ? 21u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 20) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..20 exist; running those\n", last);
++	if (last > 21) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..21 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
