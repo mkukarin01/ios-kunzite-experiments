@@ -692,6 +692,27 @@ BY THE GPU IS ON THE PANEL: orange, white, blue from the top (held 15 s)" - **wa
 panel during those 15 s**. Verified: 229 patches, series reproduces the file, syntax clean.
 **Test:** #42 image with `kgpu=22`.
 
+**BOOT #43 (2026-10-24 01:11, shim/out/shim-boot-43.img = #42 with `kgpu=22`, kernel CI 40016172124
+@ 48a171d sha256 c1c60d13...): STEP 22 FAILS CLEANLY - THE 2D WRITES TAKE A PERMISSION FAULT; NO
+PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot43-20261024-0111.txt. Steps 1-21 as #42
+(out of secure mode, the word written). Step 22: picture 0xe0200000..0xe0bf6000 -> 0xa3324c000, 14
+of 16 tables used (as planned); 172 words, WPTR 0x11 -> 0xbd; RPTR 189 after 0.9 ms, CX busy bit
+23 clear, RBBM_STATUS 0x1, no RBBM/CP interrupt, no HW fault, no protect fault, SQE_STAT
+0x70928000 (the last packet, CP_WAIT_MEM_WRITES, was reached) - but **CB0 FSR 0x408 = PF
+(permission fault)**, every pixel and the marker 0 (144 of 144 samples wrong), so nothing was
+copied to the panel. Undo ran clean ("gpu picture: freed 0x9f8000", CP halted, slumber, CX down).
+**Cause:** our PTEs (PTE_GMU) have AP[2:1] = 00 = privileged only. The CP's own accesses are
+privileged (CP_APRIV_CNTL 0x6f: ring fetch, RPTR writeback, ICACHE/SQE, ...; step 21's
+CP_MEM_WRITE got through), but the 2D engine's colour writes (RB/CCU via UCHE) are unprivileged,
+so each faulted. **And the marker was lost because CB0 SCTLR.HUPCF (bit 8) is 0**: with a fault
+outstanding and CFCFG = terminate, the SMMU terminates every later transaction of the context
+until FSR is cleared. Linux's arm-smmu-qcom sets HUPCF on the Adreno context ("process subsequent
+transactions after a fault to keep the GPU from hanging"); kgsl maps its globals (ring, scratch,
+ucode) privileged and everything else unprivileged (io-pgtable-arm AP_UNPRIV, bit 6, without
+IOMMU_PRIV). **FIX (0988, to write):** the picture mapped with AP[1] = 1 (unprivileged RW); CB0
+SCTLR with HUPCF; kg_cp_submit clears CB0 FSR before each submit and prints FAR/FSYNR0 when a
+fault bit is set (this boot had no FAR to say which address).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
