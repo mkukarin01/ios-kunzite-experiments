@@ -549,6 +549,25 @@ up). Cosmetic: kg.step is 0 during the undo, so the HFI lines sent from the slum
 H2F_MSG_START after OOB_GPU as gen7_gpu_boot does, then the GPU's own SMMU context (stream 0 ->
 an HLOS context bank with our tables, kgsl_mmu_start), the ringbuffer and a710_sqe.fw.
 
+**GPU STEP 19 = 0984 (2026-10-23, written, NOT built/booted), `kgpu=19` (the port map's 18): the
+GPU's SMMU context, ring, SQE microcode.** Read from kgsl: gen7_gpu_boot = kgsl_mmu_start,
+oob_set(gpu), gen7_gmu_hfi_start_msg (H2F_MSG_START 10, hfi_start_cmd = header only),
+gen7_start, ..., gen7_rb_start (ring memset 0xaa, RPTR_ADDR, RB_CNTL, RB_BASE, SQE_INSTR_BASE
+0x830/0x831, CP_SQE_CNTL 0x808 = 1 starts the CP, then CP_INIT). adreno_get_firmware copies the
+file minus its first dword into a GPUREADONLY global; get_ucode_version = word 1 (unless its low
+nibble is 0xa). FDT kgsl-iommu: gfx3d_user iommus <0x1fb 0x0 0x400>, gfx3d_secure 0x2. a710_sqe.fw
+(vendor, 36308 bytes, sha256 c5588585..., words 0 0x01710181 ...) **uploaded 2026-10-23 during
+boot #39** to /usr/share/firmware/kunzite/a710_sqe.fw (0644), read back with /get = identical
+(copy in temp/ios-m8/fw-readback/). 0984: H2F_MSG_START; stream 0 -> SMR0 (mask 0x400) -> S2CR0
+-> CB0, programmed and kept like CB1, TTBR0 = the shared root with ASID 0; pool 8 -> 12 tables (the
+GMU uses 7, the GPU's region at root entry 4 needs an L2 and an L3); ring 0x100000000 (32K),
+scratch 0x100008000, SQE 0x100010000 (36304 bytes); TLBIASID 0 and 1 + sync; CP_RB_BASE and
+CP_SQE_INSTR_BASE written and read back; CP_SQE_CNTL untouched. Undo: SMR0/S2CR0 back, CB0 off,
+the three blocks freed, then step 18's OOB clear and slumber; peaks at 50. Teardown keeps kg.step
+(undo lines carry 19, not 0). Success line: "THE GPU HAS ITS CONTEXT, RING AND SQE MICROCODE (the
+CP stays halted)". Verified: 226 patches, series reproduces the file, syntax clean. **Test:** #39
+image with `kgpu=19`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still

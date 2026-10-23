@@ -1,0 +1,292 @@
+kunzite: Adreno 710 step 19, the GPU's SMMU context, ring and SQE microcode (kgpu=19; the port map's 18).
+19 continues kgsl's gen7_gpu_boot with GX on from step 18 (OOB_GPU held): H2F_MSG_START (10, the
+header alone) as gen7_gmu_hfi_start_msg sends it after the OOB set, acked with result 0. Then
+kgsl_mmu_start's part, done as step 13 did for the GMU: stream 0 (FDT gfx3d_user, mask 0x400) ->
+HLOS SMR/S2CR entry 0 -> context 0 (the GPU's in kgsl and Linux), on the same 3-level tables as
+the GMU with ASID 0; the GPU's addresses start at 4 GiB (root entry 4, away from the GMU's), so the
+table pool grows from 8 to 12. In GPU memory: the ringbuffer (KGSL_RB_SIZE 32K at 0x100000000,
+filled with 0xaa as gen7_rb_start does), a scratch page (0x100008000) and adreno_get_firmware's
+copy of /usr/share/firmware/kunzite/a710_sqe.fw (all but its first word, at 0x100010000; the
+version word printed as get_ucode_version reads it). Context 0 is programmed and kept like
+context 1 (SCTLR 0 first, CBA2R/CBAR/TCR2/TCR/TTBR0/TTBR1/MAIR), its FSR cleared, TLBIASID on
+contexts 0 and 1 (new tables under the shared root), sync; then on, S2CR0 and SMR0, all read back.
+Last, gen7_rb_start's CP_RB_BASE/_HI and CP_SQE_INSTR_BASE_LO/_HI (GX registers; they go with GX
+in the slumber), read back; CP_SQE_CNTL is left alone, the CP stays halted (its start is the port
+map's 20). Undo (before step 18's OOB clear and slumber): SMR0 and S2CR0 back, CB0 off, the
+memory freed. Also: the teardown no longer zeroes kg.step, so lines from the undo (the slumber's
+HFI message) carry the last step's number instead of 0.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 76be103..b7b36d6 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -5,9 +5,10 @@
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+  * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write;
+  * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
+- * channel and starts HFI; 17 talks to it; 18 has it power GX.
++ * channel and starts HFI; 17 talks to it; 18 has it power GX; 19 gives the
++ * GPU its SMMU context, ring and microcode.
+  *
+- * Boot-arg kgpu=N (N <= 18) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 19) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -69,7 +70,7 @@
+  *     signature (qcom_mdt_pas_init / qcom_scm_pas_init_image). Nothing is
+  *     loaded or started; the page is not touched again.
+  *  13 routes stream 5 (the GMU) through HLOS SMR/S2CR entry 1 and context 1
+- *     with page tables of ours (3 levels, 4K, 39-bit, from a pool of 8 made
++ *     with page tables of ours (3 levels, 4K, 39-bit, from a pool of 12 made
+  *     here; one test page at the GMU's 0x7ffff000): arm-smmu context programming as hk did on redwood;
+  *     checks the readbacks, fault status and a TLB sync. Undone at the end as
+  *     Linux releases a context: stream 5 unrouted (SMR 0, S2CR fault), CB1
+@@ -103,6 +104,11 @@
+  *     MHz, bus 2) as H2F_MSG_GX_BW_PERF_VOTE, then OOB_GPU set: the GMU
+  *     powers GX; RBBM/CP registers read only once GFX_PWR_CLK_STATUS says
+  *     on. Undo: OOB clear, then slumber (kgsl gen7_gmu_power_off).
++ *  19 the port map's 18: H2F_MSG_START, stream 0 -> HLOS entry 0 -> context
++ *     0 on the shared tables (GPU addresses from 4 GiB), the ring (32K), a
++ *     scratch page and a710_sqe.fw (all but its first word) in GPU memory,
++ *     CP_RB_BASE and CP_SQE_INSTR_BASE written and read back; the CP stays
++ *     halted. Undo: stream 0 unrouted, CB0 off, memory freed, before 18's.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -1234,7 +1240,7 @@ kg_to_memory(vm_offset_t start, vm_size_t size)
+  * on, so no table is allocated (or freed) while the SMMU may walk them; the
+  * pool's pages are freed at the end, after stream 5 is unrouted.
+  */
+-#define KG_SPACE_TABLES  8u
++#define KG_SPACE_TABLES  12u             /* the GMU's 7 (boot #35) and the GPU's from step 19 */
+ static struct {
+ 	uint64_t *table[KG_SPACE_TABLES];
+ 	uint64_t phys[KG_SPACE_TABLES];
+@@ -2534,6 +2540,185 @@ kg_step18(void)
+ 	return acked && gx;
+ }
+ 
++/* ---- step 19: the GPU's own side (the port map's 18) ---- */
++
++#define KG_H2F_START     10u             /* H2F_MSG_START: hfi_start_cmd, the header alone */
++#define KG_GPU_STREAM    0u              /* FDT gfx3d_user: iommus <kgsl_smmu 0x0 0x400> */
++#define KG_GPU_MATCH     0u              /* HLOS SMR/S2CR entry 0 */
++#define KG_GPU_CB        0u              /* context 0: the GPU's in kgsl and Linux */
++#define KG_GPU_VA        0x100000000ull  /* the GPU's addresses: root entry 4, apart from the GMU's (same tables) */
++#define KG_RB_SIZE       0x8000u         /* KGSL_RB_SIZE */
++#define KG_GPU_RB_VA     KG_GPU_VA
++#define KG_GPU_SCRATCH_VA (KG_GPU_VA + 0x8000u)
++#define KG_GPU_SQE_VA    (KG_GPU_VA + 0x10000u)
++#define KG_SQE_FW        "/usr/share/firmware/kunzite/a710_sqe.fw"
++#define GEN7_CP_RB_BASE                  0x800
++#define GEN7_CP_RB_BASE_HI               0x801
++#define GEN7_CP_SQE_CNTL                 0x808
++#define GEN7_CP_SQE_INSTR_BASE_LO        0x830
++#define GEN7_CP_SQE_INSTR_BASE_HI        0x831
++
++/* zeroed memory of ours at a GPU address, through the (shared) tables; 0 if not */
++static vm_offset_t
++kg_gpu_alloc(const char *what, uint64_t va, uint32_t len)
++{
++	vm_offset_t mem = 0;
++	uint32_t size = (len + 0xfffu) & ~0xfffu;
++	vm_size_t alloc = ((vm_size_t)size + PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
++
++	if (kmem_alloc(kernel_map, &mem, alloc, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET KGPU: 19 no memory for the %s\n", what);
++		return 0;
++	}
++	kg_undo_push(KG_UNDO_KFREE, mem, 0, (uint32_t)alloc, what);
++	for (uint32_t o = 0; o < size; o += 0x1000u) {
++		if (!kg_space_map(va + o, kvtophys(mem + o), PTE_GMU)) {
++			return 0;
++		}
++	}
++	printf("SWEET KGPU: 19 GPU %#llx..%#llx -> memory %#llx (%s)\n", va, va + size, kvtophys(mem), what);
++	return mem;
++}
++
++/*
++ * kgsl gen7_gpu_boot, with GX on from step 18: H2F_MSG_START after the OOB
++ * set; kgsl_mmu_start's part, done as step 13 did for the GMU: stream 0 ->
++ * HLOS entry 0 -> context 0, on the same tables (ASID 0; the GPU's addresses
++ * from 4 GiB up); the ringbuffer (32K, 0xaa as gen7_rb_start fills it) and a
++ * scratch page; adreno_get_firmware's copy of a710_sqe.fw (all but its first
++ * word); then gen7_rb_start's CP_RB_BASE and CP_SQE_INSTR_BASE, read back.
++ * CP_SQE_CNTL is not touched: the CP stays halted (its start is the port
++ * map's 20). The CP registers go with GX in the slumber; the memory is freed
++ * and stream 0 unrouted before it.
++ */
++static bool
++kg_step19(void)
++{
++	void *data = NULL;
++	size_t size = 0;
++
++	if (!kg_hfi_talks || kg_hfi == NULL || kg.gpu == 0 || !kg_gx_on()) {
++		printf("SWEET KGPU: 19 needs steps 1-18 (GX on, through the GMU, in this run)\n");
++		return false;
++	}
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page, gr1 = kg.smmu_page;
++	uint32_t gmu_cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page;
++	kg_announce(19, "SMR/S2CR entry 0 and context 0 before using them, and the CP's halt state");
++	uint32_t smr = kg_rd(kg.smmu, SMMU_SMR(KG_GPU_MATCH)), sctlr = kg_rd(kg.smmu, cb + SMMU_CB_SCTLR);
++	int taken = kg_smmu_match(KG_GPU_STREAM);
++	printf("SWEET KGPU: 19 smr0 %#x s2cr0 %#x cbar0 %#x cb0 sctlr %#x; stream 0 matched by entry %d; cp_sqe_cntl %#x "
++	    "sqe_instr_base %#x:%08x rb_base %#x:%08x\n", smr, kg_rd(kg.smmu, SMMU_S2CR(KG_GPU_MATCH)),
++	    kg_rd(kg.smmu, gr1 + SMMU_CBAR(KG_GPU_CB)), sctlr, taken, kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_HI), kg_rd(kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_LO),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_RB_BASE_HI), kg_rd(kg.gpu, 4u * GEN7_CP_RB_BASE));
++	if ((smr & SMMU_SMR_VALID) || (sctlr & 1u) || taken >= 0) {
++		printf("SWEET KGPU: 19 entry 0 / context 0 / stream 0 are in use: not ours to take\n");
++		return false;
++	}
++
++	kg_next(19, "HFI H2F_MSG_START (kgsl gen7_gmu_hfi_start_msg, right after the OOB set)");
++	uint32_t start[1] = { KG_H2F_START };
++	if (!kg_hfi_cmd("start", start, 1)) {
++		return false;
++	}
++
++	kg_announce(19, "the SQE microcode " KG_SQE_FW " from the root filesystem");
++	int err = topaz_fw_read(KG_SQE_FW, &data, &size);
++	if (err != 0) {
++		printf("SWEET KGPU: 19 cannot read " KG_SQE_FW " (error %d): upload the phone's "
++		    "/vendor/firmware/a710_sqe.fw there\n", err);
++		return false;
++	}
++	const uint32_t *fw = data;
++	bool ok = false;
++	if (size < 16 || (size & 3u) || size > 0x40000u) {
++		printf("SWEET KGPU: 19 " KG_SQE_FW ": %lu bytes, not a microcode file\n", (unsigned long)size);
++		goto out;
++	}
++	uint32_t ucode_version = (fw[1] & 0xfu) != 0xau ? fw[1] : (fw[1] & ~0xfffu) | ((fw[3] & 0xfff000u) >> 12);
++	printf("SWEET KGPU: 19 sqe: %lu bytes, version %#x (adreno get_ucode_version), first words %#x %#x %#x %#x\n",
++	    (unsigned long)size, ucode_version, fw[0], fw[1], fw[2], fw[3]);
++
++	kg_next(19, "memory for the ring, the scratch page and the microcode, mapped for the GPU");
++	vm_offset_t rb = kg_gpu_alloc("gpu ringbuffer", KG_GPU_RB_VA, KG_RB_SIZE);
++	vm_offset_t scratch = rb != 0 ? kg_gpu_alloc("gpu scratch page", KG_GPU_SCRATCH_VA, 0x1000) : 0;
++	vm_offset_t sqe = scratch != 0 ? kg_gpu_alloc("gpu sqe microcode", KG_GPU_SQE_VA, (uint32_t)size - 4u) : 0;
++	if (sqe == 0) {
++		goto out;
++	}
++	memset((void *)rb, 0xaa, KG_RB_SIZE);
++	memcpy((void *)sqe, &fw[1], size - 4u);
++	kg_to_memory(rb, KG_RB_SIZE);
++	kg_to_memory(scratch, 0x1000);
++	kg_to_memory(sqe, size - 4u);
++	kg_space_commit();
++	uint64_t root = kg_space.phys[0] | (uint64_t)KG_GPU_CB << 48;
++	printf("SWEET KGPU: 19 %u of %u tables used, root %#llx\n", kg_space.used, kg_space.ntables, kg_space.phys[0]);
++
++	kg_next(19, "context 0 gets the tables, as context 1 did in step 13 (kept)");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, 0, "cb0 sctlr");
++	kg_set("SMMU", kg.smmu, gr1 + SMMU_CBA2R(KG_GPU_CB), SMMU_CBA2R_VA64, "cba2r0");
++	kg_set("SMMU", kg.smmu, gr1 + SMMU_CBAR(KG_GPU_CB), SMMU_CBAR_S1, "cbar0");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TCR2, SMMU_TCR2_VAL, "cb0 tcr2");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TCR, SMMU_TCR_39BIT, "cb0 tcr");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR0, (uint32_t)root, "cb0 ttbr0 lo");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32), "cb0 ttbr0 hi");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR1, 0, "cb0 ttbr1 lo");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_TTBR1 + 4, 0, "cb0 ttbr1 hi");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_MAIR0, SMMU_MAIR0_VAL, "cb0 mair0");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_MAIR1, 0, "cb0 mair1");
++
++	kg_next(19, "contexts 0 and 1: clear 0's fault status, forget ASIDs 0 and 1 (new tables under the shared root), "
++	    "TLB sync");
++	kg_wr(kg.smmu, cb + SMMU_CB_FSR, SMMU_FSR_ALL);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBIASID, KG_GPU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBSYNC, 1);
++	kg_wr(kg.smmu, gmu_cb + SMMU_CB_TLBIASID, KG_GMU_CB);
++	kg_wr(kg.smmu, gmu_cb + SMMU_CB_TLBSYNC, 1);
++	if (!kg_poll(kg.smmu, cb + SMMU_CB_TLBSTATUS, 1u, 0, 100) ||
++	    !kg_poll(kg.smmu, gmu_cb + SMMU_CB_TLBSTATUS, 1u, 0, 100)) {
++		printf("SWEET KGPU: 19 TLB sync does not finish\n");
++		goto out;
++	}
++
++	kg_next(19, "context 0 on, then stream 0 -> entry 0 -> context 0");
++	kg_undo_push(KG_UNDO_WORD, kg.smmu, cb + SMMU_CB_SCTLR, 0, "cb0 sctlr (off)");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON, "cb0 sctlr");
++	kg_put("SMMU", kg.smmu, SMMU_S2CR(KG_GPU_MATCH), KG_GPU_CB, KG_UNDO_WORD, 0, "s2cr0");
++	kg_put("SMMU", kg.smmu, SMMU_SMR(KG_GPU_MATCH), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | KG_GPU_STREAM,
++	    KG_UNDO_WORD, 0, "smr0");
++	uint32_t r_smr = kg_rd(kg.smmu, SMMU_SMR(KG_GPU_MATCH)), r_s2cr = kg_rd(kg.smmu, SMMU_S2CR(KG_GPU_MATCH));
++	uint32_t r_cbar = kg_rd(kg.smmu, gr1 + SMMU_CBAR(KG_GPU_CB)), r_sctlr = kg_rd(kg.smmu, cb + SMMU_CB_SCTLR);
++	uint32_t r_lo = kg_rd(kg.smmu, cb + SMMU_CB_TTBR0), r_hi = kg_rd(kg.smmu, cb + SMMU_CB_TTBR0 + 4);
++	printf("SWEET KGPU: 19 read back smr0 %#x s2cr0 %#x cbar0 %#x sctlr %#x tcr %#x ttbr0 %#x:%08x fsr %#x sgfsr %#x\n",
++	    r_smr, r_s2cr, r_cbar, r_sctlr, kg_rd(kg.smmu, cb + SMMU_CB_TCR), r_hi, r_lo, kg_rd(kg.smmu, cb + SMMU_CB_FSR),
++	    kg_rd(kg.smmu, SMMU_SGFSR));
++	if (r_smr != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | KG_GPU_STREAM) || (r_s2cr & 0x300ffu) != KG_GPU_CB ||
++	    (r_cbar & 0x30000u) != (SMMU_CBAR_S1 & 0x30000u) || !(r_sctlr & 1u) || r_lo != (uint32_t)root ||
++	    r_hi != (uint32_t)(root >> 32)) {
++		printf("SWEET KGPU: 19 the SMMU did not keep what was written: stream 0 is not going through context 0\n");
++		goto out;
++	}
++
++	kg_next(19, "the CP's ring base and microcode base (gen7_rb_start; GX registers, kept: they go with GX)");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_BASE, (uint32_t)KG_GPU_RB_VA, "cp_rb_base");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_BASE_HI, (uint32_t)(KG_GPU_RB_VA >> 32), "cp_rb_base_hi");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_LO, (uint32_t)KG_GPU_SQE_VA, "cp_sqe_instr_base_lo");
++	kg_set("GPU", kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_HI, (uint32_t)(KG_GPU_SQE_VA >> 32), "cp_sqe_instr_base_hi");
++	uint32_t s_lo = kg_rd(kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_LO), s_hi = kg_rd(kg.gpu, 4u * GEN7_CP_SQE_INSTR_BASE_HI);
++	uint32_t b_lo = kg_rd(kg.gpu, 4u * GEN7_CP_RB_BASE), b_hi = kg_rd(kg.gpu, 4u * GEN7_CP_RB_BASE_HI);
++	printf("SWEET KGPU: 19 read back sqe_instr_base %#x:%08x rb_base %#x:%08x cp_sqe_cntl %#x; rbbm_status %#x; "
++	    "cb0 fsr %#x cb1 fsr %#x\n", s_hi, s_lo, b_hi, b_lo, kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL),
++	    kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.smmu, cb + SMMU_CB_FSR), kg_rd(kg.smmu, gmu_cb + SMMU_CB_FSR));
++	ok = s_lo == (uint32_t)KG_GPU_SQE_VA && s_hi == (uint32_t)(KG_GPU_SQE_VA >> 32) && b_lo == (uint32_t)KG_GPU_RB_VA &&
++	    b_hi == (uint32_t)(KG_GPU_RB_VA >> 32);
++	printf("SWEET KGPU: 19 %s\n", ok ? "THE GPU HAS ITS CONTEXT, RING AND SQE MICROCODE (the CP stays halted)" :
++	    "the CP does not keep its ring/microcode base");
++out:
++	topaz_fw_free(data, size);
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -2542,7 +2727,6 @@ kg_teardown(void)
+ 	if (kg.nundo == 0) {
+ 		return;
+ 	}
+-	kg.step = 0;
+ 	if (kg.gpucc != 0) {
+ 		printf("SWEET KGPU: held %u s: cx gdsc %#x hw_ctrl %#x gx gdsc %#x gmu_rcg %#x/%#x hub_rcg %#x/%#x "
+ 		    "cxo %#x cx_gmu %#x hub_cx_int %#x smmu_vote %#x\n", kg.hold_s,
+@@ -2565,14 +2749,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -2607,12 +2791,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 18 ? 18u : (unsigned)last;
++	kg.last = last > 19 ? 19u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 18) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..18 exist; running those\n", last);
++	if (last > 19) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..19 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
