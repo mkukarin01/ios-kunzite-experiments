@@ -114,7 +114,23 @@ is undone in reverse (branches, RCGs, GCC, CX collapse last; "SWEET KGPU: undo .
 #27 image with `kgpu=5` instead of `kgpu=3`. Outcomes: a reset right after a "write" line =
 Gunyah forbids that write (persistent log); "STAYS OFF" / "does not take its new source" = a
 clock prerequisite is missing (the line says which); all running + undo lines = CX power and
-clocks work, next are steps 6-7 (first GMU register reads, RSCC). Any other sandbox_container_path_* caller gets
+clocks work, next are steps 6-7 (first GMU register reads, RSCC).
+
+**BOOT #28 (2026-10-23 17:08, shim/out/shim-boot-28.img = #27 with `kgpu=5`, kernel CI 39949651460
+@ d5e49a2 sha256 72878422...): STEPS 4-5 WORK, ALL UNDONE, NO RESET.** Log:
+temp/ios-m8/usblog/live-boot28-20261023-1708.txt. Steps 1-3 identical to #27. Step 4: write
+cx_gdscr 0x22f001 -> 0x22f000 => **CX ON** at once (gdscr 0xf822f000, hw_ctrl 0x80001fe0).
+Step 5: GCC vote 0x60257f -> 0x61257f; ddrss_gpu_axi 0x300001 running (already enabled);
+GCC memnoc_gfx 0x3 and snoc_dvm_gfx 0x1 now RUNNING (they were enabled-but-off: they only needed
+CX); gmu_clk_src cfg 0 -> 0x602 and hub_clk_src 0 -> 0x603, UPDATE cleared, both root on;
+cxo 0x1, cx_gmu 0x221, hub_cx_int 0x1 running WITHOUT a write (ABL leaves their enable bits
+set; "off" in step 3 = no CX power); hlos1_vote_gpu_smmu 0x80000000 -> 0x80000001 running. 5
+writes total. Held 5 s unchanged, then undone in reverse; after: cx gdsc 0x22f001, hw_ctrl
+0x5ff4, vote 0x60257f, RCG cfgs 0, smmu vote 0x80000000 (= the step-3 state). System fine
+(agent up, no panic; crashes: driverkitd as always, one PosterBoard sig 5 as in #24b).
+**Gunyah lets HLOS write GPU_CC and the GCC vote** (open question 1, write half, for these).
+NEXT: steps 6-7 (read-only again, with CX + clocks on): GMU registers at 0x3d68000 (an AO
+counter that should count, CM3 state), the bus interface, the GMU's RSCC 0x3d50000 / PDC. Any other sandbox_container_path_* caller gets
 the same garbage "success", so the fix covers more than syncdefaultsd.
 Second victim (16:08, 2x, also absent in #24): **webbookmarksd** aborts in the same
 +[NSURL fileURLWithPath:isDirectory:YES], in its passwordIconsRepeatingCleanup XPC activity. arm64
