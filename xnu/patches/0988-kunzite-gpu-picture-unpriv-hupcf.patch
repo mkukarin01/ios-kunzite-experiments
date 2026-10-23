@@ -1,0 +1,117 @@
+kunzite: Adreno 710 step 22 fix: the picture mapped unprivileged-RW, HUPCF on context 0, fault address printed (kgpu=22).
+Boot #43: the CP ran step 22's 2D stream, but context 0 recorded a permission fault (FSR 0x408)
+and nothing reached memory, not even the CP_MEM_WRITE marker after it. Our PTEs had AP[2:1] = 00
+(privileged only); the CP's own accesses are privileged (CP_APRIV_CNTL), the 2D engine's colour
+writes are not. And with SCTLR.HUPCF 0 and terminate-on-fault, a context with a fault outstanding
+terminates every later transaction, which took the marker too. Now: kg_gpu_alloc takes the PTE
+attributes; ring, scratch and SQE keep PTE_GMU (privileged only, as kgsl's privileged globals),
+the picture gets PTE_GMU | PTE_AP_UNPRIV (AP[1] = 1, io-pgtable-arm's mapping without
+IOMMU_PRIV). Context 0's SCTLR adds HUPCF (bit 8), as Linux's arm-smmu-qcom does for the Adreno
+context to keep the GPU going after a fault. kg_cp_submit clears context 0's FSR before WPTR, so
+a fault it reports belongs to that submit, and on a fault prints FAR and FSYNR0 (bit 4 write, 5
+unprivileged, 6 instruction).
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 5f483ff..99e76b4 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -272,6 +272,7 @@ void kunzite_adreno_init(void);
+ #define SMMU_MAIR0_VAL   0xf404ff44u     /* Linux's: 0 uncached, 1 cached, 2 device */
+ #define SMMU_FSR_ALL     0xc00001feu
+ #define SMMU_SCTLR_ON    (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)  /* M, TRE, AFE, CFRE, ASIDPNE */
++#define SMMU_SCTLR_HUPCF (1u << 8)       /* hit under a previous fault: the GPU's (arm-smmu-qcom adreno) */
+ #define KG_GMU_STREAM    5u              /* FDT gmu iommus */
+ #define KG_GMU_MATCH     1u              /* SMR/S2CR entry (0 is the GPU's) */
+ #define KG_GMU_CB        1u              /* context (0 is the GPU's in Linux's adreno-smmu) */
+@@ -279,6 +280,7 @@ void kunzite_adreno_init(void);
+ #define PTE_TABLE        3ull
+ #define PTE_PAGE         3ull
+ #define PTE_GMU          (2ull << 8 | 1ull << 10 | 1ull << 11)  /* outer shareable, accessed, not global; attr 0 */
++#define PTE_AP_UNPRIV    (1ull << 6)     /* AP[1]: unprivileged access too (io-pgtable-arm without IOMMU_PRIV) */
+ /* TrustZone (qcom_scm.c / qcom_scm-smc.c: SiP, SMC64, yielding; the same as TopazModem's) */
+ #define KG_SCM_FN(call)          (0x42000000u | (call))         /* the SMC function number */
+ #define KG_SCM_ID(call)          (0x02000000u | (call))         /* the same call as an argument */
+@@ -2575,9 +2577,13 @@ kg_step18(void)
+ #define GEN7_CP_SQE_INSTR_BASE_LO        0x830
+ #define GEN7_CP_SQE_INSTR_BASE_HI        0x831
+ 
+-/* zeroed memory of ours at a GPU address, through the (shared) tables; 0 if not */
++/*
++ * zeroed memory of ours at a GPU address, through the (shared) tables; 0 if
++ * not. attrs: PTE_GMU (privileged only: kgsl's globals, which only the CP
++ * touches) or PTE_GMU | PTE_AP_UNPRIV (what the 3D/2D engines write, boot #43)
++ */
+ static vm_offset_t
+-kg_gpu_alloc(const char *what, uint64_t va, uint32_t len)
++kg_gpu_alloc(const char *what, uint64_t va, uint32_t len, uint64_t attrs)
+ {
+ 	vm_offset_t mem = 0;
+ 	uint32_t size = (len + 0xfffu) & ~0xfffu;
+@@ -2589,11 +2595,12 @@ kg_gpu_alloc(const char *what, uint64_t va, uint32_t len)
+ 	}
+ 	kg_undo_push(KG_UNDO_KFREE, mem, 0, (uint32_t)alloc, what);
+ 	for (uint32_t o = 0; o < size; o += 0x1000u) {
+-		if (!kg_space_map(va + o, kvtophys(mem + o), PTE_GMU)) {
++		if (!kg_space_map(va + o, kvtophys(mem + o), attrs)) {
+ 			return 0;
+ 		}
+ 	}
+-	printf("SWEET KGPU: %u GPU %#llx..%#llx -> memory %#llx (%s)\n", kg.step, va, va + size, kvtophys(mem), what);
++	printf("SWEET KGPU: %u GPU %#llx..%#llx -> memory %#llx (%s%s)\n", kg.step, va, va + size, kvtophys(mem), what,
++	    (attrs & PTE_AP_UNPRIV) ? ", unprivileged too" : "");
+ 	return mem;
+ }
+ 
+@@ -2657,9 +2664,10 @@ kg_step19(void)
+ 	    (unsigned long)size, ucode_version, fw[0], fw[1], fw[2], fw[3]);
+ 
+ 	kg_next(19, "memory for the ring, the scratch page and the microcode, mapped for the GPU");
+-	vm_offset_t rb = kg_gpu_alloc("gpu ringbuffer", KG_GPU_RB_VA, KG_RB_SIZE);
+-	vm_offset_t scratch = rb != 0 ? kg_gpu_alloc("gpu scratch page", KG_GPU_SCRATCH_VA, 0x1000) : 0;
+-	vm_offset_t sqe = scratch != 0 ? kg_gpu_alloc("gpu sqe microcode", KG_GPU_SQE_VA, (uint32_t)size - 4u) : 0;
++	vm_offset_t rb = kg_gpu_alloc("gpu ringbuffer", KG_GPU_RB_VA, KG_RB_SIZE, PTE_GMU);
++	vm_offset_t scratch = rb != 0 ? kg_gpu_alloc("gpu scratch page", KG_GPU_SCRATCH_VA, 0x1000, PTE_GMU) : 0;
++	vm_offset_t sqe = scratch != 0 ?
++	    kg_gpu_alloc("gpu sqe microcode", KG_GPU_SQE_VA, (uint32_t)size - 4u, PTE_GMU) : 0;
+ 	if (sqe == 0) {
+ 		goto out;
+ 	}
+@@ -2700,7 +2708,7 @@ kg_step19(void)
+ 
+ 	kg_next(19, "context 0 on, then stream 0 -> entry 0 -> context 0");
+ 	kg_undo_push(KG_UNDO_WORD, kg.smmu, cb + SMMU_CB_SCTLR, 0, "cb0 sctlr (off)");
+-	kg_set("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON, "cb0 sctlr");
++	kg_set("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON | SMMU_SCTLR_HUPCF, "cb0 sctlr (with hupcf)");
+ 	kg_put("SMMU", kg.smmu, SMMU_S2CR(KG_GPU_MATCH), KG_GPU_CB, KG_UNDO_WORD, 0, "s2cr0");
+ 	kg_put("SMMU", kg.smmu, SMMU_SMR(KG_GPU_MATCH), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | KG_GPU_STREAM,
+ 	    KG_UNDO_WORD, 0, "smr0");
+@@ -3134,6 +3142,7 @@ kg_cp_submit(const char *what, const uint32_t *cmds, uint32_t n)
+ 	memcpy((uint32_t *)rb + kg_rb_wptr, cmds, 4u * n);
+ 	kg_to_memory(rb + 4u * kg_rb_wptr, 4u * n);
+ 	kg_rb_wptr += n;
++	kg_wr(kg.smmu, cb + SMMU_CB_FSR, SMMU_FSR_ALL);   /* a fault seen below is this submit's */
+ 	kg_set("GPU", kg.gpu, 4u * GEN7_CP_RB_WPTR, kg_rb_wptr, what);
+ 	uint32_t fence = kg_gmu(GEN7_GMU_AHB_FENCE_STATUS);
+ 	for (t = 0; t < 20000; t++) {
+@@ -3151,6 +3160,12 @@ kg_cp_submit(const char *what, const uint32_t *cmds, uint32_t n)
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_PROTECT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_SQE_STAT_DATA),
+ 	    kg_rd(kg.smmu, cb + SMMU_CB_FSR));
++	uint32_t fsr = kg_rd(kg.smmu, cb + SMMU_CB_FSR);
++	if (fsr & SMMU_FSR_ALL) {
++		printf("SWEET KGPU: %u   CONTEXT 0 FAULT: fsr %#x far %#x:%08x fsynr0 %#x (bit 4 write, 5 unprivileged, 6 instruction)\n",
++		    kg.step, fsr, kg_rd(kg.smmu, cb + SMMU_CB_FAR + 4), kg_rd(kg.smmu, cb + SMMU_CB_FAR),
++		    kg_rd(kg.smmu, cb + SMMU_CB_FSYNR0));
++	}
+ 	return rptr == kg_rb_wptr && !(busy & (1u << 23));
+ }
+ 
+@@ -3314,7 +3329,7 @@ kg_step22(void)
+ 		return false;
+ 	}
+ 	kg_announce(22, "nothing: memory for a 1080x2400 picture, mapped for the GPU at 0xe0200000");
+-	vm_offset_t pic = kg_gpu_alloc("gpu picture", KG_GPU_PIC_VA, KG_PIC_ROW * KG_PIC_H);
++	vm_offset_t pic = kg_gpu_alloc("gpu picture", KG_GPU_PIC_VA, KG_PIC_ROW * KG_PIC_H, PTE_GMU | PTE_AP_UNPRIV);
+ 	if (pic == 0) {
+ 		return false;
+ 	}

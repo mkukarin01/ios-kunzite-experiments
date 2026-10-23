@@ -713,6 +713,19 @@ IOMMU_PRIV). **FIX (0988, to write):** the picture mapped with AP[1] = 1 (unpriv
 SCTLR with HUPCF; kg_cp_submit clears CB0 FSR before each submit and prints FAR/FSYNR0 when a
 fault bit is set (this boot had no FAR to say which address).
 
+**FIX 0988 (2026-10-24, written, NOT built/booted), still `kgpu=22`.** kg_gpu_alloc takes the PTE
+attributes: ring, scratch page and SQE keep PTE_GMU (privileged only, like kgsl's privileged
+globals); the picture is mapped PTE_GMU | PTE_AP_UNPRIV (bit 6, AP[1] = 1: unprivileged RW too, as
+io-pgtable-arm maps without IOMMU_PRIV). CB0's SCTLR is written SMMU_SCTLR_ON | HUPCF (bit 8),
+as arm-smmu-qcom does for the Adreno context (expect the readback 0x127 instead of #42's 0x27,
+if HUPCF sticks). kg_cp_submit clears CB0 FSR (write-1s) before moving WPTR and prints "CONTEXT 0
+FAULT: fsr far fsynr0" when a fault bit is set (FSYNR0 per Linux arm-smmu.h: bit 4 WNR, bit 5
+PNU unprivileged, bit 6 IND instruction). Step 22's sequence is otherwise unchanged. If the
+fault persists, FAR says which address, FSYNR0 whether it was a write and unprivileged; the
+next suspects are then the 2D engine's other paths (Mesa's a710 magic registers). Verified: 230
+patches, series reproduces the file, syntax clean. **Test:** #43 image with `kgpu=22` (watch the
+panel ~75-90 s after boot).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
