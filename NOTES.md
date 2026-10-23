@@ -243,7 +243,8 @@ patches, series reproduces the file, syntax clean. **Before the test, once:** `c
 temp/kunzite-vendor/proprietary/vendor/firmware/a710_zap.mdt
 'http://192.168.7.2:8022/put?p=/usr/share/firmware/kunzite/a710_zap.mdt&m=644&mk=1'` (vendor
 firmware: on the phone only, never in git). **Done 2026-10-23 during boot #31**: 4044 bytes, 0644
-root, read back with /get = identical (sha256 5e2e0c88...); it stays on the root FS.
+root, read back with /get = identical (sha256 5e2e0c88...); it stays on the root FS. **Test:** #31 image with `kgpu=12`. A reset right
+after an "smc" line = Gunyah/TZ does not take that call from us.
 
 **BOOT #32 (2026-10-23 18:33, shim/out/shim-boot-32.img = #31 with `kgpu=12`, kernel CI 39960767848
 @ 39c4977 sha256 158e7a70...): TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL.**
@@ -263,8 +264,24 @@ used where kg_next was meant).
 **Open question 2 ANSWERED: TZ takes PAS calls for the GPU from our kernel.** NEXT: step 13, the
 first SMMU writes: GMU memory through the SMMU (stream 5 -> an HLOS SMR/S2CR/context, our page
 tables, 3-level 4K, 39-bit, as hk/io-pgtable-arm), then 14 (GMU firmware gmu_gen70000.bin into
-ITCM/DTCM + its blocks), 15 (GMU out of reset, GBIF halt cleared first). **Test:** #31 image with `kgpu=12`. A reset right
-after an "smc" line = Gunyah/TZ does not take that call from us.
+ITCM/DTCM + its blocks), 15 (GMU out of reset, GBIF halt cleared first).
+
+**GPU STEP 13 = 0977 (2026-10-23, written, NOT built/booted), `kgpu=13`: the first SMMU writes.**
+Stream 5 (GMU) -> SMR/S2CR entry 1 -> context 1 (0 stays the GPU's, as Linux's adreno-smmu),
+refused unless entry 1, CB1 and stream 5 are unused (#30: all empty). One kernel page (kmem_alloc,
+kvtophys; both exported) holds L1/L2/L3 tables (+0/+0x1000/+0x2000; 3 levels, 4K, 39-bit) and a
+test page (+0x3000, filled 0x6a000000|i) mapped at GMU VA 0x60000000 (PTE outer-shareable, AF,
+nG, attr 0 = uncached), cache-cleaned (dc civac). Context programmed as hk's redwood MMU-500 took
+it: SCTLR 0, CBA2R VA64, CBAR stage-1 (0x1f300), TCR2 0x38011 (36-bit PA, 16-bit ASID), TCR
+0x803519 (T0SZ 25, WBWA, ISH, EPD1), TTBR0 = tables | ASID 1 << 48, TTBR1 0, MAIR0 0xf404ff44,
+MAIR1 0; then (logged commands, not undone) FSR W1C, TLBIASID 1, TLBSYNC, poll TLBSTATUS; then
+SCTLR on (M TRE AFE CFRE ASIDPNE), S2CR1 = 1, SMR1 = valid | 0x400 << 16 | 5; all read back.
+**IDR0 has ATOSNS: no address-translation operation**, so step 13 proves the configuration is
+taken and kept (readbacks, FSR/sGFSR 0, TLB sync finishes), not a translation; the GMU's own
+reads (steps 14-15) are that proof. Undo list now 40 entries, new kind KFREE: the end of the run
+unroutes stream 5, restores CB1/CBAR1/CBA2R1, frees the page last. Also step 11's groups say
+"next:". Verified: 219 patches, series reproduces the file, syntax clean. **Test:** #32 image
+with `kgpu=13`. A reset right after a "write SMMU" line = Gunyah forbids that SMMU write.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

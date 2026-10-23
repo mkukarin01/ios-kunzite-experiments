@@ -1,0 +1,311 @@
+kunzite: Adreno 710 step 13, the first SMMU writes (kgpu=13; 1-12 unchanged).
+Stream 5 (GMU) -> HLOS SMR/S2CR entry 1 -> context 1 (0 stays the GPU's, as in Linux's
+adreno-smmu), only if entry 1, context 1 and stream 5 are unused. Page tables of ours in one
+kernel page (3 levels, 4K granule, 39-bit VA, cache-cleaned) map a test page at the GMU's
+0x60000000. Context programmed as hk's redwood SMMU took it (CBA2R VA64, CBAR stage 1, TCR2 36-bit
+PA/16-bit ASID, TCR 39-bit WBWA ISH no-TTBR1, TTBR0 with ASID 1, MAIR0 Linux's, FSR cleared,
+TLBIASID + TLBSYNC, SCTLR on), then S2CR/SMR; everything read back. No ATOS on this SMMU
+(IDR0 ATOSNS): the GMU's own reads (steps 14-15) prove the translation. All undone at the end:
+SMR, S2CR, context restored, tables freed last. Also: step 11's groups say "next:".
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -3,9 +3,9 @@
+  * HackiOS redwood_adreno.c (main repo ios/gpu-plan.md, "Port map"). Steps
+  * 1-3 only read; steps 4-5 are the first writes (CX power, CX clocks); steps
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+- * write to the GMU itself; 11-12 ask TrustZone.
++ * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write.
+  *
+- * Boot-arg kgpu=N (N <= 12) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 13) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -66,6 +66,11 @@
+  *     page KG_ZAP_META_PA and asks PAS_INIT_IMAGE(13) to check its
+  *     signature (qcom_mdt_pas_init / qcom_scm_pas_init_image). Nothing is
+  *     loaded or started; the page is not touched again.
++ *  13 routes stream 5 (the GMU) through HLOS SMR/S2CR entry 1 and context 1
++ *     with page tables of ours (3 levels, 4K, 39-bit; one test page at the
++ *     GMU's 0x60000000): arm-smmu context programming as hk did on redwood;
++ *     checks the readbacks, fault status and a TLB sync. All undone at the end
++ *     (stream unrouted, context restored, tables freed last).
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -80,8 +85,10 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t kvtophys(vm_offset_t va);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ /* iokit/Kernel/arm/TopazModem.cpp: one SCM call, "interrupted" calls resumed with the x6 session */
+@@ -122,7 +129,7 @@ void kunzite_adreno_init(void);
+ #define KG_RCG_CFG_MASK  0x371fu         /* [4:0] 2*div-1, [10:8] source, [13:12] mode */
+ #define KG_RCG_GPLL0_DIV(twice) (6u << 8 | ((twice) - 1u))
+ #define KG_CBCR_ENABLE   (1u << 0)
+-#define KG_UNDO_MAX      16u
++#define KG_UNDO_MAX      40u
+ 
+ /* the GPU block: kgsl register numbers are dwords from 0x3d00000 (gen7_reg.h) */
+ #define KG_GPU_PA        0x03d00000u
+@@ -188,7 +195,31 @@ void kunzite_adreno_init(void);
+ #define SMMU_CB_MAIR0    0x38u
+ #define SMMU_CB_FSR      0x58u
+ #define SMMU_CB_FAR      0x60u
+-
++/* step 13: a translation of our own (arm-smmu.c / io-pgtable-arm.c; the values hk's redwood SMMU took) */
++#define SMMU_CB_TCR2     0x10u
++#define SMMU_CB_TTBR1    0x28u
++#define SMMU_CB_MAIR1    0x3cu
++#define SMMU_CB_FSYNR0   0x68u
++#define SMMU_CB_TLBIASID 0x610u
++#define SMMU_CB_TLBSYNC  0x7f0u
++#define SMMU_CB_TLBSTATUS 0x7f4u
++#define SMMU_SMR_VALID   (1u << 31)
++#define SMMU_STREAM_MASK 0x400u          /* FDT: the second cell of every "iommus" of this SMMU */
++#define SMMU_S2CR_FAULT  (2u << 16)
++#define SMMU_CBAR_S1     (1u << 16 | 3u << 8 | 0xfu << 12)       /* stage 1, stage 2 bypassed */
++#define SMMU_CBA2R_VA64  1u
++#define SMMU_TCR2_VAL    (1u | 1u << 4 | 7u << 15)       /* 36-bit PA, 16-bit ASID */
++#define SMMU_TCR_39BIT   (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)  /* 4K, WBWA walks, inner shareable, no TTBR1 */
++#define SMMU_MAIR0_VAL   0xf404ff44u     /* Linux's: 0 uncached, 1 cached, 2 device */
++#define SMMU_FSR_ALL     0xc00001feu
++#define SMMU_SCTLR_ON    (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)  /* M, TRE, AFE, CFRE, ASIDPNE */
++#define KG_GMU_STREAM    5u              /* FDT gmu iommus */
++#define KG_GMU_MATCH     1u              /* SMR/S2CR entry (0 is the GPU's) */
++#define KG_GMU_CB        1u              /* context (0 is the GPU's in Linux's adreno-smmu) */
++#define KG_GMU_TEST_VA   0x60000000ull   /* where the GMU's firmware wants its first pages (hk) */
++#define PTE_TABLE        3ull
++#define PTE_PAGE         3ull
++#define PTE_GMU          (2ull << 8 | 1ull << 10 | 1ull << 11)  /* outer shareable, accessed, not global; attr 0 */
+ /* TrustZone (qcom_scm.c / qcom_scm-smc.c: SiP, SMC64, yielding; the same as TopazModem's) */
+ #define KG_SCM_FN(call)          (0x42000000u | (call))         /* the SMC function number */
+ #define KG_SCM_ID(call)          (0x02000000u | (call))         /* the same call as an argument */
+@@ -216,7 +247,7 @@ void kunzite_adreno_init(void);
+ #define KG_DB_ENTRY      24u
+ #define KG_DB_ARC        3u
+ 
+-enum kg_undo_kind { KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC };
++enum kg_undo_kind { KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC, KG_UNDO_KFREE };
+ 
+ static struct {
+ 	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc, smmu;
+@@ -285,6 +316,22 @@ kg_put(const char *block, vm_offset_t base, uint32_t off, uint32_t val, enum kg_
+ 	kg_wr(base, off, val);
+ }
+ 
++/* an undo entry without a register write (memory of ours to free at the end) */
++static void
++kg_undo_push(enum kg_undo_kind kind, vm_offset_t base, uint32_t off, uint32_t value, const char *name)
++{
++	if (kg.nundo < KG_UNDO_MAX) {
++		kg.undo[kg.nundo].kind = kind;
++		kg.undo[kg.nundo].base = base;
++		kg.undo[kg.nundo].off = off;
++		kg.undo[kg.nundo].value = value;
++		kg.undo[kg.nundo].name = name;
++		kg.nundo++;
++	} else {
++		printf("SWEET KGPU: %u undo list full: %s is not undone\n", kg.step, name);
++	}
++}
++
+ /* poll until (reg & mask) == want, for up to ms milliseconds */
+ static bool
+ kg_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned ms)
+@@ -325,6 +372,10 @@ kg_undo_pop(void)
+ 		kg_wr(base, off, kg_rd(base, off) | KG_GDSC_COLLAPSE);
+ 		(void)kg_poll(base, off, KG_GDSC_PWR_ON, 0, 100);
+ 		break;
++	case KG_UNDO_KFREE:             /* memory of ours: base = address, value = size */
++		kmem_free(kernel_map, base, value);
++		printf("SWEET KGPU: undo %s: freed %#x bytes\n", name, value);
++		return;
+ 	}
+ 	printf("SWEET KGPU: undo %s +%#x: now %#x\n", name, off, kg_rd(base, off));
+ }
+@@ -971,18 +1022,18 @@ kg_step11(void)
+ 	uint64_t res;
+ 	unsigned supported = 0;
+ 
+-	kg_announce(11, "nothing; next: SCM is_call_available(is_call_available), Linux's first question to TrustZone");
++	kg_next(11, "SCM is_call_available(is_call_available), Linux's first question to TrustZone");
+ 	if (kg_scm(11, "is_call_available", KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(KG_SCM_INFO_IS_AVAIL), 0,
+ 	    &res) != 0 || res != 1) {
+ 		printf("SWEET KGPU: 11 TrustZone does not answer the way it answers Linux\n");
+ 		return false;
+ 	}
+-	kg_announce(11, "nothing; next: is_call_available for the five PAS calls");
++	kg_next(11, "is_call_available for the five PAS calls");
+ 	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+ 		uint64_t ret = kg_scm(11, calls[i].name, KG_SCM_INFO_IS_AVAIL, KG_SCM_ARGS_VAL, KG_SCM_ID(calls[i].call), 0, &res);
+ 		printf("SWEET KGPU: 11 %s: %s\n", calls[i].name, ret == 0 && res == 1 ? "available" : "NOT available");
+ 	}
+-	kg_announce(11, "nothing; next: pas_is_supported for images 1, 4, 9, 13");
++	kg_next(11, "pas_is_supported for images 1, 4, 9, 13");
+ 	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
+ 		uint64_t ret = kg_scm(11, images[i].name, KG_SCM_PAS_IS_SUPPORTED, KG_SCM_ARGS_VAL, images[i].id, 0, &res);
+ 		bool yes = ret == 0 && res == 1;
+@@ -1077,6 +1128,122 @@ kg_step12(void)
+ 	return false;
+ }
+ 
++/* ---- step 13: GMU memory through the SMMU ---- */
++
++/* the SMMU reads the tables from memory, not from this processor's cache */
++static void
++kg_to_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * Stream 5 (the GMU) through HLOS entry 1 and context 1, with tables of
++ * ours (3 levels of 4K pages, 39-bit addresses), mapping one test page at the
++ * GMU's 0x60000000. This SMMU has no address translation operations (IDR0
++ * ATOSNS), so what is checked here is that it takes and keeps the
++ * configuration and finishes a TLB sync; the GMU reading through it (steps
++ * 14-15) is the proof of the translation.
++ */
++static bool
++kg_step13(void)
++{
++	static const uint32_t gmu_va_l1 = (uint32_t)(KG_GMU_TEST_VA >> 30) & 0x1ffu;
++	vm_offset_t mem = 0;
++	vm_size_t size = PAGE_SIZE >= 0x4000 ? PAGE_SIZE : 0x4000;
++
++	if (!kg_cx_ready(13) || kg.smmu == 0 || kg.smmu_pages == 0) {
++		printf("SWEET KGPU: 13 needs steps 4-8\n");
++		return false;
++	}
++	uint32_t cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page, gr1 = kg.smmu_page;
++	kg_announce(13, "SMR/S2CR entry 1 and context 1 before using them");
++	uint32_t smr = kg_rd(kg.smmu, SMMU_SMR(KG_GMU_MATCH)), cbar = kg_rd(kg.smmu, gr1 + SMMU_CBAR(KG_GMU_CB));
++	int taken = kg_smmu_match(KG_GMU_STREAM);
++	printf("SWEET KGPU: 13 smr1 %#x cbar1 %#x cb1 sctlr %#x; stream 5 matched by entry %d\n", smr, cbar,
++	    kg_rd(kg.smmu, cb + SMMU_CB_SCTLR), taken);
++	if ((smr & SMMU_SMR_VALID) || cbar != 0 || taken >= 0) {
++		printf("SWEET KGPU: 13 entry 1 / context 1 / stream 5 are in use: not ours to take\n");
++		return false;
++	}
++
++	if (kmem_alloc(kernel_map, &mem, size, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET KGPU: 13 no memory for the tables\n");
++		return false;
++	}
++	kg_undo_push(KG_UNDO_KFREE, mem, 0, (uint32_t)size, "gmu tables and test page");
++	uint64_t phys = kvtophys(mem);
++	if (kvtophys(mem + 0x3000) != phys + 0x3000) {
++		printf("SWEET KGPU: 13 the tables' memory is not in one piece\n");
++		return false;
++	}
++	uint64_t *l1 = (uint64_t *)mem, *l2 = (uint64_t *)(mem + 0x1000), *l3 = (uint64_t *)(mem + 0x2000);
++	uint32_t *test = (uint32_t *)(mem + 0x3000);
++	l1[gmu_va_l1] = (phys + 0x1000) | PTE_TABLE;
++	l2[(KG_GMU_TEST_VA >> 21) & 0x1ffu] = (phys + 0x2000) | PTE_TABLE;
++	l3[(KG_GMU_TEST_VA >> 12) & 0x1ffu] = (phys + 0x3000) | PTE_GMU | PTE_PAGE;
++	for (uint32_t i = 0; i < 1024; i++) {
++		test[i] = 0x6a000000u | i;
++	}
++	kg_to_memory(mem, 0x4000);
++	uint64_t root = phys | (uint64_t)KG_GMU_CB << 48;      /* tagged with the context's ASID */
++	printf("SWEET KGPU: 13 tables at %#llx (l1[%u] %#llx, l2 %#llx, l3 %#llx), GMU %#llx -> test page %#llx\n",
++	    phys, gmu_va_l1, l1[gmu_va_l1], l2[(KG_GMU_TEST_VA >> 21) & 0x1ffu], l3[(KG_GMU_TEST_VA >> 12) & 0x1ffu],
++	    KG_GMU_TEST_VA, phys + 0x3000);
++
++	kg_next(13, "context 1 gets our tables (the first SMMU writes)");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, 0, KG_UNDO_WORD, 0, "cb1 sctlr");
++	kg_put("SMMU", kg.smmu, gr1 + SMMU_CBA2R(KG_GMU_CB), SMMU_CBA2R_VA64, KG_UNDO_WORD, 0, "cba2r1");
++	kg_put("SMMU", kg.smmu, gr1 + SMMU_CBAR(KG_GMU_CB), SMMU_CBAR_S1, KG_UNDO_WORD, 0, "cbar1");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TCR2, SMMU_TCR2_VAL, KG_UNDO_WORD, 0, "cb1 tcr2");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TCR, SMMU_TCR_39BIT, KG_UNDO_WORD, 0, "cb1 tcr");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR0, (uint32_t)root, KG_UNDO_WORD, 0, "cb1 ttbr0 lo");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32), KG_UNDO_WORD, 0, "cb1 ttbr0 hi");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR1, 0, KG_UNDO_WORD, 0, "cb1 ttbr1 lo");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_TTBR1 + 4, 0, KG_UNDO_WORD, 0, "cb1 ttbr1 hi");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_MAIR0, SMMU_MAIR0_VAL, KG_UNDO_WORD, 0, "cb1 mair0");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_MAIR1, 0, KG_UNDO_WORD, 0, "cb1 mair1");
++
++	kg_next(13, "context 1: clear its fault status, forget ASID 1, TLB sync");
++	printf("SWEET KGPU: 13 command fsr <- %#x, tlbiasid <- %u, tlbsync <- 1\n", SMMU_FSR_ALL, KG_GMU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_FSR, SMMU_FSR_ALL);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBIASID, KG_GMU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBSYNC, 1);
++	bool synced = kg_poll(kg.smmu, cb + SMMU_CB_TLBSTATUS, 1u, 0, 100);
++	printf("SWEET KGPU: 13 tlbstatus %#x: %s\n", kg_rd(kg.smmu, cb + SMMU_CB_TLBSTATUS),
++	    synced ? "sync done" : "SYNC DOES NOT FINISH");
++	if (!synced) {
++		return false;
++	}
++
++	kg_next(13, "context 1 on, then stream 5 -> entry 1 -> context 1");
++	kg_put("SMMU", kg.smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON, KG_UNDO_WORD, 0, "cb1 sctlr");
++	kg_put("SMMU", kg.smmu, SMMU_S2CR(KG_GMU_MATCH), KG_GMU_CB, KG_UNDO_WORD, 0, "s2cr1");
++	kg_put("SMMU", kg.smmu, SMMU_SMR(KG_GMU_MATCH), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | KG_GMU_STREAM,
++	    KG_UNDO_WORD, 0, "smr1");
++
++	uint32_t r_smr = kg_rd(kg.smmu, SMMU_SMR(KG_GMU_MATCH)), r_s2cr = kg_rd(kg.smmu, SMMU_S2CR(KG_GMU_MATCH));
++	uint32_t r_cbar = kg_rd(kg.smmu, gr1 + SMMU_CBAR(KG_GMU_CB)), r_sctlr = kg_rd(kg.smmu, cb + SMMU_CB_SCTLR);
++	uint32_t r_lo = kg_rd(kg.smmu, cb + SMMU_CB_TTBR0), r_hi = kg_rd(kg.smmu, cb + SMMU_CB_TTBR0 + 4);
++	printf("SWEET KGPU: 13 read back smr1 %#x s2cr1 %#x cbar1 %#x cba2r1 %#x sctlr %#x tcr %#x tcr2 %#x ttbr0 %#x:%08x "
++	    "mair0 %#x fsr %#x sgfsr %#x\n", r_smr, r_s2cr, r_cbar, kg_rd(kg.smmu, gr1 + SMMU_CBA2R(KG_GMU_CB)), r_sctlr,
++	    kg_rd(kg.smmu, cb + SMMU_CB_TCR), kg_rd(kg.smmu, cb + SMMU_CB_TCR2), r_hi, r_lo,
++	    kg_rd(kg.smmu, cb + SMMU_CB_MAIR0), kg_rd(kg.smmu, cb + SMMU_CB_FSR), kg_rd(kg.smmu, SMMU_SGFSR));
++	bool kept = r_smr == (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | KG_GMU_STREAM) &&
++	    (r_s2cr & 0x300ffu) == KG_GMU_CB && (r_cbar & 0x30000u) == (SMMU_CBAR_S1 & 0x30000u) && (r_sctlr & 1u) &&
++	    r_lo == (uint32_t)root && r_hi == (uint32_t)(root >> 32);
++	if (!kept) {
++		printf("SWEET KGPU: 13 the SMMU did not keep what was written: stream 5 is not going through context 1\n");
++		return false;
++	}
++	printf("SWEET KGPU: 13 THE SMMU TAKES OUR TABLES: stream 5 (GMU) -> entry 1 -> context 1, GMU %#llx -> %#llx "
++	    "(no ATOS here: the GMU's own reads are the proof)\n", KG_GMU_TEST_VA, phys + 0x3000);
++	return true;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -1108,14 +1275,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -1150,12 +1317,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 12 ? 12u : (unsigned)last;
++	kg.last = last > 13 ? 13u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 12) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..12 exist; running those\n", last);
++	if (last > 13) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..13 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
