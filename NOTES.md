@@ -323,6 +323,20 @@ bytes", then the usual 5, "run over". Verified: 220 patches, series reproduces t
 clean, no CBAR/CBA2R/CB undo left. **Test:** reboot the phone (it is on the #33 panic screen) to
 fastboot, CI -> #33 image again with this kernel, `kgpu=13`.
 
+**BOOT #34 (2026-10-23 19:19, shim/out/shim-boot-34.img = #33 with the 0978 kernel, CI 39966958819
+@ 31ab72f sha256 45f89519...): STEPS 1-13 AND THE UNDO RUN CLEAN, NO PANIC (0978 works).** Log:
+temp/ios-m8/usblog/live-boot34-20261023-1918.txt. Step 13 as #33 (context writes "(kept)", TLB sync
+done, identical readbacks, "THE SMMU TAKES OUR TABLES"); tables at 0xa290d8000. "9 writes to
+undo": smr1 -> 0, s2cr1 -> 0x20000, cb1 sctlr (off) -> 0, "gmu tables and test page: freed 0x4000
+bytes" (kmem_free with KMA_DATA|KMA_ZERO works), then the 5 of steps 4-5, CX back to 0x22f001,
+"run over". System as before (driverkitd only). CBAR1 read 0 at the start (not #33's 0x1f300) and
+CB1's leftovers differ again (sctlr 0x4a2112): the SMMU state did NOT survive the reboot despite
+retain-regs; the CBAR-blind guard is still right within a boot. **Steps 1-13 of the port map are
+proven on kunzite.** NEXT: step 14, the GMU firmware (gmu_gen70000.bin: kgsl gen7_gmu_parse_fw /
+load_fw / itcm_shadow, its blocks into ITCM/DTCM and the VMAs the blob asks for through context
+1), then 15 (GBIF_HALT = 0, CM3_SYSRESET = 0, wait FW_INIT_RESULT): the first proof that the GMU
+reads through our SMMU tables.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
