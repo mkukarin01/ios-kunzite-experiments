@@ -353,7 +353,8 @@ memcpy'd + cache-cleaned), versions at DTCM+0xff8 (expected core 0x40000007 >= 0
 Undo peaks at 17 entries. CM3 stays in reset; TCMs not restored. Verified: 221 patches, series
 reproduces the file, syntax clean. **Before the test, once:** `curl -s -T temp/kunzite-vendor/
 proprietary/vendor/firmware/gmu_gen70000.bin 'http://192.168.7.2:8022/put?p=/usr/share/firmware/
-kunzite/gmu_gen70000.bin&m=644&mk=1'` (vendor firmware, phone only). **Test:** #34 image with
+kunzite/gmu_gen70000.bin&m=644&mk=1'` (vendor firmware, phone only). **Done 2026-10-23 during boot #34**: 57272
+bytes, 0644 root, read back with /get = identical (sha256 b2d3f0e2...). **Test:** #34 image with
 `kgpu=14`. Success line: "THE GMU FIRMWARE IS LOADED (the CM3 stays in reset)".
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
