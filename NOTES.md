@@ -63,6 +63,15 @@ charger 0148) merged but dormant until re-ported. NEXT: push kunzite-topaz-gpu -
 possible if stayon removed + their LP-mode DCS, GPU still off). THEN: GPU port plan step 3
 (redwood_adreno.c -> parrot a710) + userland (Mesa chipid, eagl slots for 20H392).
 
+**CI run 39919704364 (kunzite-topaz-gpu @ 94bfddc) FAILED, 1 compile error (make -k, nothing else
+broke):** `sweet_ufs.c:843 call to undeclared function 'kunzite_touch_init'`. Cause: regenerating
+0908 -> 0967 dropped its first sweet_ufs.c hunk (`extern void sweet_touch_init` -> `kunzite_touch_init`
+at line 54); the old hunk's context still matched. Restored verbatim; series re-applied to
+sweet_ufs.c/sweet_keys.c/kunzite_touch.c cleanly (scratch git apply). 0960/0964/0968 regen diffs
+reviewed: only context moves, no lost hunks. Externs used by 0960-0969 all defined in the series.
+Blacktop's own 4 skipped patches (TrustCache, iobuffermemd, skywalk, syntax_checker) are dxb's, not ours: unrelated to the merge.
+NEXT: push -> rerun CI (link stage not reached yet).
+
 **SCOUT RESULT (2026-10-23, workflow wf_edc5205d, 4 readers):**
 - HackiOS boot = fastboot RAM-boot -> BootShim + Mu-Silicium UEFI (drivers extracted from the
   phone's own xbl.img!) -> xnuloader EFI app -> XNU; one kernel for all devices (BCM2837 config

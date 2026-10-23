@@ -1,6 +1,6 @@
 kunzite: Goodix GT9916K (Berlin-D) on SPI QUP1 SE3, GENI FIFO mode, polled; RPMh L7E
-for AVDD. Regenerated over the merged series (files entry + call site re-derived;
-the kunzite_touch.c body is carried over unchanged).
+for AVDD. Regenerated over the merged series (files entry, call site and its extern
+re-derived; the kunzite_touch.c body is carried over unchanged).
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -1189,6 +1189,15 @@ diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
+@@ -51,7 +51,7 @@
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+-extern void sweet_touch_init(void);
++extern void kunzite_touch_init(void);
+ extern void sweet_usb_probe(void);
+
+ #define REG_CAP         0x00
 @@ -842,7 +842,7 @@
  	 */
  	int hw = 0;
