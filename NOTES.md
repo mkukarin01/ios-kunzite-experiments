@@ -373,6 +373,30 @@ gen7_gmu_first_boot order after load_fw: version_info, itcm_shadow, [scm cx regs
 irq enable, bus vote, device_start = CM3_SYSRESET 0 + poll FW_INIT_RESULT bit 8; GBIF_HALT 0
 first): needs a read of gen7_gmu_register_config / gen7_gmu_device_start's preconditions.
 
+**GPU STEP 15 = 0980 (2026-10-23, written, NOT built/booted), `kgpu=15`: the GMU starts.** Read
+from kgsl (temp/gpu-plan-review/kgsl): gen7_gmu_first_boot after load_fw = version_info,
+itcm_shadow (a copy for snapshots), scm_gpu_init_cx_regs (BCL/CLX/tsense via TZ; EOPNOTSUPP is
+ignored, skipped here), register_config, irq_enable, bus vote, device_start. 0980 does
+register_config in kgsl's order, all kept: FALNEXT/FAL 1, FW_INIT_RESULT 0, BOOT_CONFIG 2,
+HFI_QTBL_ADDR 0x60012000 + INFO 1, AHB_FENCE_RANGE_0 0x80c808a0, CM3_CFG 0x4052, gen7_3_0 GBIF QSB
+SIDE0-3 0x00071620, GBIF_HALT 0, GENERAL_9 0 (log wptr), GENERAL_10 0x07010000 (chipid),
+GENERAL_8 0x6000200f (log 0x60002000, 16 pages), SYS_BUS/ICACHE/DCACHE_CONFIG 1; then
+irq_enable's two clears (masks left alone: we poll). Before that: a 64K log at 0x60002000 and 16K
+HFI at 0x60012000 (kgsl's next VAs after the firmware's 0x60000000/0x60001000), the queue table
+as gen7_hfi_init writes it (840 bytes = 6 + 17x12 words; queues at +0x350/+0x1350/+0x2350, types
+0xa00/0xa01/0x2802, 1024 words), every GMU block flushed (KMA_ZERO zeroes in the cache would
+land on what the GMU writes), TLBIASID+sync. Then CM3_SYSRESET 0 and FW_INIT_RESULT polled for
+0x100 under mask 0x1ff (kgsl gives 100 ms; here 500), bits 11:9 = stopped in the NMI handler.
+Printed after: fw_init_result, HFI_CTRL_STATUS, GMU2HOST_INTR_INFO, AO_HOST_INTERRUPT_STATUS,
+sysreset; CB1 FSR/FAR/FSYNR0 and sGFSR; non-zero words in the log's first page and its first 4;
+the three queues' read/write indices. Undo (a new KG_UNDO_CM3 entry pushed just before the
+release, so it runs first): gen7_gmu_pwrctrl_suspend's order = AHB_FENCE_STATUS_CLR 7,
+AO_AHB_FENCE_CTRL 0, CM3_SYSRESET 1, GBIF_HALT ARB (bit 1) + wait HALT_ACK, then the frees (now 8
+"gmu firmware memory"), stream 5 unrouted, CX down. Undo peaks at 20 entries (max 40). Verified:
+222 patches, series reproduces the file, syntax clean. **Test:** #35 image with `kgpu=15`.
+Success line: "THE GMU'S FIRMWARE RUNS"; worth reading even on failure: CB1 FSR/FAR (the GMU
+fetching an address we did not map), the log count (the GMU writing through our tables).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
