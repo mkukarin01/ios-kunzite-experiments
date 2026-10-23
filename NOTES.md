@@ -615,6 +615,30 @@ LOADED (TrustZone authenticated it)" then "THE CP RUNS: CP_ME_INIT consumed, the
 (microcode fetched through context 0)". Verified: 227 patches, series reproduces the file, syntax
 clean. **Test:** #40 image with `kgpu=20`.
 
+**BOOT #41 (2026-10-24 00:27, shim/out/shim-boot-41.img = #40 with `kgpu=20`, kernel CI 40010709615
+@ 9e7fe65 sha256 c0095ab9...): KGPU 20 PASSES: "THE ZAP SHADER IS LOADED (TrustZone authenticated
+it)" AND "THE CP RUNS: CP_ME_INIT consumed, the GPU idle (microcode fetched through context 0)";
+NO PANIC, UNDO CLEAN.** Log: temp/ios-m8/usblog/live-boot41-20261024-0027.txt. Steps 1-19 as
+#40, the GPU's addresses now 0xe0000000 (ring 0xe0000000, scratch 0xe0008000, SQE 0xe0010000;
+9 of 12 tables; CB0 before: sctlr 0x30e, other leftovers than #40's). Zap: loadable 0x1000..0x2000
+relocatable; **PAS_MEM_SETUP(13, 0x89e1a000, 0x1000) ret 0 res 0** (step 12's INIT_IMAGE still
+holds); **the zap region is writable from HLOS** (1948 bytes of a710_zap.b01 written, no abort);
+**PAS_AUTH_AND_RESET(13) ret 0 res 0**. gen7_start: 20 plain writes, ao hwcg, 46 protect, secvid,
+49 hwcg, RBBM_CLOCK_CNTL 0x8aa8aa82 (was 0); 5 registers read back other than written:
+RBBM_PERFCTR_GPU_BUSY_MASKED 0x50b reads 0x2f7fff (writable bits only), UCHE_GMEM_RANGE_MIN_LO
+0xe0b and MAX_LO 0xe0d read 0 (not kept on gen7_3_0?), RBBM_CLOCK_MODE_CP 0x260 and
+RBBM_ISDB_CNT 0x533 read 0 - kgsl writes them blind; none mattered here. RB_CMP_DBG_ECO_CNTL
+0x4000 -> 0x4800. rb_start: RPTR_ADDR 0xe0008000, RB_CNTL 0x20c, **CP_SQE_CNTL 1**: rbbm_status
+0x1, no CP interrupt, no fault. **WPTR 10 -> RPTR 10 at once ("after 0.0 ms"), the shadow in the
+scratch page reads 10 (the CP wrote it through context 0), CX busy 0x71000000 (bit 23 clear),
+SQE_STAT 0x70c80007 (the CP_ME_INIT header), CB0 FSR 0x400, SGFSR 0.** So the GPU's CP fetched
+its microcode and the ring and wrote memory, all through our tables. Undo (51): cp_sqe_cntl 0
+first, stream 0 unrouted, CB0 off, frees, oob clear, slumber (PREPARE_SLUMBER acked, GX off,
+0xf, RSC sleep done), the rest as #40; "run over". System as #40 (agent up). **The port map's
+1-20 proven (kgpu 1-20).** NEXT (kgpu 21 = the port map's 21): out of secure mode
+(CP_SET_SECURE_MODE 0 through the ring, as gen7_rb_start does once the zap is loaded) and a word
+written by the GPU (CP_MEM_WRITE to the scratch page), both with WPTR/RPTR and idle checks.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
