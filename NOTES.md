@@ -298,6 +298,19 @@ line ever arrived: **kernel panic** (user: on screen, ~1 min at the lock screen)
 USB log, so the culprit is not in it. Suspects: (1) kmem_free of the KMA_KOBJECT|KMA_DATA table
 page (new path: hk never freed its tables), (2) one of the 13 SMMU restores writing CB1's junk
 leftovers back. The panic screen's text (keepsyms=1 => names) decides.
+**#33 PANIC DECODED (user's screen, symbolized against the booted kernel 94fc689f...):** "Kernel
+data abort" at pc 0xfffffe0007521a00 = **kg_undo_pop+0x74, `str w20, [x23]`** (the KG_UNDO_WORD
+restore), lr kg_thread+0x280 (kg_teardown inlined); esr 0x96000010 (synchronous external abort;
+WnR not trustworthy here, the instruction is a store); far 0xfffffe10003c1004 = SMMU base
+(x19 0xfffffe10003c0000) + **0x1004 = CBAR1**, value w20 = 0. The undo had already restored SMR1,
+S2CR1, SCTLR, MAIR0/1, TTBR0/1, TCR, TCR2. **Writing CBAR1 := 0 (type 0 = a STAGE-2 context) on
+this stage-1-only SMMU (IDR0 S1TS, no S2TS) is rejected with an external abort** (SMMU or
+Gunyah); 0 was only the power-up value. Our 0x1f300 (stage 1, S2 bypass) was accepted. Linux's
+arm-smmu releases a context with SCTLR = 0 only (arm_smmu_write_context_bank, !cfg). Fix: undo
+only SMR (0), S2CR (fault), SCTLR (0, not the junk leftover); log but never restore CBAR/CBA2R/
+TCR/TCR2/TTBR/MAIR; allocate the tables with KMA_DATA|KMA_ZERO (the pair topaz_sandbox_container.c
+already allocates and kmem_frees on every op 4) instead of hk's KMA_KOBJECT|KMA_DATA, whose
+kmem_free has never run here.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
