@@ -1,0 +1,716 @@
+kunzite: Adreno 710 step 17, HFI messages to the GMU (kgpu=17; 16's check relaxed, 1-15 unchanged).
+16: a word that still reads what it held after the write is "write ignored" (boot #37: the three
+hidden TCS command addresses, wired to the PDC's +0x4514/+0x4510/+0x4520), reported, not a failure.
+17 does kgsl's gen7_hfi_start after reset_hfi_queues. Tables as gen7_build_rpmh_tables: the ARC
+levels of gfx.lvl/cx.lvl/mx.lvl from cmd-db (counted as adreno_rpmh_arc_cmds), the FDT levels of
+speed bin 0xc6 (295-940 MHz, qcom,level 56..416, no qcom,cx-level so every dep vote 0xffffffff),
+the GMU's 200/500 MHz at LOW_SVS/SVS (no qcom,gmu-freq-table): the legacy H2F_MSG_PERF_TBL
+(hfi_dcvstable_cmd, 59 words: HFI 2.1 is before 2.6.1); the BCMs SH0/MC0/ACV and CN0 from cmd-db
+(address, unit, width, vcd) with the FDT's qcom,bus-table-ddr7 (ddr_device_type 7) and
+bus-table-cnoc, ab 0, ACV perfmode 0x8 above level 0: H2F_MSG_BW_VOTE_TBL (hfi_bwtable_cmd, 160
+words). Then H2F_MSG_FEATURE_CTRL for IFPC, ACD and BCL off (kgsl only sends enables; a refusal is
+reported) and H2F_MSG_CORE_FW_START. Each command goes into the command queue (cookie-padded to 4
+words, seqnum/size in the header), HOST2GMU_INTR_SET 1, then GMU2HOST_INTR_INFO bit 0 or the
+message queue moving within 1 s (NMI ends the wait), the ack matched on the sent header, result 0.
+The HFI block is accessed through an uncached alias (ml_io_map_unmappable, VM_WIMG_WCOMB; unmapped
+before the step returns): the GMU sees it uncached, and its indices share cache lines with ours.
+The cmd-db lookup moves out of kg_arc into kg_db_find; step 2 keeps the speed bin. Undo: a second
+CM3 reset entry, so the GMU stops before step 16's RSC/PDC words go back (40 entries at most).
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index a0937e0..b3b3369 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -5,9 +5,9 @@
+  * 6-9 read again, now inside the powered CX half; step 10 is the first
+  * write to the GMU itself; 11-12 ask TrustZone; 13 is the first SMMU write;
+  * 14 loads the GMU's firmware; 15 lets the GMU run it; 16 gives it its RPMh
+- * channel and starts HFI.
++ * channel and starts HFI; 17 talks to it.
+  *
+- * Boot-arg kgpu=N (N <= 16) runs steps 1..N once, on its own thread, kgpu_delay
++ * Boot-arg kgpu=N (N <= 17) runs steps 1..N once, on its own thread, kgpu_delay
+  * seconds (default 60) after boot, so the USB live log is up to watch it.
+  * Before each group of reads a step says what it is about to read and waits
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+@@ -93,6 +93,11 @@
+  *     undone at the end (the boot's words back, the GMU still running);
+  *     then gen7_gmu_hfi_start: HFI_CTRL_INIT 1 (kept), HFI_CTRL_STATUS bit
+  *     0 polled for 100 ms. Reports the log, interrupts and HFI queues.
++ *  17 gen7_hfi_start's messages through an uncached alias of the HFI block:
++ *     the perf table (legacy, HFI 2.1; ARC votes from cmd-db, FDT bin 0xc6
++ *     levels), the bus table (BCMs SH0/MC0/ACV and CN0 from cmd-db, FDT
++ *     LPDDR4X table), IFPC/ACD/BCL off, core fw start; each acked with
++ *     result 0. Undo: the CM3 into reset before step 16's words go back.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -108,8 +113,12 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
++#include <vm/memory_types.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* a mapping ml_io_unmap can take back (ml_io_map's are permanent) */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern uint64_t kvtophys(vm_offset_t va);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+@@ -280,7 +289,7 @@ static struct {
+ 	vm_offset_t gcc, db, qfprom, gpucc, gmu, gbif, rscc, pdc, smmu;
+ 	uint32_t smmu_page, smmu_pages, smmu_cbs, smmu_smrs;
+ 	int gpu_cb;                     /* the HLOS context stream 0 (GPU) is matched to, or -1 */
+-	unsigned last, pause_ms, delay_s, hold_s, step;
++	unsigned last, pause_ms, delay_s, hold_s, step, speed_bin;
+ 	bool started, ahb_on;
+ 	struct {
+ 		enum kg_undo_kind kind;
+@@ -480,9 +489,9 @@ kg_db_range(uint32_t off, uint32_t size)
+ 	return off <= KG_CMDDB_SIZE && size <= KG_CMDDB_SIZE - off;
+ }
+ 
+-/* one ARC resource: its RPMh address and its level table (cmd-db aux data) */
+-static void
+-kg_arc(const char *res)
++/* an RPMh resource in cmd-db: how many entries name it; the first one's slave type, address and aux data */
++static unsigned
++kg_db_find(const char *res, unsigned *slave, uint32_t *addr, uint32_t *aux, unsigned *len)
+ {
+ 	uint32_t key[2] = { 0, 0 };
+ 	unsigned matches = 0;
+@@ -492,43 +501,62 @@ kg_arc(const char *res)
+ 	}
+ 	for (unsigned i = 0; i < 8; ++i) {
+ 		uint32_t h = 8u + 16u * i;
+-		unsigned slave = kg_db16(h);
+-		if (!slave) {
++		unsigned type = kg_db16(h);
++		if (!type) {
+ 			break;
+ 		}
+ 		uint32_t entries = KG_DB_HEADER + kg_db16(h + 2);
+ 		uint32_t data = KG_DB_HEADER + kg_db16(h + 4);
+ 		unsigned count = kg_db16(h + 6);
+ 		if ((entries & 3u) || !kg_db_range(entries, count * KG_DB_ENTRY) || !kg_db_range(data, 0)) {
+-			printf("SWEET KGPU: 1 malformed cmd-db slave header %u\n", i);
+-			return;
++			printf("SWEET KGPU: %u malformed cmd-db slave header %u\n", kg.step, i);
++			return 0;
+ 		}
+ 		for (unsigned j = 0; j < count; ++j) {
+ 			uint32_t e = entries + KG_DB_ENTRY * j;
+ 			if (kg_rd(kg.db, e) != key[0] || kg_rd(kg.db, e + 4) != key[1]) {
+ 				continue;
+ 			}
+-			uint32_t addr = kg_rd(kg.db, e + 16);
+-			unsigned len = kg_db16(e + 20);
+-			uint32_t aux = data + kg_db16(e + 22);
+-			++matches;
+-			if (slave != KG_DB_ARC || (len & 1u) || !kg_db_range(aux, len)) {
+-				printf("SWEET KGPU: 1 rpmh %s slave %u addr %#x aux %u bytes: not an ARC entry\n",
+-				    res, slave, addr, len);
+-				continue;
+-			}
+-			char levels[96];
+-			size_t used = 0;
+-			levels[0] = 0;
+-			for (unsigned k = 0; k < len / 2 && k < 16 && used < sizeof(levels) - 8; ++k) {
+-				used += (size_t)snprintf(levels + used, sizeof(levels) - used, " %u", (unsigned)kg_db16(aux + 2 * k));
++			if (matches++ == 0) {
++				*slave = type;
++				*addr = kg_rd(kg.db, e + 16);
++				*len = kg_db16(e + 20);
++				*aux = data + kg_db16(e + 22);
+ 			}
+-			printf("SWEET KGPU: 1 rpmh %s addr %#x, %u levels:%s\n", res, addr, len / 2, levels);
+ 		}
+ 	}
++	if (matches != 0 && !kg_db_range(*aux, *len)) {
++		printf("SWEET KGPU: %u rpmh %s: aux data outside cmd-db\n", kg.step, res);
++		return 0;
++	}
++	return matches;
++}
++
++/* one ARC resource: its RPMh address and its level table (cmd-db aux data) */
++static void
++kg_arc(const char *res)
++{
++	unsigned slave = 0, len = 0;
++	uint32_t addr = 0, aux = 0;
++	unsigned matches = kg_db_find(res, &slave, &addr, &aux, &len);
++
+ 	if (matches != 1) {
+ 		printf("SWEET KGPU: 1 rpmh %s: %u cmd-db entries\n", res, matches);
+ 	}
++	if (matches == 0) {
++		return;
++	}
++	if (slave != KG_DB_ARC || (len & 1u)) {
++		printf("SWEET KGPU: 1 rpmh %s slave %u addr %#x aux %u bytes: not an ARC entry\n", res, slave, addr, len);
++		return;
++	}
++	char levels[96];
++	size_t used = 0;
++	levels[0] = 0;
++	for (unsigned k = 0; k < len / 2 && k < 16 && used < sizeof(levels) - 8; ++k) {
++		used += (size_t)snprintf(levels + used, sizeof(levels) - used, " %u", (unsigned)kg_db16(aux + 2 * k));
++	}
++	printf("SWEET KGPU: 1 rpmh %s addr %#x, %u levels:%s\n", res, addr, len / 2, levels);
+ }
+ 
+ static bool
+@@ -581,6 +609,7 @@ kg_step2(void)
+ 	unsigned bin = (((w118 >> 8) & 0xffffu) >> 5) & 0xffu;
+ 	unsigned gaming = (w130 >> 6) & 1u;
+ 	unsigned i;
++	kg.speed_bin = bin;
+ 	for (i = 0; i < sizeof(kg_bins) / sizeof(kg_bins[0]) && kg_bins[i].bin != bin; ++i) {
+ 	}
+ 	if (i < sizeof(kg_bins) / sizeof(kg_bins[0])) {
+@@ -1389,6 +1418,7 @@ static struct {
+ static unsigned kg_gmu_nmem;
+ static bool kg_gmu_loaded;               /* step 14 got through, in this run */
+ static bool kg_gmu_runs;                 /* step 15 got FW_INIT_RESULT 0x100 */
++static bool kg_hfi_up;                   /* step 16 got through */
+ 
+ /* [a, a + s) inside [base, base + len) */
+ static bool
+@@ -1787,7 +1817,8 @@ static const struct {
+ static bool
+ kg_step16(void)
+ {
+-	unsigned rsc = sizeof(kg_rsc) / sizeof(kg_rsc[0]), bad = 0;
++	unsigned rsc = sizeof(kg_rsc) / sizeof(kg_rsc[0]), bad = 0, ignored = 0;
++	uint32_t old[sizeof(kg_rsc) / sizeof(kg_rsc[0])];
+ 
+ 	if (!kg_gmu_runs || kg.rscc == 0 || kg.pdc == 0) {
+ 		printf("SWEET KGPU: 16 needs steps 4-15 (the GMU running in this run)\n");
+@@ -1809,17 +1840,25 @@ kg_step16(void)
+ 
+ 	kg_next(16, "the RSC's words (kgsl gen7_load_rsc_ucode, RSCC 0x3d50000), undone at the end");
+ 	for (unsigned i = 0; i < rsc; i++) {
++		old[i] = kg_rd(kg.rscc, 4u * kg_rsc[i].reg);
+ 		kg_put("RSCC", kg.rscc, 4u * kg_rsc[i].reg, kg_rsc[i].val, KG_UNDO_WORD, 0, kg_rsc[i].name);
+ 	}
++	/* a word still reading what it held ignores writes (boot #37: the hidden TCS addresses, wired to the PDC) */
+ 	for (unsigned i = 0; i < rsc; i++) {
+ 		uint32_t now = kg_rd(kg.rscc, 4u * kg_rsc[i].reg);
+-		if (now != kg_rsc[i].val) {
+-			printf("SWEET KGPU: 16   %s reads %#x\n", kg_rsc[i].name, now);
++		if (now == kg_rsc[i].val) {
++			continue;
++		}
++		printf("SWEET KGPU: 16   %s reads %#x%s\n", kg_rsc[i].name, now,
++		    now == old[i] ? " (write ignored: still what it held)" : "");
++		if (now == old[i]) {
++			ignored++;
++		} else {
+ 			bad++;
+ 		}
+ 	}
+-	printf("SWEET KGPU: 16 rscc: %u of %u words read back different; seq_busy %#x\n", bad, rsc,
+-	    kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0));
++	printf("SWEET KGPU: 16 rscc: %u of %u words take kgsl's values, %u ignore the write, %u read back different; "
++	    "seq_busy %#x\n", rsc - ignored - bad, rsc, ignored, bad, kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0));
+ 
+ 	kg_next(16, "the GPU PDC (kgsl gen7_load_pdc_ucode, 0xb270000: seq_start_addr 0, enable_pdc 0x80000001), "
+ 	    "undone at the end");
+@@ -1865,6 +1904,462 @@ kg_step16(void)
+ 	    !up ? "HFI_CTRL_STATUS bit 0 does not come in 100 ms" :
+ 	    bad ? "the RSCC does not keep kgsl's words" : "the GMU faulted (NMI, CM3 fault or SMMU)",
+ 	    (status0 & 1u) ? "; bit 0 was set before HFI_CTRL_INIT too" : "");
++	kg_hfi_up = ok;
++	return ok;
++}
++
++/* ---- step 17: talking to the GMU (HFI messages) ---- */
++
++#define GEN7_GMU_GMU2HOST_INTR_MASK      0x1f993
++#define GEN7_GMU_HOST2GMU_INTR_SET       0x1f994
++#define KG_H2F_BW_VOTE_TBL   3u          /* adreno_hfi.h enum hfi_msg_type */
++#define KG_H2F_PERF_TBL      4u
++#define KG_H2F_FEATURE_CTRL  11u
++#define KG_H2F_CORE_FW_START 14u
++#define KG_F2H_ERR           100u
++#define KG_F2H_DEBUG         101u
++#define KG_HFI_TYPE_ACK      1u          /* header bits 19:16 */
++#define KG_HFI_RECORD        (1u << 19)
++#define KG_HFI_RCVD_MAX      19u         /* MAX_RCVD_SIZE: 16 + 3 dwords */
++#define KG_HFI_QOFF(i)       (((uint32_t)sizeof(struct kg_hfi_table) + 15u) / 16u * 16u + 0x1000u * (i))
++#define KG_DB_BCM            5u          /* cmd-db slave type CMD_DB_HW_BCM */
++#define KG_ARC_MAX           16u
++#define KG_DDR_PERFMODE      (1u << 3)   /* ACV above level 0: gen7_3_0 has no acv_perfmode_vote */
++#define KG_BCM_CMD(commit, valid, x, y) \
++	((uint32_t)(commit) << 30 | (uint32_t)(valid) << 29 | ((uint32_t)(x) & 0x3fffu) << 14 | ((uint32_t)(y) & 0x3fffu))
++
++/* FDT qcom,gpu-pwrlevels-5 (speed bin 0xc6), highest first: kHz and RPMh level (qcom,level); no qcom,cx-level */
++static const struct {
++	uint32_t khz;
++	uint16_t vlvl;
++} kg_gpu_levels[] = {
++	{ 940000, 416 }, { 875000, 384 }, { 816000, 320 }, { 734000, 256 }, { 650000, 224 },
++	{ 600000, 192 }, { 500000, 128 }, { 345000, 64 }, { 295000, 56 },
++};
++/* FDT qcom,bus-table-ddr7 (ddr_device_type 7, LPDDR4X) and qcom,bus-table-cnoc, KBps */
++static const uint32_t kg_ddr_kbps[] = { 0, 781250, 2136718, 3000000, 3972656, 5285156, 6074218, 6671875, 8332031 };
++static const uint32_t kg_cnoc_kbps[] = { 0, 100 };
++
++/* kgsl adreno_rpmh.h adreno_ddr_bcms / adreno_cnoc_bcms; addr, unit, width, vcd from cmd-db */
++struct kg_bcm {
++	const char *name;
++	uint32_t buswidth;
++	bool fixed;
++	uint32_t addr, unit;
++	uint16_t width;
++	uint8_t vcd;
++};
++static struct kg_bcm kg_ddr_bcms[] = { { "SH0", 16, false }, { "MC0", 4, false }, { "ACV", 0, true } };
++static struct kg_bcm kg_cnoc_bcms[] = { { "CN0", 4, false } };
++
++/* kgsl adreno_hfi.h hfi_dcvstable_cmd (H2F_MSG_PERF_TBL, HFI before 2.6.1) and hfi_bwtable_cmd */
++struct kg_perf_table {
++	uint32_t hdr, gpu_level_num, gmu_level_num;
++	struct { uint32_t vote, dep_vote, freq; } gx[16];
++	struct { uint32_t vote, freq; } cx[4];
++};
++_Static_assert(sizeof(struct kg_perf_table) == 236, "kgsl struct hfi_dcvstable_cmd: 59 words");
++struct kg_bw_table {
++	uint32_t hdr, bw_level_num, cnoc_cmds_num, ddr_cmds_num, cnoc_wait_bitmask, ddr_wait_bitmask;
++	uint32_t cnoc_cmd_addrs[6], cnoc_cmd_data[2][6], ddr_cmd_addrs[8], ddr_cmd_data[16][8];
++};
++_Static_assert(sizeof(struct kg_bw_table) == 640, "kgsl struct hfi_bwtable_cmd: 160 words");
++static struct kg_perf_table kg_perf;
++static struct kg_bw_table kg_bw;
++
++/* the HFI block through an uncached alias, as the GMU sees it (PTE_GMU: MAIR attr 0, uncached) */
++static volatile struct kg_hfi_table *kg_hfi;
++static volatile uint32_t *kg_hfi_queue[3];
++static uint32_t kg_hfi_seq;
++
++/* an ARC's levels, counted as kgsl adreno_rpmh_arc_cmds does (up to the first 0 after a non-0) */
++static unsigned
++kg_arc_levels(const char *res, uint16_t *val)
++{
++	unsigned slave = 0, len = 0, num;
++	uint32_t addr = 0, aux = 0;
++	bool dummy = true;
++
++	if (kg_db_find(res, &slave, &addr, &aux, &len) == 0 || slave != KG_DB_ARC || len < 4) {
++		printf("SWEET KGPU: 17 rpmh %s: no ARC levels in cmd-db\n", res);
++		return 0;
++	}
++	len = len / 2 > KG_ARC_MAX ? KG_ARC_MAX : len / 2;
++	for (unsigned k = 0; k < len; k++) {
++		val[k] = kg_db16(aux + 2 * k);
++	}
++	for (num = 1; num < len; num++) {
++		if (val[num] != 0) {
++			dummy = false;
++		}
++		if (val[num - 1] != 0 && val[num] == 0) {
++			break;
++		}
++	}
++	return dummy ? 0 : num;
++}
++
++/*
++ * kgsl adreno_rpmh_setup_volt_dependency_tbl, one level: the primary rail's
++ * first level >= vlvl, then the secondary's first level >= that
++ */
++static bool
++kg_arc_vote(uint32_t *vote, const uint16_t *pri, unsigned npri, const uint16_t *sec, unsigned nsec, uint16_t vlvl)
++{
++	unsigned k, j;
++
++	for (k = 0; k < npri && pri[k] < vlvl; k++) {
++	}
++	if (k == npri) {
++		printf("SWEET KGPU: 17 no ARC level >= %u\n", vlvl);
++		return false;
++	}
++	for (j = 0; j < nsec; j++) {
++		if (sec[j] >= pri[k] || j + 1 == nsec) {
++			break;
++		}
++	}
++	if (j == nsec) {
++		j = 0;
++	}
++	*vote = (uint32_t)pri[k] << 16 | j << 8 | k;
++	return true;
++}
++
++static bool
++kg_bcm_read(struct kg_bcm *b)
++{
++	unsigned slave = 0, len = 0;
++	uint32_t aux = 0;
++
++	if (kg_db_find(b->name, &slave, &b->addr, &aux, &len) == 0 || slave != KG_DB_BCM || len < 8) {
++		printf("SWEET KGPU: 17 rpmh %s: no BCM entry in cmd-db (slave %u, %u bytes)\n", b->name, slave, len);
++		return false;
++	}
++	b->unit = kg_db16(aux) | (uint32_t)kg_db16(aux + 2) << 16;
++	b->width = kg_db16(aux + 4);
++	b->vcd = (uint8_t)kg_db16(aux + 6);
++	printf("SWEET KGPU: 17 bcm %s addr %#x unit %u width %u vcd %u\n", b->name, b->addr, b->unit, b->width, b->vcd);
++	return b->fixed || b->unit != 0;
++}
++
++/* kgsl tcs_cmd_data for one bandwidth level, ab 0 (no GMU AB vote): one BCM command per BCM */
++static void
++kg_bw_level(const struct kg_bcm *b, unsigned n, uint32_t ib, uint32_t perfmode, uint32_t *data)
++{
++	for (unsigned i = 0; i < n; i++) {
++		bool commit = i == n - 1 || b[i].vcd != b[i + 1].vcd;
++		if (b[i].fixed) {
++			data[i] = KG_BCM_CMD(commit, ib != 0, 0, ib != 0 ? perfmode : 0);
++			continue;
++		}
++		uint64_t y = (uint64_t)ib * b[i].width / b[i].buswidth * 1000u / b[i].unit;
++		if (ib != 0 && y == 0) {
++			y = 1;
++		}
++		if (y > 0x3fffu) {
++			y = 0x3fffu;
++		}
++		data[i] = KG_BCM_CMD(commit, y != 0, 0, y);
++	}
++}
++
++static uint32_t
++kg_bcm_waits(const struct kg_bcm *b, unsigned n)
++{
++	uint32_t mask = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (i == n - 1 || b[i].vcd != b[i + 1].vcd) {
++			mask |= 1u << i;
++		}
++	}
++	return mask;
++}
++
++/* kgsl gen7_build_rpmh_tables: the GPU/GMU perf table and the bus table, from cmd-db and the FDT */
++static bool
++kg_build_tables(void)
++{
++	static uint16_t gx[KG_ARC_MAX], cx[KG_ARC_MAX], mx[KG_ARC_MAX];
++	static const uint16_t gmu_vlvl[3] = { 0, 64, 128 };          /* RPMH_REGULATOR_LEVEL_LOW_SVS, _SVS */
++	static const uint32_t gmu_khz[3] = { 0, 200000, 500000 };    /* GMU_FREQ_MIN/MAX: no qcom,gmu-freq-table */
++	unsigned ngx = kg_arc_levels("gfx.lvl", gx), ncx = kg_arc_levels("cx.lvl", cx), nmx = kg_arc_levels("mx.lvl", mx);
++	unsigned nlv = sizeof(kg_gpu_levels) / sizeof(kg_gpu_levels[0]);
++	unsigned nddr = sizeof(kg_ddr_kbps) / sizeof(kg_ddr_kbps[0]);
++
++	if (ngx == 0 || ncx == 0 || nmx == 0) {
++		return false;
++	}
++	memset(&kg_perf, 0, sizeof(kg_perf));
++	kg_perf.hdr = KG_H2F_PERF_TBL;
++	kg_perf.gpu_level_num = nlv + 1;        /* level 0: off */
++	kg_perf.gmu_level_num = 3;
++	for (unsigned i = 0; i <= nlv; i++) {
++		uint16_t vlvl = i == 0 ? 0 : kg_gpu_levels[nlv - i].vlvl;
++		kg_perf.gx[i].freq = i == 0 ? 0 : kg_gpu_levels[nlv - i].khz;
++		kg_perf.gx[i].dep_vote = 0xffffffffu;   /* no qcom,cx-level: no CX dependency (adreno_rpmh_to_cx_hlvl) */
++		if (!kg_arc_vote(&kg_perf.gx[i].vote, gx, ngx, mx, nmx, vlvl)) {
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < 3; i++) {
++		kg_perf.cx[i].freq = gmu_khz[i];
++		if (!kg_arc_vote(&kg_perf.cx[i].vote, cx, ncx, mx, nmx, gmu_vlvl[i])) {
++			return false;
++		}
++	}
++	printf("SWEET KGPU: 17 arc levels gfx %u cx %u mx %u; perf table %u gpu + %u gmu levels:\n", ngx, ncx, nmx,
++	    kg_perf.gpu_level_num, kg_perf.gmu_level_num);
++	for (unsigned i = 0; i <= nlv; i += 2) {
++		printf("SWEET KGPU: 17   gx%u %#x/%u kHz  gx%u %#x/%u kHz\n", i, kg_perf.gx[i].vote, kg_perf.gx[i].freq,
++		    i + 1, i + 1 <= nlv ? kg_perf.gx[i + 1].vote : 0, i + 1 <= nlv ? kg_perf.gx[i + 1].freq : 0);
++	}
++	printf("SWEET KGPU: 17   gmu %#x/%u %#x/%u %#x/%u kHz; dep votes 0xffffffff\n", kg_perf.cx[0].vote,
++	    kg_perf.cx[0].freq, kg_perf.cx[1].vote, kg_perf.cx[1].freq, kg_perf.cx[2].vote, kg_perf.cx[2].freq);
++
++	for (unsigned i = 0; i < 3; i++) {
++		if (!kg_bcm_read(&kg_ddr_bcms[i])) {
++			return false;
++		}
++	}
++	if (!kg_bcm_read(&kg_cnoc_bcms[0])) {
++		return false;
++	}
++	memset(&kg_bw, 0, sizeof(kg_bw));
++	kg_bw.hdr = KG_H2F_BW_VOTE_TBL;
++	kg_bw.bw_level_num = nddr;
++	kg_bw.ddr_cmds_num = 3;
++	kg_bw.cnoc_cmds_num = 1;
++	kg_bw.ddr_wait_bitmask = kg_bcm_waits(kg_ddr_bcms, 3);
++	kg_bw.cnoc_wait_bitmask = kg_bcm_waits(kg_cnoc_bcms, 1);
++	for (unsigned i = 0; i < 3; i++) {
++		kg_bw.ddr_cmd_addrs[i] = kg_ddr_bcms[i].addr;
++	}
++	kg_bw.cnoc_cmd_addrs[0] = kg_cnoc_bcms[0].addr;
++	for (unsigned i = 0; i < nddr; i++) {
++		kg_bw_level(kg_ddr_bcms, 3, kg_ddr_kbps[i], i >= 1 ? KG_DDR_PERFMODE : 0, kg_bw.ddr_cmd_data[i]);
++		printf("SWEET KGPU: 17   ddr%u %u KBps: %#x %#x %#x\n", i, kg_ddr_kbps[i], kg_bw.ddr_cmd_data[i][0],
++		    kg_bw.ddr_cmd_data[i][1], kg_bw.ddr_cmd_data[i][2]);
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		kg_bw_level(kg_cnoc_bcms, 1, kg_cnoc_kbps[i], 0, kg_bw.cnoc_cmd_data[i]);
++	}
++	printf("SWEET KGPU: 17   cnoc %#x %#x; waits ddr %#x cnoc %#x\n", kg_bw.cnoc_cmd_data[0][0],
++	    kg_bw.cnoc_cmd_data[1][0], kg_bw.ddr_wait_bitmask, kg_bw.cnoc_wait_bitmask);
++	return true;
++}
++
++/* kgsl gen7_hfi_queue_read: one message from a queue, or false */
++static bool
++kg_hfi_read(unsigned qi, uint32_t *m)
++{
++	volatile struct kg_hfi_queue *h = &kg_hfi->q[qi];
++	uint32_t r = h->read_index, w = h->write_index, size = h->queue_size;
++
++	if (r == w) {
++		return false;
++	}
++	__asm__ volatile("dmb oshld" ::: "memory");
++	uint32_t n = r < size ? (kg_hfi_queue[qi][r] >> 8) & 0xffu : 0;
++	if (size != 0x1000u / 4 || n == 0 || n > KG_HFI_RCVD_MAX) {
++		printf("SWEET KGPU: 17 hfi queue %u: r/w %u/%u size %u, message of %u words: dropping what is queued\n",
++		    qi, r, w, size, n);
++		h->read_index = w;
++		return false;
++	}
++	memset(m, 0, KG_HFI_RCVD_MAX * 4);
++	for (uint32_t i = 0; i < n; i++) {
++		m[i] = kg_hfi_queue[qi][r];
++		r = (r + 1u) % size;
++	}
++	h->read_index = (r + 3u) / 4u * 4u % size;
++	return true;
++}
++
++static void
++kg_hfi_show(unsigned qi, const uint32_t *m)
++{
++	uint32_t id = m[0] & 0xffu, type = (m[0] >> 16) & 0xfu;
++
++	if (type == KG_HFI_TYPE_ACK) {
++		printf("SWEET KGPU: 17   q%u ack %#x for %#x: result %#x %#x\n", qi, m[0], m[1], m[2], m[3]);
++	} else if (id == KG_F2H_ERR) {
++		char text[17];
++		memcpy(text, &m[2], 16);
++		for (unsigned i = 0; i < 16; i++) {
++			text[i] = text[i] >= 0x20 && text[i] < 0x7f ? text[i] : (text[i] == 0 ? 0 : '.');
++		}
++		text[16] = 0;
++		printf("SWEET KGPU: 17   q%u GMU ERROR %u %u \"%s\"\n", qi, m[1] >> 16, m[1] & 0xffffu, text);
++	} else if (id == KG_F2H_DEBUG) {
++		printf("SWEET KGPU: 17   q%u debug type %u timestamp %#x data %#x\n", qi, m[1], m[2], m[3]);
++	} else {
++		printf("SWEET KGPU: 17   q%u message %#x: %#x %#x %#x\n", qi, m[0], m[1], m[2], m[3]);
++	}
++}
++
++static void
++kg_hfi_drain(unsigned qi)
++{
++	uint32_t m[KG_HFI_RCVD_MAX];
++	for (unsigned n = 0; n < 16 && kg_hfi_read(qi, m); n++) {
++		kg_hfi_show(qi, m);
++	}
++}
++
++/*
++ * kgsl gen7_hfi_send_generic_req (HFI 2.1: the result is the ack's third
++ * word): the command into the command queue, the doorbell, then
++ * GMU2HOST_INTR_INFO bit 0 (or the message queue moving) for up to 1 s,
++ * giving up early on an NMI as poll_gmu_reg does; then every message.
++ */
++static bool
++kg_hfi_cmd(const char *what, uint32_t *cmd, uint32_t dwords)
++{
++	volatile struct kg_hfi_queue *h = &kg_hfi->q[0];
++	uint32_t w = h->write_index, r = h->read_index, size = h->queue_size, align = (dwords + 3u) & ~3u;
++	uint32_t space = w >= r ? size - (w - r) : r - w;
++
++	if (w >= size || space <= align) {
++		printf("SWEET KGPU: 17 %s: no room in the command queue (r/w %u/%u)\n", what, r, w);
++		return false;
++	}
++	kg_hfi_seq = (kg_hfi_seq + 1u) & 0xfffu;
++	cmd[0] = kg_hfi_seq << 20 | dwords << 8 | (cmd[0] & 0xffu);
++	uint32_t sent = cmd[0];
++	for (uint32_t i = 0; i < align; i++) {
++		kg_hfi_queue[0][w] = i < dwords ? cmd[i] : 0xfafafafau;
++		w = (w + 1u) % size;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	h->write_index = w;
++	printf("SWEET KGPU: 17 send %s: hdr %#x, %u words, command queue w %u; HOST2GMU_INTR_SET 1\n", what, sent,
++	    dwords, w);
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_HOST2GMU_INTR_SET), 1);
++
++	uint32_t info = 0, init = 0;
++	unsigned t;
++	for (t = 0; t < 10000; t++) {
++		info = kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO);
++		init = kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT);
++		if ((info & KG_HFI_MSGQ) || (init & 0xe00u) || kg_hfi->q[1].write_index != kg_hfi->q[1].read_index) {
++			break;
++		}
++		delay(100);
++	}
++	kg_wr(kg.gmu, KG_GMU_OFF(GEN7_GMU_GMU2HOST_INTR_CLR), KG_HFI_MSGQ);
++	printf("SWEET KGPU: 17   after %u.%u ms: gmu2host_intr_info %#x fw_init_result %#x; command queue r %u, "
++	    "message queue r/w %u/%u\n", t / 10, t % 10, info, init, h->read_index, kg_hfi->q[1].read_index,
++	    kg_hfi->q[1].write_index);
++
++	uint32_t m[KG_HFI_RCVD_MAX], result = ~0u;
++	bool acked = false;
++	while (kg_hfi_read(1, m)) {
++		kg_hfi_show(1, m);
++		if (((m[0] >> 16) & 0xfu) == KG_HFI_TYPE_ACK && ((m[1] ^ sent) & ~KG_HFI_RECORD) == 0) {
++			acked = true;
++			result = m[2];
++		}
++	}
++	kg_hfi_drain(2);
++	if (!acked || result != 0) {
++		printf("SWEET KGPU: 17 %s: %s\n", what, !acked ? "NO ACK" : "the GMU refuses it (result not 0)");
++	}
++	return acked && result == 0;
++}
++
++/*
++ * kgsl gen7_hfi_start, after reset_hfi_queues: the perf table, the bus
++ * table, [ACD/BCL/CLX/IFPC enables: kgsl sends them for gen7_3_0; here
++ * IFPC/ACD/BCL go explicitly off, a refusal only reported], core fw start.
++ * Not done: kgsl_pwrctrl_setup_default_votes (the first DCVS/bus vote).
++ * Undo: the GMU back into reset first (a second CM3 entry), so it is
++ * stopped before step 16's RSC/PDC words go back; step 15's entry repeats it.
++ */
++static bool
++kg_step17(void)
++{
++	static const struct {
++		uint32_t feature;
++		const char *name;
++	} off[] = { { 9, "feature ifpc off" }, { 12, "feature acd off" }, { 11, "feature bcl off" } };
++
++	if (!kg_hfi_up || kg.db == 0 || kg.speed_bin != 0xc6) {
++		printf("SWEET KGPU: 17 needs steps 1-16 (HFI started in this run, cmd-db, the FDT tables of speed bin 0xc6: "
++		    "bin %#x)\n", kg.speed_bin);
++		return false;
++	}
++	kg_announce(17, "cmd-db: gfx.lvl, cx.lvl, mx.lvl and the bus BCMs SH0, MC0, ACV, CN0 (kgsl gen7_build_rpmh_tables)");
++	if (!kg_build_tables()) {
++		printf("SWEET KGPU: 17 the tables cannot be built\n");
++		return false;
++	}
++
++	vm_offset_t mem = kg_gmu_host(KG_GMU_HFI_VA);
++	uint64_t phys = kvtophys(mem);
++	for (uint32_t o = 0x1000; o < KG_GMU_HFI_SIZE; o += 0x1000) {
++		if (kvtophys(mem + o) != phys + o) {
++			printf("SWEET KGPU: 17 the HFI memory is not contiguous\n");
++			return false;
++		}
++	}
++	vm_offset_t alias = ml_io_map_unmappable((vm_offset_t)phys, KG_GMU_HFI_SIZE, VM_WIMG_WCOMB);
++	if (alias == 0) {
++		printf("SWEET KGPU: 17 no uncached alias of the HFI memory %#llx\n", phys);
++		return false;
++	}
++	kg_hfi = (volatile struct kg_hfi_table *)alias;
++	for (unsigned i = 0; i < 3; i++) {
++		kg_hfi_queue[i] = (volatile uint32_t *)(alias + KG_HFI_QOFF(i));
++	}
++	kg_undo_push(KG_UNDO_CM3, kg.gmu, KG_GMU_OFF(GEN7_GMU_CM3_SYSRESET), 1,
++	    "cm3_sysreset (into reset before the RSC/PDC words go back)");
++	printf("SWEET KGPU: 17 hfi memory %#llx, uncached alias; hfi_ctrl_status %#x gmu2host_intr_info %#x mask %#x; "
++	    "queues r/w %u/%u %u/%u %u/%u, reset (kgsl reset_hfi_queues)\n", phys, kg_gmu(GEN7_GMU_HFI_CTRL_STATUS),
++	    kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO), kg_gmu(GEN7_GMU_GMU2HOST_INTR_MASK), kg_hfi->q[0].read_index,
++	    kg_hfi->q[0].write_index, kg_hfi->q[1].read_index, kg_hfi->q[1].write_index, kg_hfi->q[2].read_index,
++	    kg_hfi->q[2].write_index);
++	for (unsigned i = 0; i < 3; i++) {
++		kg_hfi->q[i].read_index = kg_hfi->q[i].write_index;
++	}
++	kg_hfi_seq = 0;
++	unsigned log0 = kg_gmu_log_words();
++	bool ok = false;
++
++	kg_next(17, "HFI H2F_MSG_PERF_TBL (kgsl gen7_hfi_send_gpu_perf_table, the legacy table of HFI 2.1)");
++	if (!kg_hfi_cmd("perf table", (uint32_t *)&kg_perf, sizeof(kg_perf) / 4)) {
++		goto out;
++	}
++	kg_next(17, "HFI H2F_MSG_BW_VOTE_TBL (kgsl build_bw_table)");
++	if (!kg_hfi_cmd("bw table", (uint32_t *)&kg_bw, sizeof(kg_bw) / 4)) {
++		goto out;
++	}
++	kg_next(17, "HFI H2F_MSG_FEATURE_CTRL x3: IFPC, ACD, BCL off");
++	for (unsigned i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
++		uint32_t cmd[4] = { KG_H2F_FEATURE_CTRL, off[i].feature, 0, 0 };
++		(void)kg_hfi_cmd(off[i].name, cmd, 4);
++	}
++	kg_next(17, "HFI H2F_MSG_CORE_FW_START (kgsl gen7_hfi_send_core_fw_start)");
++	uint32_t start[2] = { KG_H2F_CORE_FW_START, 0 };
++	ok = kg_hfi_cmd("core fw start", start, 2);
++	kg_wait(100);
++	kg_hfi_drain(1);
++	kg_hfi_drain(2);
++
++out:;
++	uint32_t cb = (kg.smmu_pages + KG_GMU_CB) * kg.smmu_page, init = kg_gmu(GEN7_GMU_CM3_FW_INIT_RESULT);
++	printf("SWEET KGPU: 17 fw_init_result %#x hfi_ctrl_status %#x gmu2host_intr_info %#x ao_host_interrupt_status %#x "
++	    "rpmh_power_state %#x gfx_pwr_clk_status %#x\n", init, kg_gmu(GEN7_GMU_HFI_CTRL_STATUS),
++	    kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO), kg_gmu(GEN7_GMU_AO_HOST_INTERRUPT_STATUS),
++	    kg_gmu(GEN7_GMU_RPMH_POWER_STATE), kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS));
++	printf("SWEET KGPU: 17 rscc seq_busy %#x control_ack %#x; cb1 fsr %#x sgfsr %#x; gmu log %u -> %u words\n",
++	    kg_rd(kg.rscc, 4u * GEN7_RSCC_SEQ_BUSY_DRV0), kg_gmu(GEN7_GMU_RSCC_CONTROL_ACK),
++	    kg_rd(kg.smmu, cb + SMMU_CB_FSR), kg_rd(kg.smmu, SMMU_SGFSR), log0, kg_gmu_log_words());
++	ok = ok && (init & 0xe00u) == 0 && !(kg_rd(kg.smmu, cb + SMMU_CB_FSR) & SMMU_FSR_ALL);
++	printf("SWEET KGPU: 17 %s\n", ok ? "THE GMU ANSWERS OVER HFI: tables taken, core firmware started" :
++	    "HFI did not get through (see above)");
++	kg_hfi = NULL;
++	ml_io_unmap(alias, KG_GMU_HFI_SIZE);
+ 	return ok;
+ }
+ 
+@@ -1899,14 +2394,14 @@ kg_teardown(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages", kg.pause_ms);
+ 	while (done < kg.last) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+@@ -1941,12 +2436,12 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+-	kg.last = last > 16 ? 16u : (unsigned)last;
++	kg.last = last > 17 ? 17u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 16) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..16 exist; running those\n", last);
++	if (last > 17) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..17 exist; running those\n", last);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);

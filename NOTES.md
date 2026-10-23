@@ -458,6 +458,27 @@ ack, frees, stream 5 unrouted, CX down; "run over". System as #36 (agent up). NE
 (gen7_hfi_start's messages), with step 16's check fixed: a word that still reads its old value
 after the write is "write ignored", printed but not a failure.
 
+**GPU STEP 17 = 0982 (2026-10-23, written, NOT built/booted), `kgpu=17`: HFI messages.** Read from
+kgsl adreno_gen7_hfi.c / adreno_gen7_rpmh.c / adreno_rpmh.c: gen7_hfi_start = reset_hfi_queues,
+perf table, bw table, ACD/BCL/CLX/IFPC enables (gen7_3_0 has IFPC|BCL|ACD; not sent here),
+core fw start, then default votes (not done). HFI 2.1 (0x20010000): legacy H2F_MSG_PERF_TBL (4,
+hfi_dcvstable_cmd 59 words) and generic_req (ack word 2 = result; v5 only after minor 4).
+Message header = seq<<20 | size<<8 | type<<16 | id; queues 1024 words, writes padded to 4 with
+0xfafafafa; doorbell HOST2GMU_INTR_SET (0x1f994) = 1; ack wait = GMU2HOST_INTR_INFO bit 0, 1 s,
+NMI (FW_INIT_RESULT 11:9) aborts. Inputs: FDT pwrlevels-5 = bin 0xc6 (kHz/vlvl: 940000/416
+875000/384 816000/320 734000/256 650000/224 600000/192 500000/128 345000/64 295000/56), no
+cx-level; GMU 200/500 MHz at 64/128 (kgsl defaults); ddr_device_type 7 -> bus-table-ddr7 (KBps 0
+781250 2136718 3000000 3972656 5285156 6074218 6671875 8332031), cnoc 0/100. Predicted perf
+table from #37's ARC levels (gfx 10, cx 14, mx 15): gx0 0, gx1 0x380201/295000 ... gx9
+0x1a00d09/940000 (vote = vlvl<<16 | mx idx<<8 | gfx idx); gmu 0 / 0x400302 / 0x800403. BW votes
+need the BCMs' unit/width/vcd from cmd-db (printed). The HFI block is used through an uncached
+alias (ml_io_map_unmappable, VM_WIMG_WCOMB, unmapped before the step returns; ml_io_map's own
+mappings are permanent and ml_io_unmap would kmem_free them from the wrong map): our read/write
+indices share cache lines with the GMU's. Undo gains a CM3 entry first (GMU stopped before the
+RSC/PDC words go back). Success line: "THE GMU ANSWERS OVER HFI: tables taken, core firmware
+started". Verified: 224 patches, series reproduces the file, syntax clean. **Test:** #37 image with
+`kgpu=17`.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
