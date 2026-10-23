@@ -242,7 +242,8 @@ SHADER'S SIGNATURE FROM THIS KERNEL". Nothing is loaded or started; the page is 
 patches, series reproduces the file, syntax clean. **Before the test, once:** `curl -s -T
 temp/kunzite-vendor/proprietary/vendor/firmware/a710_zap.mdt
 'http://192.168.7.2:8022/put?p=/usr/share/firmware/kunzite/a710_zap.mdt&m=644&mk=1'` (vendor
-firmware: on the phone only, never in git). **Test:** #31 image with `kgpu=12`. A reset right
+firmware: on the phone only, never in git). **Done 2026-10-23 during boot #31**: 4044 bytes, 0644
+root, read back with /get = identical (sha256 5e2e0c88...); it stays on the root FS. **Test:** #31 image with `kgpu=12`. A reset right
 after an "smc" line = Gunyah/TZ does not take that call from us.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
