@@ -95,24 +95,23 @@ static int sb3_yes;
  * texcoord5/8 = t0 -/+ offset[1], and so on. What CoreAnimation gives 40 (boot #55, Safari's
  * keyboard): offset = (-a, b), (a, b), (-a, -b), (a, -b), so texcoord5-8 are the four corners
  * (3, 4, 9 and 10 repeat them); weight = 0.25, 0, 0, 0; divide = 1. So here is a source for the
- * entry, in the style of the GL renderer's own blurs (32-37: sampler2DRect, weight, divide;
- * eagl.c's glShaderSource rewrites it as it does the others): the four corners weighted, then
- * divided by alpha when divide says so.
+ * entry, in the style of the GL renderer's own blurs (32-37: sampler2DRect; eagl.c's
+ * glShaderSource rewrites it as it does the others): the four corners averaged. Taking weight and
+ * divide as the others do looked worse (black big-pixel lines behind the keys: the divide makes
+ * every texel with any alpha opaque); without them Settings' keyboard is right. Safari's stays
+ * wrong either way (parked: a pass around this one, not this one; NOTES, boot #55). CoreAnimation
+ * still sets divide, which leaves a GL error 0x502 in the log, harmless.
  */
 static const char sb3_fragment[] =
 	"uniform lowp sampler2DRect texture0;\n"
-	"uniform mediump vec4 weight[2];\n"
-	"uniform lowp float divide;\n"
 	"varying highp vec2 texcoord5, texcoord6, texcoord7, texcoord8;\n"
 	"void main() {\n"
 	"  highp vec4 acc;\n"
-	"  acc = texture2DRect(texture0, texcoord6) * weight[0].x;\n"
-	"  acc = texture2DRect(texture0, texcoord7) * weight[0].x + acc;\n"
-	"  acc = texture2DRect(texture0, texcoord5) * weight[0].x + acc;\n"
-	"  acc = texture2DRect(texture0, texcoord8) * weight[0].x + acc;\n"
-	"  if (divide != 0.0)\n"
-	"    acc /= max(0.001, acc.a);\n"
-	"  gl_FragData[0] = acc;\n"
+	"  acc = texture2DRect(texture0, texcoord6);\n"
+	"  acc += texture2DRect(texture0, texcoord7);\n"
+	"  acc += texture2DRect(texture0, texcoord5);\n"
+	"  acc += texture2DRect(texture0, texcoord8);\n"
+	"  gl_FragData[0] = acc * 0.25;\n"
 	"}\n";
 
 /* tex_fragment_shaders[40] made to point at sb3_fragment, if it is still NULL; 0 if not done */
