@@ -1,0 +1,586 @@
+kunzite: Adreno 710, glue plan K3 (main repo ios/gpu-glue-plan.md 3.2, 4): submission.
+redwood_gpu_submit/_done/_last/_report are real. Once the CP runs out of secure mode (step 24, or
+keep mode before it says ready), a fence word at scratch + 0x200 is read through an uncached alias
+of the scratch page (unmapped by the undo), and a submission takes the IBs as kgsl's gen7 ringbuffer
+does (gen7_ringbuffer_addcmds and _submitcmd): CP_THREAD_CONTROL both, CP_SET_MARKER 0x101 (IFPC
+off), BR; the IB list between markers 0xd and 0xe, one CP_INDIRECT_BUFFER_PFE each; CCU invalidate
+events 24 and 25; the fence, CP_EVENT_WRITE CACHE_CLEAN | BIT(27) writing the submission's number
+once the work is done (no BIT(31): we poll); both threads, marker 0x100 (IFPC on), BR: 25 + 4 per IB
+words, under a mutex. The ring wraps: a short tail is covered by a CP_NOP and the words go from 0
+(adreno_ringbuffer_allocspace), and the submitter waits up to 2 s for RPTR to make room; WPTR never
+catches up with it. _done compares the fence word, _last is the newest number, _report prints fence,
+ring, RBBM, CP fault, interrupt and protect status, SQE stat, IB1/IB2 base and remaining size, and
+context 0's FSR/FAR/FSYNR0. redwood_gpu_ready() now also wants the submission set up; the keep
+report shows the fence; the keep mode's exit waits for the last fence before the undo. Step 19 maps
+the scratch page unprivileged too (the fence is written by the CP's event path, not certainly a
+privileged master: boot #43's fault was such a write). Step 23 cleans its marker's line out of the
+CPU cache before reading it (boot #49 read a stale one). Step 24 (kgpu=24; with kgpu_keep: 1-21, 23,
+24, kept): IBs in an own buffer of the GPU's, a 1024x256 picture: one IB of three bands; two IBs in
+one submission; 400 submissions of a one-row IB without waiting, around the ring; every fence the
+one after the last, done(last) and not done(last + 1); the samples checked after the fences alone
+(no wait-for-idle or marker in the IBs); the report. Test: kgpu=24 kgpu_keep=1 kgpu_keep_s=120: "THE
+GPU RUNS SUBMISSIONS", then kept and undone as on #49.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 68434f2..d8b76d0 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -19,8 +19,8 @@
+  * needs ends the run.
+  *
+  * Keep mode (glue plan K1, main repo ios/gpu-glue-plan.md 4): with kgpu_keep=1
+- * the run stops after step 21 (or runs 23 after it, with kgpu=23; 22's
+- * picture is for runs that end) and is not undone: GX stays on (OOB_GPU held),
++ * the run stops after step 21 (or runs 23, 24 after it, with kgpu=23, 24;
++ * 22's picture is for runs that end) and is not undone: GX stays on (OOB_GPU held),
+  * HFI stays up, the CP runs out of secure mode, and redwood_gpu_ready() is
+  * true. Every kgpu_keep_report seconds (default 60, 0 = never) two lines of
+  * the GPU's state, and whatever the GMU has queued. It goes by the same undo
+@@ -135,6 +135,10 @@
+  *     tables made on demand, one TLB invalidate per batch; buffers filled
+  *     by the 2D engine, checked, unmapped, an address used again for other
+  *     memory. All freed in the step; the tables made stay with the pool.
++ *  24 glue plan K3: submissions as RedwoodGPU will make them: command
++ *     buffers in the GPU's own memory through redwood_gpu_submit (kgsl's
++ *     gen7 wrapping, the fence), the fence polled through an uncached
++ *     word; two IBs at once; 400 submissions, the ring wrapping.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -150,6 +154,7 @@
+ #include <sys/errno.h>
+ #include <sys/reboot.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -2776,7 +2781,8 @@ kg_step19(void)
+ 
+ 	kg_next(19, "memory for the ring, the scratch page and the microcode, mapped for the GPU");
+ 	vm_offset_t rb = kg_gpu_alloc("gpu ringbuffer", KG_GPU_RB_VA, KG_RB_SIZE, PTE_GMU);
+-	vm_offset_t scratch = rb != 0 ? kg_gpu_alloc("gpu scratch page", KG_GPU_SCRATCH_VA, 0x1000, PTE_GMU) : 0;
++	/* (unprivileged too: K3's fence is written by the CP's event path, not certainly a privileged master) */
++	vm_offset_t scratch = rb != 0 ? kg_gpu_alloc("gpu scratch page", KG_GPU_SCRATCH_VA, 0x1000, PTE_GMU | PTE_AP_UNPRIV) : 0;
+ 	vm_offset_t sqe = scratch != 0 ?
+ 	    kg_gpu_alloc("gpu sqe microcode", KG_GPU_SQE_VA, (uint32_t)size - 4u, PTE_GMU) : 0;
+ 	if (sqe == 0) {
+@@ -3801,6 +3807,7 @@ kg_step23(void)
+ 			goto out;
+ 		}
+ 		bad = kg_ucheck(a.mem, rows, r, g, bl);
++		kg_to_memory(scratch + KG_GPU_WORD_OFF + 8, 4);    /* (the CPU's line of the marker out: boot #49 read a stale one) */
+ 		printf("SWEET KGPU: 23 round %u: GPU %#llx..%#llx (%llu KB) -> memory %#llx..: marker %#x (%#x wanted), %u of %u "
+ 		    "samples wrong\n", i, a.va, a.va + a.size, a.size >> 10, kvtophys(a.mem),
+ 		    *(volatile uint32_t *)(scratch + KG_GPU_WORD_OFF + 8), mark, bad, 2u * rows);
+@@ -3885,6 +3892,366 @@ out:
+ 	return ok;
+ }
+ 
++/* ---- submission (glue plan K3): kgsl's gen7 ringbuffer, its fence, the ring wrapping ---- */
++
++#define KG_RB_DWORDS     (KG_RB_SIZE / 4u)
++#define KG_FENCE_OFF     0x200u          /* in the scratch page: the word the CP's fence writes */
++#define KG_SUB_IBS       128u            /* IBs in one submission, at most (RedwoodGPU's GPU_SUBMIT_CMDS) */
++#define KG_SUB_WORDS(n)  (25u + 4u * (n))
++#define KG_CP_NOP        0x10u
++#define KG_CP_THREAD_CONTROL 0x17u
++#define KG_CP_SET_MARKER 0x65u
++#define KG_CP_IB_PFE     0x3fu           /* CP_INDIRECT_BUFFER_PFE */
++#define KG_CP_EVENT_WRITE 0x46u
++#define KG_THREAD_BR     1u
++#define KG_THREAD_BOTH   3u
++#define KG_EV_CACHE_CLEAN 0x31u
++#define KG_EV_WRITE      (1u << 27)      /* the event writes a value (BIT(31) would also interrupt: we poll) */
++#define GEN7_CP_IB1_BASE                 0x928
++#define GEN7_CP_IB1_BASE_HI              0x929
++#define GEN7_CP_IB1_REM_SIZE             0x92a
++#define GEN7_CP_IB2_BASE                 0x92b
++#define GEN7_CP_IB2_BASE_HI              0x92c
++#define GEN7_CP_IB2_REM_SIZE             0x92d
++
++static LCK_GRP_DECLARE(kg_lck_grp, "kunzite_adreno");
++static LCK_MTX_DECLARE(kg_sub_lock, &kg_lck_grp);
++static struct {
++	volatile uint32_t *fence;       /* the fence word, through an uncached alias */
++	uint32_t seqno;                 /* the newest submission's fence */
++	unsigned submits, wraps, waits;
++	bool ready;
++} kg_sub;
++
++static uint32_t
++kg_pkt7(uint32_t op, uint32_t cnt)
++{
++	return 7u << 28 | cnt | kg_parity(cnt) << 15 | (op & 0x7fu) << 16 | kg_parity(op) << 23;
++}
++
++/*
++ * Once the CP runs out of secure mode (step 21): the fence word in the scratch page
++ * (GPU KG_GPU_SCRATCH_VA + KG_FENCE_OFF), read through an uncached alias of that page
++ * (unmapped by the undo), set to 0. Then redwood_gpu_submit takes command buffers.
++ */
++static bool
++kg_sub_setup(void)
++{
++	vm_offset_t scratch = kg_undo_mem("gpu scratch page"), alias;
++
++	if (kg_sub.ready) {
++		return true;
++	}
++	if (!kg_gpu_wrote || scratch == 0 || kg_rb_wptr == 0) {
++		printf("SWEET KGPU: %u submission needs steps 1-21 (the CP running out of secure mode)\n", kg.step);
++		return false;
++	}
++	alias = ml_io_map_unmappable((vm_offset_t)kvtophys(scratch), PAGE_SIZE, VM_WIMG_WCOMB);
++	if (alias == 0) {
++		printf("SWEET KGPU: %u no uncached alias of the scratch page\n", kg.step);
++		return false;
++	}
++	kg_undo_push(KG_UNDO_UNMAP, alias, 0, (uint32_t)PAGE_SIZE, "fence uncached alias");
++	kg_sub.fence = (volatile uint32_t *)(alias + KG_FENCE_OFF);
++	*kg_sub.fence = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	kg_sub.seqno = 0;
++	kg_sub.ready = true;
++	printf("SWEET KGPU: %u submission ready: fence word at GPU %#llx (uncached alias), ring wptr %u of %u words\n", kg.step,
++	    KG_GPU_SCRATCH_VA + KG_FENCE_OFF, kg_rb_wptr, KG_RB_DWORDS);
++	return true;
++}
++
++/*
++ * n contiguous words at the ring's WPTR, waiting up to 2 s for the CP to read far
++ * enough. When the tail is too short, a NOP covers it and the words go from 0
++ * (kgsl adreno_ringbuffer_allocspace). WPTR never catches up with RPTR: equal
++ * means empty. The lock is held.
++ */
++static bool
++kg_rb_room(vm_offset_t rb, uint32_t n)
++{
++	bool waited = false;
++
++	for (unsigned t = 0; t < 20000; t++) {
++		uint32_t rptr = kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR) % KG_RB_DWORDS, w = kg_rb_wptr;
++
++		if (w >= rptr) {
++			uint32_t tail = KG_RB_DWORDS - w;
++			if (tail > n || (tail == n && rptr != 0)) {
++				return true;
++			}
++			if (rptr > n) {
++				((volatile uint32_t *)rb)[w] = kg_pkt7(KG_CP_NOP, tail - 1u);
++				kg_to_memory(rb + 4u * w, 4);
++				kg_rb_wptr = 0;
++				kg_sub.wraps++;
++				continue;
++			}
++		} else if (rptr - w > n) {
++			return true;
++		}
++		if (!waited) {
++			kg_sub.waits++;
++			waited = true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++/*
++ * One submission: the IBs as kgsl's gen7 ringbuffer has them (gen7_ringbuffer_addcmds and
++ * _submitcmd): both threads, IFPC off (marker 0x101), BR; the IB list between markers 0xd
++ * and 0xe, one CP_INDIRECT_BUFFER_PFE each; the CCU invalidated (events 24, 25); the fence:
++ * CACHE_CLEAN writing the submission's number into the fence word once the work is done;
++ * both threads, IFPC on (0x100), BR. Returns the fence, 0 if it was not taken.
++ */
++static uint32_t
++kg_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	uint32_t cmd[KG_SUB_WORDS(KG_SUB_IBS)], n = 0, fence;
++	uint64_t at = KG_GPU_SCRATCH_VA + KG_FENCE_OFF;
++	vm_offset_t rb = kg_undo_mem("gpu ringbuffer");
++
++	if (!kg_sub.ready || rb == 0 || count == 0 || count > KG_SUB_IBS) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		if (words[i] == 0 || words[i] > 0xfffffu || (addresses[i] & 3u) != 0) {
++			return 0;
++		}
++	}
++	lck_mtx_lock(&kg_sub_lock);
++	if (!kg_rb_room(rb, KG_SUB_WORDS(count))) {
++		lck_mtx_unlock(&kg_sub_lock);
++		return 0;
++	}
++	fence = ++kg_sub.seqno;
++	if (fence == 0) {
++		fence = kg_sub.seqno = 1;
++	}
++	cmd[n++] = kg_pkt7(KG_CP_THREAD_CONTROL, 1);
++	cmd[n++] = KG_THREAD_BOTH;
++	cmd[n++] = kg_pkt7(KG_CP_SET_MARKER, 1);
++	cmd[n++] = 0x101;                               /* IFPC disable */
++	cmd[n++] = kg_pkt7(KG_CP_THREAD_CONTROL, 1);
++	cmd[n++] = KG_THREAD_BR;
++	cmd[n++] = kg_pkt7(KG_CP_SET_MARKER, 1);
++	cmd[n++] = 0x00d;                               /* IB1LIST start */
++	for (uint32_t i = 0; i < count; i++) {
++		cmd[n++] = kg_pkt7(KG_CP_IB_PFE, 3);
++		cmd[n++] = (uint32_t)addresses[i];
++		cmd[n++] = (uint32_t)(addresses[i] >> 32);
++		cmd[n++] = words[i];
++	}
++	cmd[n++] = kg_pkt7(KG_CP_SET_MARKER, 1);
++	cmd[n++] = 0x00e;                               /* IB1LIST end */
++	cmd[n++] = kg_pkt7(KG_CP_EVENT_WRITE, 1);
++	cmd[n++] = 24;                                  /* CCU invalidate depth */
++	cmd[n++] = kg_pkt7(KG_CP_EVENT_WRITE, 1);
++	cmd[n++] = 25;                                  /* CCU invalidate color */
++	cmd[n++] = kg_pkt7(KG_CP_EVENT_WRITE, 4);
++	cmd[n++] = KG_EV_CACHE_CLEAN | KG_EV_WRITE;
++	cmd[n++] = (uint32_t)at;
++	cmd[n++] = (uint32_t)(at >> 32);
++	cmd[n++] = fence;
++	cmd[n++] = kg_pkt7(KG_CP_THREAD_CONTROL, 1);
++	cmd[n++] = KG_THREAD_BOTH;
++	cmd[n++] = kg_pkt7(KG_CP_SET_MARKER, 1);
++	cmd[n++] = 0x100;                               /* IFPC enable */
++	cmd[n++] = kg_pkt7(KG_CP_THREAD_CONTROL, 1);
++	cmd[n++] = KG_THREAD_BR;
++	memcpy((uint32_t *)rb + kg_rb_wptr, cmd, 4u * n);
++	kg_to_memory(rb + 4u * kg_rb_wptr, 4u * n);
++	kg_rb_wptr = (kg_rb_wptr + n) % KG_RB_DWORDS;
++	kg_wr(kg.gpu, 4u * GEN7_CP_RB_WPTR, kg_rb_wptr);
++	kg_sub.submits++;
++	lck_mtx_unlock(&kg_sub_lock);
++	return fence;
++}
++
++/* the CP has written fence `fence` (or a later one) */
++static bool
++kg_fence_done(uint32_t fence)
++{
++	return !kg_sub.ready || (int32_t)(*kg_sub.fence - fence) >= 0;
++}
++
++static void
++kg_gpu_report(const char *why)
++{
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
++
++	kg_wr(kg.gpu, 4u * GEN7_CP_SQE_STAT_ADDR, 1);
++	printf("SWEET KGPU: report (%s): fence %u, done %u; ring rptr %u wptr %u (%u wraps); rbbm_status %#x "
++	    "cp_hw_fault %#x interrupt %#x protect %#x sqe_stat %#x; ib1 %#x:%08x rem %u, ib2 %#x:%08x rem %u\n", why,
++	    kg_sub.seqno, kg_sub.ready ? *kg_sub.fence : 0, kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr, kg_sub.wraps,
++	    kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_PROTECT_STATUS),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_SQE_STAT_DATA), kg_rd(kg.gpu, 4u * GEN7_CP_IB1_BASE_HI),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_IB1_BASE), kg_rd(kg.gpu, 4u * GEN7_CP_IB1_REM_SIZE),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_IB2_BASE_HI), kg_rd(kg.gpu, 4u * GEN7_CP_IB2_BASE),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_IB2_REM_SIZE));
++	printf("SWEET KGPU: report (%s): cb0 fsr %#x far %#x:%08x fsynr0 %#x\n", why, kg_rd(kg.smmu, cb + SMMU_CB_FSR),
++	    kg_rd(kg.smmu, cb + SMMU_CB_FAR + 4), kg_rd(kg.smmu, cb + SMMU_CB_FAR), kg_rd(kg.smmu, cb + SMMU_CB_FSYNR0));
++}
++
++/* up to `ms` milliseconds for a fence; the time it took in microseconds, or ~0u */
++static unsigned
++kg_fence_wait(uint32_t fence, unsigned ms)
++{
++	for (unsigned us = 0; us <= ms * 1000u; us += 20) {
++		if (kg_fence_done(fence)) {
++			return us;
++		}
++		delay(20);
++	}
++	return ~0u;
++}
++
++/* an IB at byte `off` of the IB buffer: kg_cs copied there and cleaned to memory; its GPU address */
++static uint64_t
++kg_ib_put(struct kg_ubuf *ib, uint32_t off)
++{
++	memcpy((void *)(ib->mem + off), kg_cs, 4u * kg_cs_n);
++	kg_to_memory(ib->mem + off, 4u * kg_cs_n);
++	return ib->va + off;
++}
++
++/* kg_cs: an IB that fills rows [top, bottom) of 1024 pixels at va with one colour, the caches to memory after */
++static void
++kg_ib_fill(uint64_t va, uint32_t top, uint32_t bottom, uint8_t r, uint8_t g, uint8_t b)
++{
++	kg_cs_n = 0;
++	kg_cs_pkt7(0x46, 1);                            /* CCU_INVALIDATE_COLOR */
++	kg_cs_word(0x19);
++	kg_cs_pkt7(0x65, 1);                            /* CP_SET_MARKER RM6_BLIT2DSCALE */
++	kg_cs_word(12);
++	kg_cs_reg(0x88e5, 0x40u << 23);                 /* RB_CCU_CACHE_CNTL, as step 22 */
++	kg_cs_fill_at(va, KG_U_PITCH, KG_U_PITCH / 4u, top, bottom, r, g, b);
++	kg_cs_pkt7(0x46, 1);                            /* CCU_CLEAN_COLOR */
++	kg_cs_word(0x21);
++	kg_cs_pkt7(0x46, 1);                            /* CACHE_CLEAN */
++	kg_cs_word(0x31);
++}
++
++/*
++ * Step 24 (glue plan K3): submissions through redwood_gpu_submit, as RedwoodGPU will make
++ * them for Mesa: IBs in an own buffer of the GPU's (step 23's kind), a picture buffer of
++ * 1024 x 256; each submission ends in the fence, polled through its uncached word. No
++ * wait-for-idle and no marker in the IBs: the fence alone says the work is done.
++ * Checked: one IB of three bands; two IBs in one submission (top half, bottom half);
++ * 400 submissions of a one-row IB without waiting, which wraps the 8K-word ring and
++ * makes the submitter wait for room; their fences one after another; done(last) and
++ * not done(last + 1); the report. The buffers go in the step.
++ */
++#define KG_SUB_RUNS      400u
++static bool
++kg_step24(void)
++{
++	static const struct {
++		uint32_t top, bottom;
++		uint8_t r, g, b;
++	} band[3] = { { 0, 80, 255, 128, 0 }, { 80, 170, 255, 255, 255 }, { 170, 256, 0, 128, 255 } };
++	struct kg_ubuf pic, ib;
++	uint64_t va[2];
++	uint32_t len[2], f, first = 0, last = 0, wraps0;
++	unsigned bad = 0, us, order = 0;
++	bool ok = false;
++
++	bzero(&pic, sizeof(pic));
++	bzero(&ib, sizeof(ib));
++	if (!kg_sub_setup()) {
++		return false;
++	}
++	kg_next(24, "submissions through redwood_gpu_submit: IBs in the GPU's own memory, kgsl's gen7 wrapping, the fence "
++	    "polled; two IBs at once; 400 in a row around the ring");
++	if (!kg_ubuf_make(&pic, 0x100000, false) || !kg_ubuf_make(&ib, 0x10000, false)) {
++		goto out;
++	}
++
++	/* one IB, three bands */
++	kg_cs_n = 0;
++	kg_cs_pkt7(0x46, 1);
++	kg_cs_word(0x19);
++	kg_cs_pkt7(0x65, 1);
++	kg_cs_word(12);
++	kg_cs_reg(0x88e5, 0x40u << 23);
++	for (unsigned i = 0; i < 3; i++) {
++		kg_cs_fill_at(pic.va, KG_U_PITCH, KG_U_PITCH / 4u, band[i].top, band[i].bottom, band[i].r, band[i].g, band[i].b);
++	}
++	kg_cs_pkt7(0x46, 1);
++	kg_cs_word(0x21);
++	kg_cs_pkt7(0x46, 1);
++	kg_cs_word(0x31);
++	len[0] = kg_cs_n;
++	va[0] = kg_ib_put(&ib, 0);
++	f = kg_submit(va, len, 1);
++	us = f != 0 ? kg_fence_wait(f, 1000) : ~0u;
++	for (unsigned i = 0; i < 3 && us != ~0u; i++) {
++		bad += kg_ucheck(pic.mem + (vm_offset_t)band[i].top * KG_U_PITCH, band[i].bottom - band[i].top, band[i].r, band[i].g,
++		    band[i].b);
++	}
++	printf("SWEET KGPU: 24 one IB (%u words at GPU %#llx), three bands: fence %u done after %u us; %u of 512 samples wrong\n",
++	    len[0], va[0], f, us, bad);
++	if (f == 0 || us == ~0u || bad != 0) {
++		goto out;
++	}
++
++	/* two IBs in one submission */
++	kg_ib_fill(pic.va, 0, 128, 200, 0, 200);
++	len[0] = kg_cs_n;
++	va[0] = kg_ib_put(&ib, 0x1000);
++	kg_ib_fill(pic.va, 128, 256, 0, 200, 200);
++	len[1] = kg_cs_n;
++	va[1] = kg_ib_put(&ib, 0x2000);
++	f = kg_submit(va, len, 2);
++	us = f != 0 ? kg_fence_wait(f, 1000) : ~0u;
++	bad = us == ~0u ? 1u : kg_ucheck(pic.mem, 128, 200, 0, 200) + kg_ucheck(pic.mem + 128u * KG_U_PITCH, 128, 0, 200, 200);
++	printf("SWEET KGPU: 24 two IBs in one submission: fence %u done after %u us; %u of 512 samples wrong\n", f, us, bad);
++	if (f == 0 || us == ~0u || bad != 0) {
++		goto out;
++	}
++
++	/* 400 in a row, around the ring */
++	kg_ib_fill(pic.va, 0, 1, 7, 77, 177);
++	len[0] = kg_cs_n;
++	va[0] = kg_ib_put(&ib, 0x3000);
++	wraps0 = kg_sub.wraps;
++	for (unsigned i = 0; i < KG_SUB_RUNS; i++) {
++		f = kg_submit(va, len, 1);
++		if (f == 0) {
++			printf("SWEET KGPU: 24 submission %u of %u not taken (no room in 2 s?)\n", i, KG_SUB_RUNS);
++			goto out;
++		}
++		order += i != 0 && f != last + 1u;
++		first = i == 0 ? f : first;
++		last = f;
++	}
++	us = kg_fence_wait(last, 2000);
++	bad = us == ~0u ? 1u : kg_ucheck(pic.mem, 1, 7, 77, 177);
++	printf("SWEET KGPU: 24 %u submissions, fences %u..%u (%u out of order), the last done after %u us; ring: %u wraps, "
++	    "%u waits for room so far, wptr %u; done(%u) %s, done(%u) %s; row 0: %u of 2 samples wrong\n", KG_SUB_RUNS, first,
++	    last, order, us, kg_sub.wraps - wraps0, kg_sub.waits, kg_rb_wptr, last, kg_fence_done(last) ? "yes" : "NO",
++	    last + 1u, kg_fence_done(last + 1u) ? "YES" : "no", bad);
++	if (us == ~0u || order != 0 || kg_sub.wraps == wraps0 || !kg_fence_done(last) || kg_fence_done(last + 1u) || bad != 0) {
++		goto out;
++	}
++	kg_gpu_report("step 24, all done");
++	printf("SWEET KGPU: 24 THE GPU RUNS SUBMISSIONS: IBs from its own memory, kgsl's wrapping, fences in order, the "
++	    "ring wrapped %u times\n", kg_sub.wraps - wraps0);
++	ok = true;
++out:
++	if (!ok && kg_sub.ready) {
++		kg_gpu_report("step 24 failed");
++		(void)kg_fence_wait(kg_sub.seqno, 2000);      /* (the buffers go next: nothing of ours may be in flight) */
++	}
++	kg_ubuf_drop(&ib);
++	kg_ubuf_drop(&pic);
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -3932,11 +4299,12 @@ kg_keep_report(unsigned s)
+ 
+ 	printf("SWEET KGPU: kept %u s: gx gdsc %#x rpmh_power_state %#x gfx_pwr_clk_status %#x cx_busy %#x; "
+ 	    "rbbm_status %#x cp rptr/wptr %u/%u sqe_cntl %#x hw_fault %#x; cb0 fsr %#x; gmu2host_intr_info %#x, "
+-	    "hfi message r/w %u/%u debug r/w %u/%u\n", s, kg_rd(kg.gpucc, KG_GX_GDSCR), kg_gmu(GEN7_GMU_RPMH_POWER_STATE),
+-	    kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS), kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS), kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS),
+-	    kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr, kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL),
+-	    kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT), kg_rd(kg.smmu, cb + SMMU_CB_FSR), kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO),
+-	    kg_hfi->q[1].read_index, kg_hfi->q[1].write_index, kg_hfi->q[2].read_index, kg_hfi->q[2].write_index);
++	    "hfi message r/w %u/%u debug r/w %u/%u; fence %u of %u, %u submissions\n", s, kg_rd(kg.gpucc, KG_GX_GDSCR),
++	    kg_gmu(GEN7_GMU_RPMH_POWER_STATE), kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS), kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS),
++	    kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr,
++	    kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT), kg_rd(kg.smmu, cb + SMMU_CB_FSR),
++	    kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO), kg_hfi->q[1].read_index, kg_hfi->q[1].write_index, kg_hfi->q[2].read_index,
++	    kg_hfi->q[2].write_index, kg_sub.ready ? *kg_sub.fence : 0, kg_sub.seqno, kg_sub.submits);
+ 	/* glue plan 3.3: the GMEM range gen7_start wrote (read 0 right after it on #41/#45/#47), hbb 14, macrotile */
+ 	printf("SWEET KGPU: kept %u s: uche_gmem_range min %#x:%08x max %#x:%08x; rbbm_nc_mode_cntl %#x; "
+ 	    "rb_nc_mode_cntl %#x tpl1 %#x sp %#x gras %#x uche_mode_cntl %#x\n", s,
+@@ -3958,6 +4326,7 @@ kg_keep(void)
+ 	uint64_t began = mach_absolute_time();
+ 	unsigned s = 0, said = 0;
+ 
++	(void)kg_sub_setup();           /* (redwood_gpu_ready() wants it) */
+ 	kg_keep_report(0);
+ 	kg.kept = true;
+ 	if (kg.keep_s != 0) {
+@@ -3989,6 +4358,9 @@ kg_keep(void)
+ 	}
+ 	kg.kept = false;
+ 	kg.hold_s = s;
++	if (kg_sub.ready && kg_fence_wait(kg_sub.seqno, 1000) == ~0u) {
++		kg_gpu_report("the last submission not done before the undo");
++	}
+ 	printf("SWEET KGPU: the kept GPU goes after %u s: %s\n", s, kg.exit_asked ? kg.exit_why : "kgpu_keep_s ran out");
+ 	kg_keep_report(s);
+ }
+@@ -3996,14 +4368,14 @@ kg_keep(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21, kg_step22, kg_step23 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21, kg_step22, kg_step23, kg_step24 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture; 23 the GPU's own buffers", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture; 23 the GPU's own buffers; 24 submissions", kg.pause_ms);
+ 	while (done < kg.last && !kg.exit_asked) {
+ 		kg.step = done + 1;
+ 		if (kg.keep && kg.step == 22) {
+@@ -4045,22 +4417,22 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_keep", &keep, sizeof(keep));
+ 	(void)PE_parse_boot_argn("kgpu_keep_s", &keep_s, sizeof(keep_s));
+ 	(void)PE_parse_boot_argn("kgpu_keep_report", &report_s, sizeof(report_s));
+-	kg.last = last > 23 ? 23u : (unsigned)last;
++	kg.last = last > 24 ? 24u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 23) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..23 exist; running those\n", last);
++	if (last > 24) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..24 exist; running those\n", last);
+ 	}
+ 	if (keep != 0 && kg.last < 21) {
+ 		printf("SWEET KGPU: kgpu_keep wants the CP running (step 21), kgpu=%d: not kept, undone at the end\n", last);
+ 	} else if (keep != 0) {
+ 		if (kg.last == 22) {
+ 			printf("SWEET KGPU: kgpu_keep: steps 1..21 (step 22's picture is for runs that end)\n");
+-		} else if (kg.last == 23) {
+-			printf("SWEET KGPU: kgpu_keep: steps 1..21 and 23 (step 22's picture is for runs that end)\n");
++		} else if (kg.last >= 23) {
++			printf("SWEET KGPU: kgpu_keep: steps 1..21 and 23..%u (step 22's picture is for runs that end)\n", kg.last);
+ 		}
+-		kg.last = kg.last == 23 ? 23u : 21u;
++		kg.last = kg.last >= 23 ? kg.last : 21u;
+ 		kg.keep = true;
+ 		kg.keep_s = keep_s > 0 ? (unsigned)keep_s : 0u;
+ 		kg.report_s = report_s > 0 ? (unsigned)report_s : 0u;
+@@ -4195,11 +4567,11 @@ topaz_gpu_pool_free(__unused uint64_t pa, __unused uint64_t size)
+ {
+ }
+ 
+-/* steps 1-21 done and the GPU kept (K1) */
++/* steps 1-21 done, the GPU kept (K1), submission set up (K3) */
+ bool
+ redwood_gpu_ready(void)
+ {
+-	return kg.kept;
++	return kg.kept && kg_sub.ready;
+ }
+ 
+ /* the answers of glue plan 3.3 come with K4 */
+@@ -4253,23 +4625,24 @@ redwood_gpu_to_memory(void *start, uint64_t size)
+ 	}
+ }
+ 
+-/* submission and fences come with K3: nothing is taken, and nothing is ever outstanding */
++/* IBs, kgsl's gen7 wrapping and a fence into the ring (K3); the fence, 0 if not taken (no room in 2 s) */
+ uint32_t
+-redwood_gpu_submit(__unused const uint64_t *addresses, __unused const uint32_t *words, __unused uint32_t count)
++redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+-	return 0;
++	return kg_submit(addresses, words, count);
+ }
+ 
++/* the CP has written fence `fence` or a later one (read through the fence word's uncached alias) */
+ bool
+-redwood_gpu_done(__unused uint32_t fence)
++redwood_gpu_done(uint32_t fence)
+ {
+-	return true;
++	return kg_fence_done(fence);
+ }
+ 
+ uint32_t
+ redwood_gpu_last(void)
+ {
+-	return 0;
++	return kg_sub.seqno;
+ }
+ 
+ void
+@@ -4280,10 +4653,15 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ 	bzero(by, 7 * sizeof(uint32_t));
+ }
+ 
++/* CP, ring and context 0 state, for a submission that does not end */
+ void
+ redwood_gpu_report(const char *why)
+ {
+-	printf("SWEET KGPU: RedwoodGPU reports \"%s\", with no GPU behind it yet\n", why);
++	if (!kg_sub.ready) {
++		printf("SWEET KGPU: RedwoodGPU reports \"%s\", with no submission set up\n", why);
++		return;
++	}
++	kg_gpu_report(why);
+ }
+ 
+ void

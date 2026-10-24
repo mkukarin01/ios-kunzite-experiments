@@ -43,7 +43,9 @@ range reads 0 even with GX held; RBBM_NC_MODE_CNTL = 1. **K2 = 0992 (the GPU's o
 tables on demand, user-range addresses, real map/unmap, step 23) is written**, not built or
 booted: push, CI, then boot #49 with `kgpu=23 kgpu_keep=1 kgpu_keep_s=120` (entry after #48).
 **K2 done: boot #49 passes** (12 rounds, remap, guard, 34 MB with grown tables, read-only entry,
-undo frees the grown tables after the streams). **Next: K3**, submission and fences.
+undo frees the grown tables after the streams). **K3 = 0993 (submission: kgsl's gen7 wrapping,
+the fence through an uncached word, ring wrap, step 24) is written**, not built or booted: push,
+CI, then boot #50 with `kgpu=24 kgpu_keep=1 kgpu_keep_s=120` (entry after #49).
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -1009,6 +1011,49 @@ stream 5 and CB1 off, **"undo gpu page tables made on demand: freed 3 pages"**, 
 ...; "after undo: cx gdsc 0x22f001 hw_ctrl 0x5ff4 gx gdsc 0x222801" (= #47/#48), "run over". No
 panic; backboardd (56), SpringBoard (26) and the agent as before. Next: glue plan K3, submission
 (`redwood_gpu_submit/_done/_last`, kgsl's IB wrapping, the gen7 fence, ring wrap).
+
+**GLUE K3 = 0993 (2026-10-24, written, NOT built/booted): submission.** Main repo
+ios/gpu-glue-plan.md 3.2, 4. `redwood_gpu_submit/_done/_last/_report` are real.
+- **Setup** (`kg_sub_setup`, by step 24 or by keep mode before it says ready): a fence word at
+  scratch + 0x200 (GPU 0xe0008200), read through an uncached (WC) alias of the scratch page,
+  unmapped by the undo.
+- **A submission** is kgsl's gen7 wrapping, 25 + 4 words per IB, under a mutex:
+  - THREAD_CONTROL both, SET_MARKER 0x101, THREAD_CONTROL BR;
+  - marker 0xd, one CP_INDIRECT_BUFFER_PFE per IB, marker 0xe;
+  - EVENT_WRITE 24 and 25 (CCU invalidate);
+  - EVENT_WRITE CACHE_CLEAN | BIT(27) with the fence address and number;
+  - THREAD_CONTROL both, marker 0x100, THREAD_CONTROL BR.
+- **Ring wrap** as `adreno_ringbuffer_allocspace`: a CP_NOP over a short tail, then the words go
+  from 0; the submitter waits up to 2 s for RPTR; WPTR never catches up with it.
+- `_report` prints the fence, ring, RBBM/CP fault/interrupt/protect status, SQE stat, IB1/IB2
+  and CB0 FSR/FAR/FSYNR0.
+- `redwood_gpu_ready()` also wants the setup. The keep report shows the fence. Keep's exit waits
+  for the last fence before the undo.
+- **Step 19 change:** the scratch page is mapped `PTE_GMU | PTE_AP_UNPRIV`. The fence is written
+  by the CP's event path, which may not be a privileged master (boot #43's fault was an
+  unprivileged write to a privileged-only page). [guess: needed; harmless if not]
+- **Step 23 fix:** `kg_to_memory` on the marker's line before reading it (#49's stale reads).
+- **Step 24** (`kgpu=24`; with `kgpu_keep`: 1-21, 23, 24, then kept): IBs in an own buffer, a
+  1024x256 picture.
+  - One IB of three bands, checked after its fence alone (no WFI or marker in the IB).
+  - Two IBs in one submission.
+  - 400 submissions of a one-row IB without waiting, around the ring (at least one wrap
+    required): each fence must be the one after the last; done(last) yes, done(last + 1) no.
+  - Then the report and "24 THE GPU RUNS SUBMISSIONS".
+- Verified:
+  - the replay: 239 applied, the four known skips, byte-identical, nothing else changed;
+    series 235 patches;
+  - kcc.sh 0 diagnostics (strict: the same 4 old ones); CI's compile line builds it;
+  - CI's full warning set: +6 against K2, all from XNU's own `LCK_GRP_DECLARE`/
+    `LCK_MTX_DECLARE` expansion (reserved `__startup_` names, a function cast), as in any driver
+    declaring a lock that way;
+  - all 36 undefined symbols resolve against #49's kernel.
+
+**Test (boot #50):** standard cmdline + `sweetusb=2 kgpu=24 kgpu_keep=1 kgpu_keep_s=120`. Expect
+#49's step 23 (markers now matching), "24 submission ready", the one-IB and two-IB lines with
+0 samples wrong, the 400-line with 0 out of order and at least 1 wrap, done(last) yes and
+done(last+1) no, the report, "THE GPU RUNS SUBMISSIONS". Then kept 120 s (fence in the reports)
+and the undo as #49 with "undo fence uncached alias".
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
