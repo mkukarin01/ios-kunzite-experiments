@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 0999 (the real write-combine fix), 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #58 (0999, write-combined buffers), 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -182,7 +182,9 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
 **0999 written: #56's panic was a 32-bit shift, not a "lower DDR bank".** In
 `pmap_sync_page_attributes_phys`, `pp << PAGE_SHIFT` with a 32-bit page number turned page 0x1_60de0000
 into 0x60de0000. 0999 uses `ptoa(pp)` and makes write-combined buffers the default again (log entry
-"0999"). Boot #57 (CI 887472f9, 0998, cached buffers) is the last good state.
+"0999"). **Boot #58 (CI 7ffbfac6, tag xnu-boot-58) is the current good state: write-combined buffers,
+no panic, eagl-check 100 frames in 24.9 ms (66 cached), the per-submission cache push down from
+about 0.4-0.9 ms to 4-250 us** (log entry). shim/out/shim-boot-58c.img is the same with gpu_cached=1.
 
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
@@ -1860,6 +1862,29 @@ gpu_cached=1, was never booted.)
   - RedwoodGPU.cpp compiled with CI's line, 0 warnings;
   - pmap.c not compiled locally (no CI compile line for osfmk at hand): a one-macro change;
   - replay: 245 applied, the 4 usual skips.
+
+**BOOT #58 (2026-10-24 21:10:57, shim/out/shim-boot-58.img: CI kernel sha256 7ffbfac6... with 0999,
+tag xnu-boot-58 on 26fa621; cmdline #54's). WRITE-COMBINED GPU BUFFERS WORK.** Log:
+temp/ios-m8/usblog/live-boot58-20261024-2110.txt.
+- 0999 is in the kernel (llvm-objdump):
+  - `pmap_sync_page_attributes_phys` begins `ubfiz x0, x0, #14, #32` (the page number widened,
+    then shifted);
+  - `RedwoodGPUStart` no longer calls `redwood_gpu_identity` (`cached = 0`).
+- backboardd on the GPU at 21:11:34 (FD710, "open 1"), past where #56 panicked. The agent answered
+  at 21:11:38.
+- **eagl-check:** FD710, 20808 pixels, 0 missing, 0 outside, **100 frames 24.9 ms** (#57 cached: 66.2
+  ms; #53: 65.0), 0 failed.
+- **RedwoodGPU's statistics**, against #57's (cached):
+
+  | window | #58 write-combined | #57 cached |
+  |---|---|---|
+  | boot's first 7 submissions | 6436 KB pushed, 212 us a submission | 22390 KB, 886 us |
+  | quiet UI | 102 submissions, 110 KB, **4 us a submission** | 102 submissions, 12662 KB, 419 us |
+  | busy UI | 168 submissions, 6436 KB, 254 us; 185 submissions, 5358 KB, 201 us | 389 submissions, 17286 KB, 687 us |
+
+  What is still pushed is IOSurfaces (screens, textures), which stay cached (G7).
+- No CONTEXT 0 FAULT, no GMU ERROR, no panic so far.
+- Not seen: the user's look at the UI on #58.
   - **Left on the phone before the park:** /topaz/sb3 present; the inject with the second source installed
     (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
     for the old behaviour (Settings blocky, Safari black).
