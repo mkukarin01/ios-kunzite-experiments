@@ -38,6 +38,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define VSLOT(vtable, offset)   ((vtable) + 0x10 + (offset))
 #define FN_FUNCTION_SUPPORTED   0x1884b2164UL   /* CA::OGL::GLContext::function_supported() const */
 #define FN_FUNCTION_UNIFORM     0x1884b21acUL   /* CA::OGL::GLContext::function_uniform(unsigned, unsigned long, unsigned long, float const*) */
+#define TEX_FRAGMENT_SHADERS    0x1d5b48a10UL   /* CA::OGL::tex_fragment_shaders: a GLSL source per function, or NULL */
 
 static uintptr_t slide;
 
@@ -74,6 +75,66 @@ context_function(void *context)
 	return *(*(uint8_t **)((char *)context + 0x10) + 0x10);
 }
 
+/*
+ * kunzite (boot #55's census): CoreAnimation's GL renderer has no function 40 ("sb3"), the blur it
+ * puts over a keyboard's backdrop; refused, it draws that backdrop blocky (Settings) or not at
+ * all (Safari's keyboard came out black). With the file /topaz/sb3 there when the window server
+ * starts, it is told 40 is there: it then draws it with no program, which eagl.c draws (plainly,
+ * or with its own sb3 program) and whose numbers it writes down.
+ */
+#define FUNCTION_SB3 40
+#define SB3_SWITCH "/topaz/sb3"
+static int sb3_yes;
+
+/*
+ * Told yes, CoreAnimation crashed (boot #55): GaussianBlurFilter::render -> Context::blur_surface ->
+ * BlurState::single_pass_blur -> function_uniform -> update_shader -> create_shader, which
+ * strdup()s CA::OGL::tex_fragment_shaders[40], and that entry is NULL: the GL renderer has no
+ * source for "sb3" (nor for 38, 39, drawn by eagl.c), though create_shader expects one. 40's
+ * vertex shader is the Gaussian blurs' (32-37, vertex_shaders[6]): texcoord6/7 = t0 -/+ offset[0],
+ * texcoord5/8 = t0 -/+ offset[1], and so on. What CoreAnimation gives 40 (boot #55, Safari's
+ * keyboard): offset = (-a, b), (a, b), (-a, -b), (a, -b), so texcoord5-8 are the four corners
+ * (3, 4, 9 and 10 repeat them); weight = 0.25, 0, 0, 0; divide = 1. So here is a source for the
+ * entry, in the style of the GL renderer's own blurs (32-37: sampler2DRect, weight, divide;
+ * eagl.c's glShaderSource rewrites it as it does the others): the four corners weighted, then
+ * divided by alpha when divide says so.
+ */
+static const char sb3_fragment[] =
+	"uniform lowp sampler2DRect texture0;\n"
+	"uniform mediump vec4 weight[2];\n"
+	"uniform lowp float divide;\n"
+	"varying highp vec2 texcoord5, texcoord6, texcoord7, texcoord8;\n"
+	"void main() {\n"
+	"  highp vec4 acc;\n"
+	"  acc = texture2DRect(texture0, texcoord6) * weight[0].x;\n"
+	"  acc = texture2DRect(texture0, texcoord7) * weight[0].x + acc;\n"
+	"  acc = texture2DRect(texture0, texcoord5) * weight[0].x + acc;\n"
+	"  acc = texture2DRect(texture0, texcoord8) * weight[0].x + acc;\n"
+	"  if (divide != 0.0)\n"
+	"    acc /= max(0.001, acc.a);\n"
+	"  gl_FragData[0] = acc;\n"
+	"}\n";
+
+/* tex_fragment_shaders[40] made to point at sb3_fragment, if it is still NULL; 0 if not done */
+static int
+sb3_source(void)
+{
+	uintptr_t *entry = (uintptr_t *)(TEX_FRAGMENT_SHADERS + slide + FUNCTION_SB3 * sizeof(uintptr_t));
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+
+	if (*entry != 0) {
+		fprintf(stderr, "topaz-gl: tex_fragment_shaders[40] holds %#lx, not NULL: left alone, sb3 not offered\n", *entry);
+		return 0;
+	}
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		fprintf(stderr, "topaz-gl: tex_fragment_shaders not writable: sb3 not offered\n");
+		return 0;
+	}
+	*entry = (uintptr_t)sb3_fragment;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	return 1;
+}
+
 static int
 my_function_supported(void *context)
 {
@@ -81,6 +142,14 @@ my_function_supported(void *context)
 	int supported = orig_function_supported(context);
 	unsigned function = context_function(context);
 
+	if (!supported && function == FUNCTION_SB3 && sb3_yes) {
+		if (!said[function & 255]) {
+			said[function & 255] = 1;
+			fprintf(stderr, "topaz-gl: CoreAnimation's GL renderer has no function %u (\"sb3\"): told it has (%s)\n", function,
+			    SB3_SWITCH);
+		}
+		return 1;
+	}
 	if (!supported) {
 		if (gl_function_refused != NULL) {
 			gl_function_refused(function);
@@ -96,6 +165,18 @@ my_function_supported(void *context)
 static void
 my_function_uniform(void *context, unsigned index, size_t components, size_t count, const float *values)
 {
+	static unsigned sb3_told;
+
+	if (context_function(context) == FUNCTION_SB3 && sb3_told < 6) {
+		char text[400];
+		size_t used = 0;
+
+		sb3_told++;
+		for (size_t i = 0; i < components * count && i < 28 && used < sizeof(text) - 16; i++) {
+			used += (size_t)snprintf(text + used, sizeof(text) - used, " %.4g", (double)values[i]);
+		}
+		fprintf(stderr, "topaz-gl: sb3 uniform %u: %zu of %zu:%s\n", index, count, components, text);
+	}
 	gl_function_values(context, context_function(context), index, components, count, values);
 	orig_function_uniform(context, index, components, count, values);
 }
@@ -110,6 +191,7 @@ gl_hooks(void *lib)
 		return;
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
+	sb3_yes = access(SB3_SWITCH, F_OK) == 0 && sb3_source();
 	gl_function_refused = (void (*)(unsigned))dlsym(lib, "redwood_gl_function_refused");
 	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(lib,
 	    "redwood_gl_function_values");
@@ -119,8 +201,8 @@ gl_hooks(void *lib)
 		orig_function_uniform = replace_virtual("function_uniform", VSLOT(VT_GLES_CONTEXT, 0x388), FN_FUNCTION_UNIFORM,
 		    my_function_uniform);
 	}
-	fprintf(stderr, "topaz-gl: GLESContext hooks: function_supported %s, function_uniform %s\n",
-	    orig_function_supported ? "on" : "OFF", orig_function_uniform ? "on" : "OFF");
+	fprintf(stderr, "topaz-gl: GLESContext hooks: function_supported %s, function_uniform %s; sb3 %s\n",
+	    orig_function_supported ? "on" : "OFF", orig_function_uniform ? "on" : "OFF", sb3_yes ? "said to be there" : "as it is");
 }
 
 /* Where a crash happened, printed to stderr (the console): image + offset + symbol. */

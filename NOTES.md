@@ -1712,6 +1712,42 @@ arrival times in census-boot55.txt.
     picture it is given").
   - CoreAnimation's numbers for it get logged ("gives its function 40 numbers"). From those, a
     real `sb3` program for eagl, like its `ds8` and variable-blur ones.
+- **The sb3 work (20:07-20:20), with the user looking.**
+  - **Told yes alone, backboardd crashed (SIGSEGV, 20:08:12)**, symbolized in the 20H392 cache:
+    `GaussianBlurFilter::render` -> `Context::blur_surface` -> `BlurState::single_pass_blur` ->
+    `GLContext::function_uniform` -> `update_shader` -> `create_shader` -> `strdup` -> `strlen`.
+    - `create_shader` takes a texture effect's GL source from `CA::OGL::tex_fragment_shaders[f]`
+      (0x1d5b48a10), for f in a bitmask that includes 40.
+    - Entry 40 is NULL; so are 38 and 39, which eagl draws, but the code never reads those.
+    - So "sb3" is CoreAnimation's single-pass Gaussian blur, and the GL renderer has no source for
+      it.
+    - Its vertex shader is `vertex_shaders[6]` (`tex_vertex_shader_indices[40]` = 6), as for the
+      N-tap Gaussian blurs 32-37: texcoord0-13 = t0 -/+ offset[0..6].
+    - The GL sources are copied to main repo temp/gpu-glue-r/ca-tex-shaders/.
+    - The switch was removed at once. The backboardd that launchd had already started still had
+      it, so it was restarted again (20:08:30).
+  - **topaz_inject now supplies the source** (`sb3_fragment`, only with /topaz/sb3 and only if
+    entry 40 is still NULL): it writes the entry in `__DATA_CONST` the way it writes the vtable,
+    and logs CoreAnimation's first sb3 uniforms.
+    - Safari's keyboard: offset = (-a, b), (a, b), (-a, -b), (a, -b) (texcoord5-8 are those four
+      corners); weight = 0.25, 0, 0, 0; divide = 1. a, b animate up from about 0.
+    - No crash. The first source took the four corners at 0.25 and no divide: GL error 0x502 on
+      CoreAnimation's divide uniform.
+    - The second source takes weight and divide like CoreAnimation's own blurs.
+  - **What the user saw:**
+    - Settings: right with the first source; grey with black big-pixel lines behind the keys with
+      the second.
+    - Safari: black on first start, then after reopening the same lines, shifted.
+  - **New `userland/gpu/kshot`** (IOSurfaceLookup of the window server's 1125 x 2436 BGRA screen
+    surfaces, written as PNG with ImageIO; run over the agent, `/get` the PNG) shows Safari's
+    keyboard background as big black and light-grey blocks, a magnified corner of a texture.
+    Copies are in main repo temp/ios-m8/u4/kshot/.
+    - [guess] A pass around sb3 reads its texture in the wrong space (8x-small texture read as if
+      full size) or reads unwritten texels. CoreAnimation's own 32-37 blurs, with the same vertex
+      shader and offsets, draw right, so sb3's taps are probably not it.
+  - **Left on the phone:** /topaz/sb3 present; the inject with the second source installed
+    (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
+    for the old behaviour (Settings blocky, Safari black).
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

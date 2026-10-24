@@ -1,7 +1,7 @@
 #!/bin/bash
 # gl-triangle for the phone (arm64 iOS 16), signed ad hoc as the agent is (agent/build.sh). It loads
 # libOSMesa.8.dylib (userland/mesa/mk-mesa-mac.sh) at run time, so it needs no Mesa to build:
-#   userland/gpu/mk-gl-triangle.sh   ->   userland/gpu/out/gl-triangle, out/kjoin, out/kfind, out/kdmesg
+#   userland/gpu/mk-gl-triangle.sh   ->   userland/gpu/out/gl-triangle, out/kjoin, out/kfind, out/kdmesg, out/kshot
 # Onto the phone and run, over the agent (the GPU kept: kgpu_keep=1 kgpu>=21). The agent holds a /put
 # body in memory and jetsam kills it near 5 MB, so the 15 MB library goes in 2 MB parts, joined by kjoin
 # (it prints the size and FNV-1a 64 hash, to compare with the Mac's copy):
@@ -24,4 +24,12 @@ for p in gl_triangle:gl-triangle kjoin:kjoin kfind:kfind kdmesg:kdmesg; do
 		codesign -f -s - --entitlements ../../agent/entitlements.plist --generate-entitlement-der out/${p#*:}
 	fi
 done
-ls -l out/gl-triangle out/kjoin out/kfind out/kdmesg
+# kshot needs more frameworks (it writes PNG files with ImageIO)
+clang -O2 -g -Wall -Wextra -std=c11 -target arm64-apple-ios16.0 -isysroot "$SDK" kshot.c -framework CoreFoundation \
+	-framework CoreGraphics -framework IOSurface -framework ImageIO -o out/kshot
+if command -v ldid >/dev/null; then
+	ldid -S../../agent/entitlements.plist out/kshot
+else
+	codesign -f -s - --entitlements ../../agent/entitlements.plist --generate-entitlement-der out/kshot
+fi
+ls -l out/gl-triangle out/kjoin out/kfind out/kdmesg out/kshot
