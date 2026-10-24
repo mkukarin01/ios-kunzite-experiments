@@ -1,9 +1,10 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: K5-min, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: U2, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
-(K5-min, written and checked, not built by CI yet: the user pushes)**. Glue milestones G1-G3
+(K5-min, written and checked, not built by CI yet: the user pushes)**. **U2 is built** (the
+libraries for backboardd, plus eagl-check; Mac-side checks only). Glue milestones G1-G3
 reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7 (freedreno FD710)
 draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha256
 74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
@@ -13,8 +14,8 @@ draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha
 - §4-§7 give the steps and their order.
 The log of K0-U3 is the handoff below this section.
 
-**Order from here:** ~~K5-min~~ (done, 0995) -> U2 (while CI builds 0995) -> boot #53 (K5 kernel
-+ U2 libraries + U4 into backboardd, in one boot) -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+**Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53 (K5 kernel, eagl-check,
+then U4 into backboardd, in one boot) -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
 **Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
@@ -39,51 +40,70 @@ After each step: rewrite this section, an entry below, the plan's progress lines
     `ci-cc.sh` for bsd/ C). These are CI's compile lines against temp/ios-m8/buildtree;
   - `xcrun nm -u` on the object, against `xcrun nm` of xnu/out/xnu-kernel/kernel.development.sweet.
 
-**Step 1 - U2: `userland/gpu/mk-topaz-gl.sh` (Mac only), modelled on mk-gl-triangle.sh and
-HackiOS `userland/build.sh` :293 and :345-348** (main repo
-temp/kunzite-research/hackios-xnu-userland/userland/).
-- `mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt eagl.c > out/eagl_gen.h`:
-  - $M is the Mesa build's out/ (main repo temp/mesa-build/out/);
-  - HackiOS's slot list is valid for 20H392 as it is (R5: all 457 entries at the same offsets).
-- Build `/topaz/lib/libtopaz-gl.dylib` from eagl.c + gl_osmesa.c with `-dynamiclib -install_name
-  ... -Iout -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc`, linked
-  against libOSMesa.8.dylib (install name /topaz/lib/libOSMesa.8.dylib).
-- Build `/topaz/lib/libtopaz-inject.dylib` from topaz_inject.c with
-  `-framework CoreFoundation -framework IOKit -lobjc`.
-- Build the wrapper from bbd_wrap.c. `REAL` follows the U4 way chosen (below).
-- Sign ad hoc with `ldid -S` (dylibs without entitlements).
-- Check on the Mac:
-  - `otool -L`: only system libraries plus /topaz/lib/*;
-  - eagl_gen.h has 457 slots.
-- Optional phone check before U4: HackiOS `src/gl_test.c` (EAGL without backboardd) over the
-  agent.
+**Done - U2: `userland/gpu/mk-topaz-gl.sh`** (entry in the log below). Run as
+`MESA_BUILD=<main repo>/temp/mesa-build userland/gpu/mk-topaz-gl.sh`. It writes to userland/gpu/out/
+(not in git):
+- `eagl_gen.h`: `eagl/mkeagl.py` over `eagl/eagl_slots.txt` (HackiOS's, MIT, copied into the
+  fork; see eagl/README) gives 409 entries: 356 passed on to Mesa, 30 by hand in eagl.c, 23 with
+  no function in the library. None of the 23 is one CoreAnimation is known to call.
+- `libtopaz-gl.dylib`: eagl.c + gl_osmesa.c, install name /topaz/lib/libtopaz-gl.dylib.
+  - It needs /topaz/lib/libOSMesa.8.dylib.
+  - All 386 Mesa symbols it imports are in our libOSMesa's exports.
+- `libtopaz-inject.dylib`: topaz_inject.c (20H392 addresses, R5).
+- `backboardd`: bbd_wrap.c, with `REAL` from `BBD_REAL`. The default is /usr/libexec/backboardd
+  (U4 way 2); BBD_REAL=/usr/libexec/real/backboardd builds way 1.
+- `eagl-check` (new, `eagl_check.m`):
+  - loads libOSMesa and libtopaz-gl from a directory (default /tmp);
+  - makes an EAGLContext of API 3 as CoreAnimation does, then `+setCurrentContext:`;
+  - draws a clear and a shader triangle through **OpenGLES.framework's own gl\* functions**, so
+    through the table, and checks the picture as gl-triangle does;
+  - `soft` selects softpipe, which needs no GPU;
+  - the last line is "EAGL CHECK: THE TABLE WORKS, THROUGH iOS's OWN OpenGL ES (0 failed)".
+- All are signed ad hoc for iOS 16.0, arm64. eagl-check carries the agent's entitlements (like
+  gl-triangle).
+- **Not run on the phone yet**: the agent did not answer while U2 was written.
 
-**Step 2 - boot #53: K5 + U4 (replacing a system file: the user's OK first).**
-- Cmdline: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
-  - No `kgpu_keep_s`: the GPU is kept until reboot, and reboot runs the undo through
-    `kunzite_adreno_shutdown`.
-  - kgpu=21 skips the 23/24 tests. `kg_keep` sets up submission itself, so RedwoodGPU is still
-    published.
-- **Timing catch.** On #52 RedwoodGPU appeared 3 min 20 s after boot (with the 23/24 tests).
-  topaz_inject waits only 5 s for it (50 x 100 ms), then leaves CoreAnimation on the CPU, logging
-  "topaz: no GPU service". So once "RedwoodGPU published" is in the log, restart backboardd over
-  the agent (launchd starts it again, through the wrapper). Alternative: make the wrapper wait
-  for the service.
-- Uploads go to /tmp, each read back:
-  - the 15 MB libOSMesa as 2 MB parts, joined with `kjoin` (recipe in mk-gl-triangle.sh; the
-    agent dies on a /put over about 5 MB);
-  - then into `/topaz/lib` (root:wheel 0755, the dylibs 0644).
-- U4 way (§3.6):
-  - preferred: the wrapper at `/topaz/bin/backboardd`, the launchd.plist cache's
-    `com.apple.backboardd` ProgramArguments[0] pointed at it, and `REAL` = /usr/libexec/backboardd.
-    The old plist is kept beside it as the rollback;
-  - fallback (topaz's): the stock binary to /usr/libexec/real/backboardd, the wrapper in its
-    place.
+**Next - boot #53: K5 kernel, eagl-check, then U4 (replacing a system file: the user's OK
+first).**
+1. **Kernel.** CI after the push of 0995. Check that SHA256SUMS and the run's head sha are the
+   commit with 0995. Image as in the procedure below, cmdline standard +
+   `sweetusb=2 kgpu=21 kgpu_keep=1`.
+   - No `kgpu_keep_s`: the GPU is kept until reboot, and reboot runs the undo through
+     `kunzite_adreno_shutdown`.
+   - kgpu=21 skips the 23/24 tests. `kg_keep` sets up submission itself, so RedwoodGPU is still
+     published.
+2. **Before the swap, over the agent, in /tmp.**
+   - Uploads:
+     - `kjoin`;
+     - libOSMesa as 2 MB parts, joined with kjoin (recipe in mk-gl-triangle.sh). The agent dies on a
+       /put over about 5 MB;
+     - `libtopaz-gl.dylib`;
+     - `eagl-check`.
+   - `/run?a=/tmp/eagl-check&a=soft` (softpipe; works at any time).
+   - Once "RedwoodGPU published" is in the log, `/run?a=/tmp/eagl-check` (the Adreno).
+   - Both must end "THE TABLE WORKS". If not, stop here: the table, setCurrentContext or the
+     method swap is wrong, and backboardd would crash the same way.
+3. **The swap (U4), only with the user's OK.**
+   - `/topaz/lib/` (root:wheel 0755) gets libOSMesa.8.dylib, libtopaz-gl.dylib and
+     libtopaz-inject.dylib (0644).
+   - Then one of the two ways (§3.6):
+     - preferred: the wrapper at `/topaz/bin/backboardd` (0755), and the launchd.plist cache's
+       `com.apple.backboardd` ProgramArguments[0] pointed at it. Keep the old plist beside it as
+       the rollback;
+     - fallback (topaz's): the stock binary to /usr/libexec/real/backboardd and the wrapper,
+       built with BBD_REAL=/usr/libexec/real/backboardd, in its place.
+   - The plist change only takes effect at the next boot: reboot with the same cmdline.
+4. **Timing catch.** On #52 RedwoodGPU appeared 3 min 20 s after boot (with the 23/24 tests).
+   topaz_inject waits only 5 s for it (50 x 100 ms), then leaves CoreAnimation on the CPU and
+   logs "topaz: no GPU service". So once "RedwoodGPU published" is in the log, restart backboardd
+   over the agent; launchd starts it again, through the wrapper. Alternative: make the wrapper
+   wait for the service.
 - Off switch without touching files: `gl=0` in the cmdline.
 - Rollback: the original files back over the agent. The agent is its own launchd job and stays up.
 - Expect in the log:
   - fork 0914's "topaz: backboardd starts WITH DYLD_INSERT_LIBRARIES";
   - syslog "topaz: /topaz/lib/libtopaz-gl.dylib loaded";
+  - eagl.c's "redwood-gl: an OpenGL ES 3 context for CoreAnimation";
   - "RedwoodGPU: client backboardd", and submissions climbing with fences that keep up.
 - Failure signs:
   - a backboardd crash loop: the EAGL slots or the inject addresses (§3.5);
@@ -1367,6 +1387,28 @@ moves after G4.
     in the CI kernel after 91ef60f.
 - [guess] Cost: the flush walks every 64-byte line of the copied rows, about 10 MB for a full
   screen, each frame the GPU drew. Measure it on #53 before blaming it for frame time.
+
+**U2 = `userland/gpu/mk-topaz-gl.sh` + `eagl_check.m` (2026-10-24; built and checked on the Mac,
+not run on the phone).**
+- HackiOS's `mkeagl.py` and `eagl_slots.txt` (MIT; a79ff07 of oosexgang/hackios-xnu-userland) are
+  copied into `userland/gpu/eagl/` unchanged. They give 409 entries: 356 passed on, 30 by hand,
+  23 with no function in the library. mkeagl lists any of those 23 that QuartzCore calls, and it
+  listed none.
+- libtopaz-gl.dylib (eagl.c + gl_osmesa.c, 404592 bytes) depends on:
+  - /topaz/lib/libOSMesa.8.dylib;
+  - CoreFoundation, IOKit, IOSurface, libobjc and libSystem.
+
+  All 386 symbols it takes from libOSMesa are exported there (382 gl\*, 4 OSMesa\*).
+- libtopaz-inject.dylib: CoreFoundation, IOKit, libobjc.
+- The wrapper `backboardd` gets `REAL` from the build: bbd_wrap.c's `#define REAL` can now be
+  overridden. The default is /usr/libexec/backboardd, and the binary's strings show it.
+- All are built for minos 16.0 and signed ad hoc.
+- The only compiler warning is topaz's own (eagl.c:3317, a variable set but not used).
+- `eagl-check` is new: HackiOS's gl_test draws through OSMesa directly, as gl-triangle did, so it
+  would not have tried the table. eagl-check goes through iOS's own EAGLContext and OpenGL ES, so a
+  wrong slot shows up there and not in backboardd.
+- The agent did not answer (`/ping` timed out) while U2 was written, so nothing has run on the
+  phone yet: boot #53, step 2.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

@@ -11,7 +11,9 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
 
+#ifndef REAL                                /* kunzite: -DREAL='"/usr/libexec/backboardd"' (mk-topaz-gl.sh) */
 #define REAL "/usr/libexec/real/backboardd"
+#endif
 #define LOADER "/topaz/lib/libtopaz-inject.dylib"
 #define ENVFILE "/topaz/backboardd.env"      /* KEY=VALUE lines (tests: FD_MESA_DEBUG=sysmem ...) */
 

@@ -1,0 +1,4 @@
+mkeagl.py and eagl_slots.txt are HackiOS's (github.com/oosexgang/hackios-xnu-userland, userland/mkeagl.py and
+userland/src/eagl_slots.txt at a79ff07, 2026-10-22; MIT, LICENSE.hackios), unchanged. The slot list was read
+off iOS 16.5 (20F66); every one of its 457 gl* entries sits at the same offset in our 20H392 OpenGLES (main
+repo ios/gpu-glue-plan.md 3.5). mk-topaz-gl.sh runs mkeagl.py over it for eagl.c.
