@@ -1,0 +1,112 @@
+kunzite: Mesa main's FD710 (Adreno 710, gen7_3_0, chip id 0x07010000; 4db0b15c) in
+Mesa 25.0.7's device table, which has no FD710: main's newer register names and its
+raw-only register list rewritten as 25.0.7's magic_regs + raw_magic_regs (25.0.7 writes
+the named magic ones after the raw ones), tile_max 1024 as main has it. Checked: the
+table generates (stub renderer), FD730 unchanged, all 36 of main's FD710 values present;
+applies before freedreno-darwin.patch and osmesa-es-profile.patch.
+
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -135,7 +135,10 @@
+                  cs_shared_mem_size, wave_granularity, fibers_per_sp,
+                  magic_regs, raw_magic_regs = None, highest_bank_bit = 15,
+                  ubwc_swizzle = 0x6, macrotile_mode = 1,
+-                 threadsize_base = 64, max_waves = 16):
++                 threadsize_base = 64, max_waves = 16,
++                 tile_max_w = None, tile_max_h = None):
++        tile_max_w_override = tile_max_w
++        tile_max_h_override = tile_max_h
+         if chip == CHIP.A6XX:
+             tile_max_w   = 1024 # max_bitfield_val(5, 0, 5)
+             tile_max_h   = max_bitfield_val(14, 8, 4) # 1008
+@@ -146,6 +149,10 @@
+             # on a7xx the compute_lb_size is 40KB for all known parts for now.
+             # We have a parameter for it in case some low-end parts cut it down.
+             compute_lb_size = 40 * 1024
++        if tile_max_w_override:
++            tile_max_w = tile_max_w_override
++        if tile_max_h_override:
++            tile_max_h = tile_max_h_override
+ 
+         super().__init__(chip, gmem_align_w = 16, gmem_align_h = 4,
+                          tile_align_w = tile_align_w,
+@@ -1077,6 +1084,79 @@
+         highest_bank_bit = 16,
+         magic_regs = a730_magic_regs,
+         raw_magic_regs = a730_raw_magic_regs,
++    ))
++
++# FD710 (gen7_3_0, chip id 0x07010000: SM6475/SM7435 "parrot"), backported to 25.0.7 from
++# Mesa main 4db0b15c ("freedreno: Add support for Adreno 710 and 720"). Main's entry lists
++# every register in raw_magic_regs; 25.0.7 writes its named magic_regs after the raw ones, so
++# the values main captured for those (SP_CHICKEN_BITS, PC_MODE_CNTL, RB_CCU_DBG_ECO_CNTL =
++# RB_UNKNOWN_8E06) go into a710_magic_regs, and main's newer register names become 25.0.7's
++# (SP_CHICKEN_BITS_1-3 = SP_UNKNOWN_AE08-AE0A, SP_HLSQ_DBG_ECO_CNTL = SP_UNKNOWN_AE6C,
++# VFD_DBG_ECO_CNTL = VFD_UNKNOWN_A600, SP_ISDB_CNTL = SP_UNKNOWN_AE06,
++# SP_HLSQ_TIMEOUT_THRESHOLD_DP = SP_UNKNOWN_AE6B, SP_HLSQ_DBG_ECO_CNTL_1 = SP_UNKNOWN_AE73,
++# SP_HLSQ_MODE_CNTL = SP_UNKNOWN_AB02, GRAS_ROTATION_CNTL = GRAS_UNKNOWN_80A7,
++# RB_LRZ_CNTL2 = RB_UNKNOWN_8899; same offsets). Main does not write UCHE_CLIENT_PF for the
++# 710: here it is kgsl's own gen7_3_0 value, so the write changes nothing.
++a710_magic_regs = dict(a730_magic_regs,
++        SP_CHICKEN_BITS = 0x00000400,
++        PC_MODE_CNTL = 0x00001f1f,
++        UCHE_CLIENT_PF = 0x00000081,
++        RB_UNKNOWN_8E06 = 0x00080000,
++    )
++
++a710_raw_magic_regs = [
++        [A6XXRegs.REG_A6XX_UCHE_CACHE_WAYS, 0x00040004],
++        [A6XXRegs.REG_A6XX_TPL1_DBG_ECO_CNTL1, 0x00000700],
++
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE08, 0x00400400],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE09, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE0A, 0x00000000],
++        [A6XXRegs.REG_A7XX_UCHE_UNKNOWN_0E10, 0x00000000],
++        [A6XXRegs.REG_A7XX_UCHE_UNKNOWN_0E11, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE6C, 0x00000000],
++        [A6XXRegs.REG_A6XX_PC_DBG_ECO_CNTL, 0x20100000],
++        [A6XXRegs.REG_A7XX_PC_UNKNOWN_9E24, 0x01fc7f00],
++        [A6XXRegs.REG_A7XX_VFD_UNKNOWN_A600, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE06, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE6A, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE6B, 0x00000080],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AE73, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AB02, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AB01, 0x00000001],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_AB22, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_B310, 0x00000000],
++
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_0CE2,   0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_0CE2+1, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_0CE4,   0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_0CE4+1, 0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_0CE6,   0x00000000],
++        [A6XXRegs.REG_A7XX_SP_UNKNOWN_0CE6+1, 0x00000000],
++
++        [A6XXRegs.REG_A7XX_GRAS_UNKNOWN_80A7, 0x00000000],
++
++        [A6XXRegs.REG_A7XX_RB_UNKNOWN_8E79,   0x00000000],
++        [A6XXRegs.REG_A7XX_RB_UNKNOWN_8899,   0x00000000],
++    ]
++
++add_gpus([
++        GPUId(chip_id=0x07010000, name="FD710"), # KGSL, no speedbin data
++        GPUId(chip_id=0xffff07010000, name="FD710"), # Default no-speedbin fallback
++    ], A6xxGPUInfo(
++        CHIP.A7XX,
++        [a7xx_base, a7xx_gen1],
++        num_ccu = 1,
++        tile_align_w = 64,
++        tile_align_h = 32,
++        tile_max_w = 1024,
++        tile_max_h = 1024,
++        num_vsc_pipes = 32,
++        cs_shared_mem_size = 32 * 1024,
++        wave_granularity = 2,
++        fibers_per_sp = 128 * 2 * 16,
++        highest_bank_bit = 15,
++        magic_regs = a710_magic_regs,
++        raw_magic_regs = a710_raw_magic_regs,
+     ))
+ 
+ add_gpus([
