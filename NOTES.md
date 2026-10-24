@@ -184,7 +184,16 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
 into 0x60de0000. 0999 uses `ptoa(pp)` and makes write-combined buffers the default again (log entry
 "0999"). **Boot #58 (CI 7ffbfac6, tag xnu-boot-58) is the current good state: write-combined buffers,
 no panic, eagl-check 100 frames in 24.9 ms (66 cached), the per-submission cache push down from
-about 0.4-0.9 ms to 4-250 us** (log entry). shim/out/shim-boot-58c.img is the same with gpu_cached=1.
+about 0.4-0.9 ms to 4-250 us; the user finds it smoother, and better than an iPhone X on the same
+iOS** (log entry). shim/out/shim-boot-58c.img is the same with gpu_cached=1.
+**Still open, in order:**
+1. the hours-long GPU hold (the manual watch below);
+2. `trapLock` waiting for and invalidating GPU-drawn surfaces (§3.2; kshot, snapshots);
+3. the parked Safari keyboard blur (sb3);
+4. phase D (scanout without the CPU copy);
+5. the UCHE GMEM range question (framebuffer fetch);
+6. the agent's in-memory `/put` (ask first);
+7. the tag-build cache scope in the CI workflow.
 
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
@@ -1884,7 +1893,9 @@ temp/ios-m8/usblog/live-boot58-20261024-2110.txt.
 
   What is still pushed is IOSurfaces (screens, textures), which stay cached (G7).
 - No CONTEXT 0 FAULT, no GMU ERROR, no panic so far.
-- Not seen: the user's look at the UI on #58.
+- **The user (21:20): "feels smoother"; compared with an iPhone X running the same iOS, "this one
+  is much better".** The keyboard artifacts in Settings and Safari changed slightly (sb3 stays
+  parked).
   - **Left on the phone before the park:** /topaz/sb3 present; the inject with the second source installed
     (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
     for the old behaviour (Settings blocky, Safari black).
