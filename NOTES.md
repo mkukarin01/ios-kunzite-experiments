@@ -44,8 +44,10 @@ tables on demand, user-range addresses, real map/unmap, step 23) is written**, n
 booted: push, CI, then boot #49 with `kgpu=23 kgpu_keep=1 kgpu_keep_s=120` (entry after #48).
 **K2 done: boot #49 passes** (12 rounds, remap, guard, 34 MB with grown tables, read-only entry,
 undo frees the grown tables after the streams). **K3 = 0993 (submission: kgsl's gen7 wrapping,
-the fence through an uncached word, ring wrap, step 24) is written**, not built or booted: push,
-CI, then boot #50 with `kgpu=24 kgpu_keep=1 kgpu_keep_s=120` (entry after #49).
+the fence through an uncached word, ring wrap, step 24) is done: boot #50** (one IB, two IBs, 400
+submissions around the ring, all fences in order, no fault; entry after #49). **Next: K4**
+(parameters, `RedwoodGPUStart()`, a userland client). Also split the keep report's first line
+(256-byte console limit).
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -1054,6 +1056,34 @@ ios/gpu-glue-plan.md 3.2, 4. `redwood_gpu_submit/_done/_last/_report` are real.
 0 samples wrong, the 400-line with 0 out of order and at least 1 wrap, done(last) yes and
 done(last+1) no, the report, "THE GPU RUNS SUBMISSIONS". Then kept 120 s (fence in the reports)
 and the undo as #49 with "undo fence uncached alias".
+
+**BOOT #50 (2026-10-24 12:49, shim/out/shim-boot-50.img: standard cmdline + `sweetusb=2 kgpu=24
+kgpu_keep=1 kgpu_keep_s=120`; kernel = CI after 1e78bde (the pushed head), sha256 d6e0fa1e...):
+K3 PASSES - THE GPU RUNS SUBMISSIONS.** Log: temp/ios-m8/usblog/live-boot50-20261024-1249.txt.
+- Step 23 as #49, now with **every marker matching** (0x6b672305 in round 5, 0x6b67230b in round
+  11): #49's stale reads were the CPU cache.
+- "24 submission ready: fence word at GPU 0xe0008200 (uncached alias), ring wptr 1037 of 8192".
+- **One IB** (166 words at GPU 0x4000110000), three bands: fence 1 done after 80 us, 0 of 512
+  samples wrong. The fence alone is enough: no wait-for-idle or marker in the IB.
+- **Two IBs in one submission:** fence 2 after 80 us, 0 of 512 wrong.
+- **400 submissions:** fences 3..402, 0 out of order; the last done 540 us after the last submit;
+  the ring wrapped once, 0 waits for room; wptr 4524; done(402) yes, done(403) no; row 0 right.
+- Report: fence 402 done 402; rptr 4524 = wptr; rbbm_status 0x1; CP hw_fault, interrupt and
+  protect 0; sqe_stat 0x70970001 (the last THREAD_CONTROL header); ib1 0x40_00113000 (the
+  one-row IB) rem 0. CB0 FSR 0x400 (no fault bits; FAR/FSYNR0 hold leftovers).
+- "24 THE GPU RUNS SUBMISSIONS ... the ring wrapped 1 times"; "24 of 24 steps done; 54 writes to
+  undo"; kept 120 s, reports with "fence 402 of 402".
+- Undo as #49 plus "undo fence uncached alias: unmapped 0x4000 bytes" first; slumber acked; grown
+  tables freed; "after undo: cx gdsc 0x22f001 hw_ctrl 0x5ff4 gx gdsc 0x222801"; "run over".
+- No CONTEXT 0 FAULT, no panic; backboardd (56), SpringBoard (26) and the agent as before.
+- **Log limit found:** the first keep-report line grew past **256 bytes** with K3's fence fields
+  and the console cut it there, losing the end and the newline (the next line ran on). Keep
+  printf lines under 256 bytes; split that one in the next patch.
+
+**The hardware interface (K0-K3) is done:** the GPU is kept, maps the own buffers and runs IBs
+with fences, all through `redwood_gpu_*`. Next is glue plan K4: `redwood_gpu_parameter` with the
+3.3 values, `RedwoodGPUStart()` publishing RedwoodGPU, and a small userland client over the
+agent.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
