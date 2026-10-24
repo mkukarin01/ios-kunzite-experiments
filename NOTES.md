@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: #58's 6-hour run and crash survey, 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #59, Photos' hang traced to fairplayd, 2026-10-25) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -275,6 +275,45 @@ UI, with no CONTEXT 0 FAULT, GMU ERROR or panic.**
     SiriSearchFeedback (26): not crashes.
   - assetsd (25), PosterBoard (7): as above.
 
+**BOOT #59 (2026-10-25 03:14:13, shim/out/shim-boot-59.img: CI kernel sha256 dd398efc... with 1000,
+tag xnu-boot-59; cmdline #54's).** Log: temp/ios-m8/usblog/live-boot59-20261025-0314.txt.
+- 1000 is in: `sweet_amfi_vnode_check_signature` loads #0x4000. kcsops: SpringBoard and tccd
+  **0x26004001** (VALID ENTITLEMENTS_VALIDATED PLATFORM_BINARY SIGNED).
+- The UI is on the GPU at 03:14:51.
+- The user opened Photos (03:16:34 and 03:20:04) and Wallpaper. **assetsd was never started** (no
+  exec of it in the log; kcsops -w 600 never saw it; not in /ps). kshot: Photos is a blank white
+  screen.
+- PosterBoard aborted again (03:16:53), the same nil `_imageForView:` image.
+- **Photos' hang, from its new watchdog report** (MobileSlideShow-...-160642, bug_type 509, "failed
+  to terminate gracefully after 5.0s"; its main thread symbolized in the 20H392 cache):
+  `PLThumbnailManagerCore` -> `+[PLImageFormat _syncFormats]` -> **`MCCopyCheckpointValue`**
+  (libMobileCheckpoint.dylib) -> `MCCopyCheckpoint` -> `getResponseForCommand` ->
+  `MOXPCTransportReceiveMessage` (MobileSystemServices), waiting.
+  - **#53's Photos report has the same frames: Photos was always stuck here**, before assetsd and
+    TCC matter.
+- **checkpointd** (`com.apple.mobilecheckpoint.checkpointd`, /usr/libexec/checkpointd, running as
+  root, pid 259) took the request.
+  - Its handler thread waits in `mach_msg` in a MIG client stub of its own (0x1000036d8,
+    msgh_id **0x1513**), called through obfuscated, control-flow-flattened code: FairPlay style.
+  - Its cache /var/mobile/Library/Caches/Checkpoint.plist does not exist; Checkpoint.xml is in
+    /System/Library/CoreServices.
+- **fairplayd.H2 is exec'd again and again** (12 times by 03:21, no crash report: it exits). Its
+  job (com.apple.fairplayd.H2) has MachServices com.apple.fairplayd, com.apple.fairplayd.versioned
+  and com.apple.unfreed.
+  - HackiOS's rc.jobs.fairplay: fairplayd wants the IOKit user client
+    com_apple_driver_FairPlayIOKitUserClient, which these kernels do not have.
+  - [guess] checkpointd's request waits in fairplayd's queue forever: launchd relaunches fairplayd
+    for it, and fairplayd exits each time without answering.
+- **So:**
+  - Photos (and probably App Store, Podcasts and Weather, as HackiOS found) hangs on FairPlay, not
+    on the GPU or TCC;
+  - 1000's effect on TCC is untested (assetsd needs a path that does not wait on checkpointd);
+  - assetsd's own TCC throw came from other callers on earlier boots.
+- Experiments, cheapest first:
+  - (a) hide fairplayd's MachServices / job in the launchd.plist cache, so checkpointd's lookup
+    fails fast; takes effect at the next boot;
+  - (b) a FairPlayIOKit stub in our kernel so fairplayd stays up (big; it would still have no keys).
+
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
 - **If it panics again: the same image with `gpu_cached=1` added** (cached buffers, like #57), and
@@ -287,8 +326,12 @@ UI, with no CONTEXT 0 FAULT, GMU ERROR or panic.**
     #57's 12-22 MB per line to only the surfaces' pushes;
   - the user's look.
 
-**Next - boot #59: CI kernel with fork 1000 (CS_ENTITLEMENTS_VALIDATED, for TCC / Photos); cmdline #54's.**
-Test as in the "Followed up" entry (kcsops, ktcc, Photos, wallpapers, screenshots).
+**Boot #59 (fork 1000) is up; 1000 works as written (status 0x26004001 everywhere), but Photos' blank
+screen turned out to be a different chain: Photos -> checkpointd -> fairplayd, which never answers**
+(log entry "BOOT #59"). assetsd was not even started, so 1000's effect on TCC is still untested.
+**Next: the user's call:** hide fairplayd's job (launchd.plist cache, a backup kept; it takes effect
+at the next boot) so checkpointd fails fast instead of hanging, and then see what Photos and assetsd
+do.
 
 **Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
 ```
