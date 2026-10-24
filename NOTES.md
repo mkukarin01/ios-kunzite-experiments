@@ -1179,6 +1179,30 @@ cache clean, write-combined buffers, wrapDelta, read-only client memory), or str
   - The renderer must be FD710.
   - `soft` sets OSMESA_SOFTWARE=1 (softpipe, to compare); `debug=` sets FD_MESA_DEBUG. The agent
     passes no environment, so the program sets these itself.
+- **U1 BUILT (2026-10-24 13:36):** Homebrew bison 3.8.2 installed by the user (keg-only, at
+  /opt/homebrew/opt/bison/bin, which the script puts first). Build folder re-made; meson now finds
+  bison 3.8.2; ninja 1134/1134 (1-2 min). `temp/mesa-build/out/`:
+  - `libOSMesa.8.dylib`: 15 MB, arm64, platform iOS, minos 16.0, install name
+    /topaz/lib/libOSMesa.8.dylib, signed ad hoc;
+  - 13 OSMesa exports (CreateContextExt/Attribs, MakeCurrent, GetProcAddress, DestroyContext
+    among them), 1296 gl* (exported-gl.txt), and gl.xml;
+  - it holds the FD710 entry and redwood-drm ("RedwoodGPU", "Adreno on Darwin");
+  - it links libz.1, libSystem.B, IOKit (Versions/A) and libc++.1, all four in 20H392's cache.
+    Its 22 libc++ imports are long-standing ABI (__cxa_*, std::mutex, logic_error,
+    __next_prime, type-info vtables). Checking them against the cache's export lists failed
+    (my ipsw query), so dlopen on the phone is the real check.
+
+**U3 test (next boot, #52):** standard cmdline + `sweetusb=2 kgpu=24 kgpu_keep=1 kgpu_keep_s=900`.
+Once "RedwoodGPU published":
+- `/put` temp/mesa-build/out/libOSMesa.8.dylib -> /tmp/libOSMesa.8.dylib (0644) and
+  userland/gpu/out/gl-triangle -> /tmp/gl-triangle (0755);
+- `/run?a=/tmp/gl-triangle&t=60` for the GPU, then `/run?a=/tmp/gl-triangle&a=soft&t=60` for
+  softpipe to compare;
+- `/get` /tmp/gl-triangle-gl.ppm and -es.ppm to look at.
+
+Expect "THE ADRENO 710 DREW BOTH PICTURES, THROUGH MESA": renderer FD710, both pictures right,
+glReadPixels matching, 100 frames timed. In the kernel log: "RedwoodGPU: client gl-triangle",
+the fence moving past 402 in the keep reports, no CONTEXT 0 FAULT.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
