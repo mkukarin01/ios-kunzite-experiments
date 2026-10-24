@@ -36,9 +36,9 @@ It was checked by generating the table and applying it with the other two Mesa p
   (freedreno-darwin.patch). K1 reads them again.
 
 **Next:** glue plan K0 = **0990 is done** (boots #46 without GPU boot-args and #47 with `kgpu=22`
-both pass on the CI kernel after 5b87e5c, sha256 99274a14...; entries below boot #45). Next is
-**K1: keep mode** (glue plan section 4): steps 1-21 without the undo, the GPU held up,
-`redwood_gpu_ready()` true, and an exit path for reboots.
+both pass on the CI kernel after 5b87e5c, sha256 99274a14...; entries below boot #45). **K1 =
+0991 (keep mode) is written**, not built or booted: push, CI, then boot #48 with
+`kgpu=21 kgpu_keep=1 kgpu_keep_s=1800` (entry after #47).
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -873,6 +873,40 @@ freed, slumber (GX off, RSC sleep done), "after undo: cx gdsc 0x22f001 hw_ctrl 0
 0x222801" (as #45). **Next: glue plan K1, keep mode** (kgpu=21 kgpu_keep=1: steps 1-21, no
 undo, GPU held up, redwood_gpu_ready()). It also programs hbb 14 there and reads the UCHE GMEM
 range again once GX is held.
+
+**GLUE K1 = 0991 (2026-10-24, written, NOT built/booted): keep mode.** Main repo
+ios/gpu-glue-plan.md 4. `kgpu_keep=1` (with `kgpu` >= 21; 22 is capped to 21) stops after
+step 21 without the undo: OOB_GPU held (GX on), HFI up, the CP running out of secure mode, idle;
+`redwood_gpu_ready()` true while kept (`redwood_gpu_on()` from the boot-args). Two report lines
+at once and every `kgpu_keep_report` s (default 60, 0 = never):
+- GX GDSC, RPMh power state, gfx power/clock status, CX busy, RBBM_STATUS, CP RPTR/WPTR,
+  SQE_CNTL, HW_FAULT, CB0 FSR, GMU2HOST_INTR_INFO, HFI message and debug r/w;
+- UCHE_GMEM_RANGE_MIN/MAX, RBBM_NC_MODE_CNTL (0x534, macrotile) and the five hbb-14 registers.
+
+Then the GMU's queues are drained and printed. The GPU goes by the run's own undo (as #47's)
+after `kgpu_keep_s` s (default 0 = never), or at shutdown:
+- `reboot_kernel()` (bsd/kern/kern_shutdown.c, new hunk, SWEET only, not for RB_PANIC) calls
+  `kunzite_adreno_shutdown(howto)` before IOSystemShutdownNotification(ProcessExit);
+- that sets exit_asked, wakes the probe's thread (`thread_wakeup(&kg_sleep_chan)`), and waits
+  up to 5 s for "run over". The thread undoes everything itself, skipping the teardown pause;
+- a shutdown during a run stops it between steps.
+
+Note: nothing on this port sets `PE_halt_restart`, so a software reboot ends in the hardware
+reset, which takes the GPU down anyway; the exit is for an orderly end. A panic does not run
+it, and kept GPU memory is never freed while kept. Verified:
+- the replay: 237 applied, the four known skips, kunzite_adreno.c and kern_shutdown.c
+  byte-identical, nothing else changed; series 233 patches;
+- kcc.sh 0 diagnostics (strict: the same 4 old ones);
+- CI's compile lines (scratch cc.sh) build both files;
+- all 94 undefined symbols of the two objects resolve in the #46/#47 kernel's symbol table plus
+  the new objects; kern_shutdown.o imports `_kunzite_adreno_shutdown`, kunzite_adreno.o
+  exports it.
+
+**Test (boot #48):** standard cmdline + `sweetusb=2 kgpu=21 kgpu_keep=1 kgpu_keep_s=1800`.
+Expect "21 of 21 steps done", "THE GPU IS KEPT", a report every minute for 30 min with the
+agent and the UI as usual, no GMU ERROR lines, "the kept GPU goes after 1800 s: kgpu_keep_s ran
+out", then the undo as #47 and "run over". Look for UCHE_GMEM_RANGE in the reports
+(open question 1) and RBBM_NC_MODE_CNTL (macrotile). A shorter first try: `kgpu_keep_s=120`.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

@@ -1,0 +1,339 @@
+kunzite: Adreno 710, glue plan K1 (main repo ios/gpu-glue-plan.md 4): keep mode. With kgpu_keep=1
+(and kgpu >= 21; kgpu=22 runs steps 1..21) the run is not undone after step 21: OOB_GPU stays set
+(GX on), HFI stays up, the CP runs out of secure mode, idle, and redwood_gpu_ready() is true
+(redwood_gpu_on() too, from the boot-args). At once and every kgpu_keep_report seconds (default 60,
+0 = never), two lines: GX GDSC, the GMU's RPMh power state, GFX power/clock status and CX busy,
+RBBM_STATUS, CP RPTR/WPTR, SQE_CNTL, HW_FAULT, CB0 FSR, GMU2HOST_INTR_INFO and the HFI message and
+debug queue indices; then UCHE_GMEM_RANGE_MIN/MAX (0 right after gen7_start on #41/#45/#47: do they
+hold once GX is kept?), RBBM_NC_MODE_CNTL (the macrotile mode, glue plan 3.3) and the five hbb-14
+registers (0990). Whatever the GMU queued is drained and printed. The GPU goes by the run's own undo
+(CP halted first, slumber, GMU into reset, CX off) after kgpu_keep_s seconds (default 0 = never), or
+at shutdown: reboot_kernel (bsd/kern/kern_shutdown.c) calls kunzite_adreno_shutdown(howto) before
+processes are told to exit, unless it is a panic; that wakes the probe's thread, which undoes
+everything itself, and waits at most 5 s. A shutdown during a run also stops it between steps and
+undoes it. Test: kgpu=21 kgpu_keep=1 kgpu_keep_s=1800: 30 min kept with a report a minute, agent and
+UI as usual, then the undo as on #47.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 43241f4..0f379be 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -18,6 +18,14 @@
+  * log and the persistent log. A step that does not find what the next one
+  * needs ends the run.
+  *
++ * Keep mode (glue plan K1, main repo ios/gpu-glue-plan.md 4): with kgpu_keep=1
++ * the run stops after step 21 and is not undone: GX stays on (OOB_GPU held),
++ * HFI stays up, the CP runs out of secure mode, and redwood_gpu_ready() is
++ * true. Every kgpu_keep_report seconds (default 60, 0 = never) two lines of
++ * the GPU's state, and whatever the GMU has queued. It goes by the same undo
++ * as at the end of a run: after kgpu_keep_s seconds (default 0 = never), or
++ * when the system shuts down (reboot_kernel calls kunzite_adreno_shutdown).
++ *
+  *  1  GCC (gcc-parrot.c): GPU_CFG_AHB 0x81004 (Linux keeps it on; GPU_CC is
+  *     only readable with it), MEMNOC_GFX 0x81010, SNOC_DVM_GFX 0x81018, the
+  *     GPLL0 votes 0x62000 bits 15/16. RPMh: the ARC resources the GMU votes
+@@ -134,6 +142,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/reboot.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -156,6 +165,7 @@ extern int topaz_fw_read(const char *path, void **data, size_t *size);
+ extern void topaz_fw_free(void *data, size_t size);
+ extern int topaz_root_mounted(void);
+ void kunzite_adreno_init(void);
++void kunzite_adreno_shutdown(int howto);
+ 
+ #define KG_GCC_PA        0x00100000u
+ #define KG_GCC_SIZE      0x00090000u     /* up to the GPU branches at 0x81xxx */
+@@ -324,6 +334,12 @@ static struct {
+ 	int gpu_cb;                     /* the HLOS context stream 0 (GPU) is matched to, or -1 */
+ 	unsigned last, pause_ms, delay_s, hold_s, step, speed_bin;
+ 	bool started, ahb_on;
++	bool keep;                      /* kgpu_keep: no undo after step 21 (K1) */
++	unsigned keep_s, report_s;      /* kgpu_keep_s, kgpu_keep_report */
++	volatile bool running;          /* the thread is on, until "run over" */
++	volatile bool kept;             /* the GPU is kept: redwood_gpu_ready() */
++	volatile bool exit_asked;       /* the system shuts down: the GPU is to go */
++	const char *exit_why;
+ 	struct {
+ 		enum kg_undo_kind kind;
+ 		vm_offset_t base;
+@@ -3439,7 +3455,9 @@ kg_teardown(void)
+ 		    kg_rd(kg.gpucc, 0x9144), kg_rd(kg.gpucc, 0x913c), kg_rd(kg.gpucc, 0x9148), kg_rd(kg.gpucc, 0x7000));
+ 	}
+ 	printf("SWEET KGPU: undoing %u writes, in reverse\n", kg.nundo);
+-	kg_wait(kg.pause_ms);
++	if (!kg.exit_asked) {
++		kg_wait(kg.pause_ms);
++	}
+ 	while (kg.nundo > 0) {
+ 		kg_undo_pop();
+ 	}
+@@ -3449,6 +3467,85 @@ kg_teardown(void)
+ 	}
+ }
+ 
++/* ---- keep mode (K1): the GPU held up after step 21 ---- */
++
++static unsigned
++kg_seconds_since(uint64_t began)
++{
++	uint64_t nanos;
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &nanos);
++	return (unsigned)(nanos / NSEC_PER_SEC);
++}
++
++/* the kept GPU's state; then what the GMU has put in its message and debug queues */
++static void
++kg_keep_report(unsigned s)
++{
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
++
++	printf("SWEET KGPU: kept %u s: gx gdsc %#x rpmh_power_state %#x gfx_pwr_clk_status %#x cx_busy %#x; "
++	    "rbbm_status %#x cp rptr/wptr %u/%u sqe_cntl %#x hw_fault %#x; cb0 fsr %#x; gmu2host_intr_info %#x, "
++	    "hfi message r/w %u/%u debug r/w %u/%u\n", s, kg_rd(kg.gpucc, KG_GX_GDSCR), kg_gmu(GEN7_GMU_RPMH_POWER_STATE),
++	    kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS), kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS), kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr, kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL),
++	    kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT), kg_rd(kg.smmu, cb + SMMU_CB_FSR), kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO),
++	    kg_hfi->q[1].read_index, kg_hfi->q[1].write_index, kg_hfi->q[2].read_index, kg_hfi->q[2].write_index);
++	/* glue plan 3.3: the GMEM range gen7_start wrote (read 0 right after it on #41/#45/#47), hbb 14, macrotile */
++	printf("SWEET KGPU: kept %u s: uche_gmem_range min %#x:%08x max %#x:%08x; rbbm_nc_mode_cntl %#x; "
++	    "rb_nc_mode_cntl %#x tpl1 %#x sp %#x gras %#x uche_mode_cntl %#x\n", s,
++	    kg_rd(kg.gpu, 4u * 0x0e0c), kg_rd(kg.gpu, 4u * 0x0e0b), kg_rd(kg.gpu, 4u * 0x0e0e), kg_rd(kg.gpu, 4u * 0x0e0d),
++	    kg_rd(kg.gpu, 4u * 0x0534), kg_rd(kg.gpu, 4u * 0x8e08), kg_rd(kg.gpu, 4u * 0xb604),
++	    kg_rd(kg.gpu, 4u * 0xae02), kg_rd(kg.gpu, 4u * 0x8602), kg_rd(kg.gpu, 4u * 0x0e01));
++	kg_hfi_drain(1);
++	kg_hfi_drain(2);
++}
++
++/*
++ * Steps 1-21 done and nothing undone: hold the GPU until kgpu_keep_s runs out or the
++ * system shuts down, with a report every kgpu_keep_report seconds. Returns when it is
++ * to go; the caller undoes the run.
++ */
++static void
++kg_keep(void)
++{
++	uint64_t began = mach_absolute_time();
++	unsigned s = 0, said = 0;
++
++	kg_keep_report(0);
++	kg.kept = true;
++	if (kg.keep_s != 0) {
++		printf("SWEET KGPU: THE GPU IS KEPT: GX on (OOB_GPU held), HFI up, the CP running out of secure mode, "
++		    "idle; redwood_gpu_ready() true; for %u s (kgpu_keep_s), then undone\n", kg.keep_s);
++	} else {
++		printf("SWEET KGPU: THE GPU IS KEPT: GX on (OOB_GPU held), HFI up, the CP running out of secure mode, "
++		    "idle; redwood_gpu_ready() true; until the system shuts down\n");
++	}
++	for (;;) {
++		unsigned next = kg.report_s != 0 ? said + kg.report_s : ~0u;
++
++		if (kg.keep_s != 0 && kg.keep_s < next) {
++			next = kg.keep_s;
++		}
++		if (next != ~0u && next > s) {
++			kg_wait((next - s) * 1000u);
++		} else if (next == ~0u) {
++			kg_wait(3600u * 1000u);
++		}
++		s = kg_seconds_since(began);
++		if (kg.exit_asked || (kg.keep_s != 0 && s >= kg.keep_s)) {
++			break;
++		}
++		if (kg.report_s != 0 && s >= said + kg.report_s) {
++			kg_keep_report(s);
++			said = s;
++		}
++	}
++	kg.kept = false;
++	kg.hold_s = s;
++	printf("SWEET KGPU: the kept GPU goes after %u s: %s\n", s, kg.exit_asked ? kg.exit_why : "kgpu_keep_s ran out");
++	kg_keep_report(s);
++}
++
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+@@ -3460,7 +3557,7 @@ kg_thread(void *arg, wait_result_t result)
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+ 	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture", kg.pause_ms);
+-	while (done < kg.last) {
++	while (done < kg.last && !kg.exit_asked) {
+ 		kg.step = done + 1;
+ 		if (!steps[done]()) {
+ 			break;
+@@ -3468,11 +3565,14 @@ kg_thread(void *arg, wait_result_t result)
+ 		++done;
+ 	}
+ 	printf("SWEET KGPU: %u of %u steps done; %u writes to undo\n", done, kg.last, kg.nundo);
+-	if (kg.nundo > 0) {
++	if (kg.keep && done == kg.last && !kg.exit_asked) {
++		kg_keep();
++	} else if (kg.nundo > 0 && !kg.exit_asked) {
+ 		kg_wait(kg.hold_s * 1000u);
+ 	}
+ 	kg_teardown();
+ 	printf("SWEET KGPU: run over\n");
++	kg.running = false;
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -3480,7 +3580,7 @@ kg_thread(void *arg, wait_result_t result)
+ void
+ kunzite_adreno_init(void)
+ {
+-	int last = 0, delay_s = 60, pause_ms = 1500, hold_s = 5;
++	int last = 0, delay_s = 60, pause_ms = 1500, hold_s = 5, keep = 0, keep_s = 0, report_s = 60;
+ 	thread_t thread;
+ 
+ 	if (kg.started || !PE_parse_boot_argn("kgpu", &last, sizeof(last)) || last <= 0) {
+@@ -3490,6 +3590,9 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
++	(void)PE_parse_boot_argn("kgpu_keep", &keep, sizeof(keep));
++	(void)PE_parse_boot_argn("kgpu_keep_s", &keep_s, sizeof(keep_s));
++	(void)PE_parse_boot_argn("kgpu_keep_report", &report_s, sizeof(report_s));
+ 	kg.last = last > 22 ? 22u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+@@ -3497,15 +3600,54 @@ kunzite_adreno_init(void)
+ 	if (last > 22) {
+ 		printf("SWEET KGPU: kgpu=%d, but only steps 1..22 exist; running those\n", last);
+ 	}
++	if (keep != 0 && kg.last < 21) {
++		printf("SWEET KGPU: kgpu_keep wants the CP running (step 21), kgpu=%d: not kept, undone at the end\n", last);
++	} else if (keep != 0) {
++		if (kg.last > 21) {
++			printf("SWEET KGPU: kgpu_keep: steps 1..21 (step 22's picture is for runs that end)\n");
++		}
++		kg.last = 21;
++		kg.keep = true;
++		kg.keep_s = keep_s > 0 ? (unsigned)keep_s : 0u;
++		kg.report_s = report_s > 0 ? (unsigned)report_s : 0u;
++		printf("SWEET KGPU: kgpu_keep: the GPU is kept after step 21, %s; a report every %u s (0: none)\n",
++		    kg.keep_s != 0 ? "for kgpu_keep_s seconds" : "until the system shuts down", kg.report_s);
++	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
++	kg.running = true;
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
++		kg.running = false;
+ 		printf("SWEET KGPU: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
+ 
++/*
++ * From reboot_kernel (bsd/kern/kern_shutdown.c), before processes are told to exit and
++ * not for a panic (the reset after one takes the GPU down with the SoC). A kept GPU, or
++ * a run still going, is taken down by its own thread, by the run's undo: the CP halted
++ * first, then the GMU's slumber (GX off), the GMU into reset, CX off. At most 5 s here.
++ */
++void
++kunzite_adreno_shutdown(int howto)
++{
++	unsigned ms;
++
++	if (!kg.running) {
++		return;
++	}
++	kg.exit_why = (howto & RB_HALT) ? "the system halts" : "the system restarts";
++	kg.exit_asked = true;
++	thread_wakeup(&kg_sleep_chan);
++	for (ms = 0; kg.running && ms < 5000; ms += 10) {
++		delay(10000);
++	}
++	printf("SWEET KGPU: shutdown: %s after %u ms\n", kg.running ? "the GPU still going down, carrying on" : "the GPU is down",
++	    ms);
++}
++
+ /*
+  * ---- the hardware interface, in place of TopazAdreno.cpp ----
+  *
+@@ -3514,9 +3656,9 @@ kunzite_adreno_init(void)
+  * A610 driver, TopazAdreno.cpp and its firmware TopazAdrenoFw.cpp, is not built
+  * for kunzite (iokit/conf/files.arm64); this is its place (main repo
+  * ios/gpu-glue-plan.md 3.2, 3.7). Here the SMMU translates: no identity mode, and no
+- * GPU pool below 4 GiB (0x90000000 is the modem's carveout). Until keep mode
+- * (glue plan K1) holds the GPU up, it is never ready: RedwoodGPU's user client
+- * does not start and RedwoodGPUStart() is not called, so nothing below that
++ * GPU pool below 4 GiB (0x90000000 is the modem's carveout). The GPU is ready
++ * while keep mode (kgpu_keep, K1) holds it up. RedwoodGPUStart() is not called
++ * yet (K4), so RedwoodGPU's user client never starts and nothing below that
+  * needs a running GPU is reached yet.
+  */
+ bool redwood_gpu_on(void);
+@@ -3545,11 +3687,22 @@ void topaz_adreno_init(void);
+ /* RedwoodGPU.cpp's switch for a "tl: Q" line per submission (through redwood_tl); never set, as in topaz */
+ uint32_t gpu_log;
+ 
+-/* the GPU path runs this boot: SweetSurface's surfaces then get the rows the GPU's tiles run into (K1, K5) */
++/*
++ * the GPU path runs this boot (kgpu_keep with kgpu >= 21): SweetSurface's surfaces then get
++ * the rows the GPU's tiles run into (K5)
++ */
+ bool
+ redwood_gpu_on(void)
+ {
+-	return false;
++	static int on = -1;
++
++	if (on < 0) {
++		int keep = 0, last = 0;
++
++		on = PE_parse_boot_argn("kgpu_keep", &keep, sizeof(keep)) && keep != 0 &&
++		    PE_parse_boot_argn("kgpu", &last, sizeof(last)) && last >= 21;
++	}
++	return on > 0;
+ }
+ 
+ /* GPU address = physical address: never here, the SMMU translates */
+@@ -3588,10 +3741,11 @@ topaz_gpu_pool_free(__unused uint64_t pa, __unused uint64_t size)
+ {
+ }
+ 
++/* steps 1-21 done and the GPU kept (K1) */
+ bool
+ redwood_gpu_ready(void)
+ {
+-	return false;
++	return kg.kept;
+ }
+ 
+ /* the answers of glue plan 3.3 come with K4 */
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index 20d9d47..33eacbe 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -91,6 +91,9 @@ extern void halt_log_enter(const char * what, const void * pc, uint64_t time);
+ #if DEVELOPMENT || DEBUG
+ extern boolean_t kdp_has_polled_corefile(void);
+ #endif /* DEVELOPMENT || DEBUG */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void kunzite_adreno_shutdown(int howto);         /* bsd/dev/kunzite_adreno.c */
++#endif
+ 
+ struct sd_filterargs {
+ 	int delayterm;
+@@ -208,6 +211,13 @@ reboot_kernel(int howto, char *message)
+ 
+ 	lck_mtx_unlock(&vm_swap_data_lock);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* kunzite: a GPU kept by kgpu_keep goes down before anything else does */
++	if ((howto & RB_PANIC) == 0) {
++		kunzite_adreno_shutdown(howto);
++	}
++#endif
++
+ 	/*
+ 	 * Notify the power management root domain that the system will shut down.
+ 	 */
