@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: Photos scouting -> 1000, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: #58's 6-hour run and crash survey, 2026-10-25) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -247,6 +247,33 @@ repo's temp/ios-m8/crashes/.
     - `ktcc` (signed) granted and `ktcc-plain` denied;
     - Photos opens, the wallpaper list fills, screenshots are saved (DCIM);
     - no assetsd CRASH in the log.
+  - **Caveat found on 2026-10-25: ktcc's "denied" was no answer from tccd.** ktcc left an
+    ExcUserFault_ktcc report (bug_type 309): EXC_GUARD, LIBXPC namespace reason 9, in
+    `TCCAccessPreflight` -> `TCCAccessRequest` -> `xpc_connection_resume` on its connection to
+    tccd. A process the agent starts cannot reach tccd, so the TCC framework failed, and tccd
+    never decided. 1000 rests only on CS_ENTITLEMENTS_VALIDATED being absent, which real AMFI sets.
+    The verdict on #59 is assetsd's (no CRASH, Photos opens), not ktcc's.
+
+**#58's long run (2026-10-24 21:10 -> 2026-10-25 03:11): the GPU was held 21540 s (6 h) under the
+UI, with no CONTEXT 0 FAULT, GMU ERROR or panic.**
+- The user logged 1h42m (temp/ios-m8/usblog/live-boot58-20261024-2111.txt): "no crashes, several
+  places with artifacts, overall smooth".
+- The fence keeps up (234214 of 234214 at 5460 s); GPU free ranges steady at 93-94.
+- **Crash survey** (CrashReporter, 170 .ips, all boots; copies in temp/ios-m8/crashes/boot58/):
+  - **webbookmarksd (14) and syncdefaultsd (14):** SIGABRT in `+[NSURL fileURLWithPath:isDirectory:]`
+    from their own code, so a nil path. [guess] Their container or app-group path lookup: the
+    Sandbox stand-in in sweet_amfi.c fails container-path queries with ENOENT on purpose.
+    Systemic, worth a look.
+  - **mediaserverd (1):** abort in VideoToolbox `FigGetAlignmentForIOSurfaceOutputToDisplayService`
+    while preparing video playback. [guess] A display-service property our framebuffer stand-in
+    lacks; video playback.
+  - **Preferences (2), MobilePhone (4), MobileSlideShow (6):** bug_type 509 stackshots, i.e.
+    hangs (Date & Time; Photos waits on assetsd).
+  - **backboardd (1):** the sb3 crash of the #55 experiment (create_shader on
+    tex_fragment_shaders[40]), known.
+  - Resource reports (vmd CPU, SpringBoard and backboardd wakeups), OTAUpdate (63, logs),
+    SiriSearchFeedback (26): not crashes.
+  - assetsd (25), PosterBoard (7): as above.
 
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
