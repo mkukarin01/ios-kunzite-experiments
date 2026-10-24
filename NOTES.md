@@ -1,6 +1,110 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> HANDOFF (2026-10-24) - branch kunzite-topaz-gpu - READ FIRST <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: U3, 2026-10-24) <<<
+
+**Where things stand.** Branch `kunzite-topaz-gpu`, 236 patches, last kernel patch 0994. Glue
+milestones G1-G3 reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7
+(freedreno FD710) draws through it (boot #52). Last booted kernel: the CI build after 91ef60f
+(sha256 74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
+`ios/gpu-glue-plan.md`:
+- §3.1 is R1's gate table, i.e. what K5 edits, with line numbers in the series' files;
+- §3.5 and §3.6 hold the facts U2 and U4 need;
+- §4-§7 give the steps and their order.
+The log of K0-U3 is the handoff below this section.
+
+**Order from here:** K5-min -> U2 -> boot #53 (K5 kernel + U2 libraries + U4 into backboardd, in
+one boot) -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+After each step: rewrite this section, an entry below, the plan's progress lines, commit.
+
+**Step 1 - K5-min, patch 0995 (kernel; CI; no boot of its own).**
+- `redwood_gpu_on()` exists already (0991: kgpu_keep != 0 and kgpu >= 21, read from the
+  boot-args, so it is settled before the first surface). Nothing to add in kunzite_adreno.c.
+- SweetSurface.cpp (§3.1 rows S2-S6): replace the raw `gpu` boot-arg reads.
+  - S2 (pool) keys on `redwood_gpu_on() && redwood_gpu_identity()`, so it is off here.
+  - S5a (+64 guard rows) keys on `redwood_gpu_on()`, so it is on.
+  - S5b (12 MB reserves) and S5c (contiguous, 36-bit) key on `redwood_gpu_identity()`, so
+    they are off.
+  - S6: `sweet_res_give` only when S5b is on.
+  - TopazAdreno.cpp is not built here. If this goes upstream, it needs a `redwood_gpu_on` that
+    answers `gpu=1`, so topaz keeps its behaviour.
+- SweetFramebuffer.cpp, F6 (the copy path: `topaz_surface_drawn(s, 100)` then `memcpy` from
+  `kernelAddress()`): when `s->drawn != 0` and the wait succeeded, `sweet_dcache_flush`
+  (`dc civac`) over the rows about to be copied, before the memcpy.
+- Left out on purpose, to the deferred list: RedwoodGPU's wrapDelta, `MSM_BO_GPU_READONLY`,
+  and `gpu_cached=0` as the default (§3.2, R2).
+- How to work:
+  - get the files as the series makes them:
+    `temp/ios-m8/series-check/replay.sh xnu/patches <outtree>` (main repo temp/);
+  - write 0995 against them; replay again. Expected skips: TrustCache, iobuffermemd_monterey,
+    skywalk_sonoma, syntax_checker_sonoma;
+  - compile the two files with CI's exact lines from the last job log (xnu/out/job-logs.txt),
+    rebuilt locally against temp/ios-m8/buildtree headers;
+  - commit. The user pushes, and CI builds.
+- Done when CI links.
+
+**Step 2 - U2: `userland/gpu/mk-topaz-gl.sh` (Mac only), modelled on mk-gl-triangle.sh and
+HackiOS `userland/build.sh` :293 and :345-348** (main repo
+temp/kunzite-research/hackios-xnu-userland/userland/).
+- `mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt eagl.c > out/eagl_gen.h`:
+  - $M is the Mesa build's out/ (main repo temp/mesa-build/out/);
+  - HackiOS's slot list is valid for 20H392 as it is (R5: all 457 entries at the same offsets).
+- Build `/topaz/lib/libtopaz-gl.dylib` from eagl.c + gl_osmesa.c with `-dynamiclib -install_name
+  ... -Iout -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc`, linked
+  against libOSMesa.8.dylib (install name /topaz/lib/libOSMesa.8.dylib).
+- Build `/topaz/lib/libtopaz-inject.dylib` from topaz_inject.c with
+  `-framework CoreFoundation -framework IOKit -lobjc`.
+- Build the wrapper from bbd_wrap.c. `REAL` follows the U4 way chosen (below).
+- Sign ad hoc with `ldid -S` (dylibs without entitlements).
+- Check on the Mac:
+  - `otool -L`: only system libraries plus /topaz/lib/*;
+  - eagl_gen.h has 457 slots.
+- Optional phone check before U4: HackiOS `src/gl_test.c` (EAGL without backboardd) over the
+  agent.
+
+**Step 3 - boot #53: K5 + U4 (replacing a system file: the user's OK first).**
+- Cmdline: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
+  - No `kgpu_keep_s`: the GPU is kept until reboot, and reboot runs the undo through
+    `kunzite_adreno_shutdown`.
+  - kgpu=21 skips the 23/24 tests. `kg_keep` sets up submission itself, so RedwoodGPU is still
+    published.
+- **Timing catch.** On #52 RedwoodGPU appeared 3 min 20 s after boot (with the 23/24 tests).
+  topaz_inject waits only 5 s for it (50 x 100 ms), then leaves CoreAnimation on the CPU, logging
+  "topaz: no GPU service". So once "RedwoodGPU published" is in the log, restart backboardd over
+  the agent (launchd starts it again, through the wrapper). Alternative: make the wrapper wait
+  for the service.
+- Uploads go to /tmp, each read back:
+  - the 15 MB libOSMesa as 2 MB parts, joined with `kjoin` (recipe in mk-gl-triangle.sh; the
+    agent dies on a /put over about 5 MB);
+  - then into `/topaz/lib` (root:wheel 0755, the dylibs 0644).
+- U4 way (§3.6):
+  - preferred: the wrapper at `/topaz/bin/backboardd`, the launchd.plist cache's
+    `com.apple.backboardd` ProgramArguments[0] pointed at it, and `REAL` = /usr/libexec/backboardd.
+    The old plist is kept beside it as the rollback;
+  - fallback (topaz's): the stock binary to /usr/libexec/real/backboardd, the wrapper in its
+    place.
+- Off switch without touching files: `gl=0` in the cmdline.
+- Rollback: the original files back over the agent. The agent is its own launchd job and stays up.
+- Expect in the log:
+  - fork 0914's "topaz: backboardd starts WITH DYLD_INSERT_LIBRARIES";
+  - syslog "topaz: /topaz/lib/libtopaz-gl.dylib loaded";
+  - "RedwoodGPU: client backboardd", and submissions climbing with fences that keep up.
+- Failure signs:
+  - a backboardd crash loop: the EAGL slots or the inject addresses (§3.5);
+  - SMMU faults (CONTEXT 0 FAULT): guard rows or buffer mapping;
+  - old or garbage pixels: F6 coherency, or the deferred `gpu_cached=0`;
+  - wrong blending: framebuffer fetch, the open GMEM-range question below.
+
+**Deferred (after G4, in this order):**
+1. `gpu_cached=0` / write-combined buffers, read-only client memory and the wrapDelta (§3.2, K5's
+   R2 part).
+2. UCHE_GMEM_RANGE reads 0 even while the GPU is held (open question 1). If CoreAnimation's
+   framebuffer fetch draws wrong, it is the first suspect.
+3. Holding the GPU for hours (open question 4).
+4. Phase D: scanning out without the CPU copy (§6).
+5. The agent's /put kept in memory: stream it to disk or give it a jetsam limit. That replaces
+   the agent binary, so ask first.
+
+## Handoff log (2026-10-24, K0-U3; the continuation plan above replaces its "Next" lines)
 
 **State (observed, boot #45):** the GPU probe `kgpu=N` (bsd/dev/kunzite_adreno.c, fork patches
 0971-0989, series of 231 patches) runs all 22 steps of the port map (ios/gpu-plan.md in the main
