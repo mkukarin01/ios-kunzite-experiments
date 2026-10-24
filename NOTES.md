@@ -850,6 +850,16 @@ never set). R7's survey had listed functions only. **0990 fixed:** kunzite_adren
 
 Lesson: for a build split, check the objects' undefined symbols, not the source text.
 
+**BOOT #46 (2026-10-24 08:35, shim/out/shim-boot-46.img: standard cmdline + `sweetusb=2`, no GPU
+boot-args; kernel = CI after 5b87e5c, the pushed head, sha256 99274a14...): K0 WITHOUT GPU
+BOOT-ARGS PASSES.** Log: temp/ios-m8/usblog/live-boot46-20261024-0835.txt. Before boot: SHA256SUMS
+OK; nm has `_redwood_gpu_on`, `_redwood_gpu_ready`, `_gpu_log` and `_topaz_gpu_pool_md` beside
+`_kunzite_adreno_init`, and no `_topaz_fw_sqe_fw`; the string "TopazGPU: Adreno 610 ready" is gone
+and K0's gpu=1 line is in. Boot: the agent answered about 30 s after `fastboot boot`; /ps shows
+backboardd (501), SpringBoard (501) and kunzite-agent; AppleCLCD answers backboardd's selectors
+as before. No KGPU/TopazGPU/RedwoodGPU line, no fault, no panic, as expected without boot-args.
+Next: #47 = the same kernel with `kgpu=22` (shim/out/shim-boot-47.img, built).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
