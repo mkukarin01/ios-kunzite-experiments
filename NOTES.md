@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 0997 (K5's R2 part), 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #56's panic and 0998, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -40,8 +40,10 @@ The log of K0-U3 is the handoff below this section.
 **Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
 U4 way 1~~ (done) -> **~~G4~~ (reached)** -> ~~the user's wider look~~ (done) -> **boot #54: 0996
 + the waiting wrapper** (the UI starts on the GPU by itself; the logo gauge) -> the deferred list
-**0997 written (K5's R2 part: write-combined buffers by default, a push at creation, wrapDelta,
-read-only client memory); next boot #56 tests it** (below). The keyboard blur (`sb3`) is parked
+**Boot #56 (0997) panicked at backboardd's first GPU buffer: write-combined IOBMDs cannot be made
+from the lower DDR bank's pages** (log entry). 0998 makes buffers cached by default again; until it
+is built, `gpu_cached=1` in the cmdline does the same (shim/out/shim-boot-57.img has it). 0997's
+other changes (push at creation, wrapDelta, read-only client memory) stay. The keyboard blur (`sb3`) is parked
 with /topaz/sb3 on and the plain four-tap source: Settings' keyboard right, Safari's black (boot
 #55 entry).
 **Boot #54 done (entry in the log): the GPU was kept about 33 s after `fastboot boot` (#53: 3 min
@@ -176,8 +178,11 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
   - old or garbage pixels: F6 coherency, or the deferred `gpu_cached=0`;
   - wrong blending: framebuffer fetch, the open GMEM-range question below.
 
-**Next - boot #56 (the user pushes 0997, CI builds).**
-- Image: the CI kernel with 0997. Cmdline: #54's (standard + `sweetusb=2 kgpu=21 kgpu_keep=1`).
+**Next - boot #57: #56's kernel (0997) + `gpu_cached=1`** (shim/out/shim-boot-57.img, built), then
+the CI kernel with 0998 without the boot-arg. Write-combined buffers need the lower bank's pages kept
+out of them, or given a physical-aperture mapping (deferred).
+- Old plan for #56, valid for #57 minus write-combining. Cmdline: #54's (standard + `sweetusb=2
+  kgpu=21 kgpu_keep=1`).
 - Check, in order:
   - the UI comes up on the GPU as on #54;
   - eagl-check on the Adreno (`/run?a=/tmp/eagl-check` after kjoin + libtopaz-gl in /tmp, as on
@@ -194,7 +199,9 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
 **Deferred (after G4, in this order):**
 1. ~~`gpu_cached=0` / write-combined buffers, read-only client memory and the wrapDelta~~ (0997, to
    test on #56). Still from §3.2: `trapLock` waiting for a GPU-drawn surface and invalidating it
-   (screenshots, snapshots, kshot).
+   (screenshots, snapshots, kshot). **Write-combining itself failed on #56 (0998 reverts it)**:
+   it needs IOBMD pages from the physical aperture only (where does the lower DDR bank enter the
+   VM? a series patch) or an aperture for that bank.
 2. UCHE_GMEM_RANGE reads 0 even while the GPU is held (open question 1). If CoreAnimation's
    framebuffer fetch draws wrong, it is the first suspect.
 3. Holding the GPU for hours (open question 4).
@@ -1768,6 +1775,27 @@ arrival times in census-boot55.txt.
   - **Parked (the user, 20:21):** the plain four-tap source is back (Settings' keyboard right, Safari's
     black either way), /topaz/sb3 stays. Next for Safari's keyboard: the passes around sb3 in
     `BlurState::single_pass_blur` / `Context::blur_surface`; kshot to see each try.
+
+**BOOT #56 (2026-10-24 20:32:58, shim/out/shim-boot-56.img: CI kernel sha256 41d8385c... with 0997,
+origin 50c3831 = 0997 + the user's xnu.yml change (CI now on tags), cmdline #54's): PANIC.**
+- backboardd started on the GPU ("RedwoodGPU: client backboardd (open 1)", 20:33:35, log line 331),
+  then the kernel panicked. From the user's photo of the panic screen:
+  - "panic(cpu 4 caller 0xfffffe0007b35c94): phystokv_range: illegal PA: 0x60de0000; phys base
+    0x90000000, size 0x17ff00000 @arm_vm_init.c:406"; panicked task pid 55 backboardd.
+- The backtrace, symbolized against the CI kernel (`xcrun atos -o kernel.development.sweet -arch
+  arm64e -l 0`: unslid):
+  - `ml_static_vtop.cold.1` <- `pmap_set_cache_attributes_internal` <- (`vm_object_page_grab` + 8)
+    <- `mach_make_memory_entry_internal` <- `IOGeneralMemoryDescriptor::memoryReferenceCreate`;
+  - <- `IOGeneralMemoryDescriptor::initWithOptions` <- `IOBufferMemoryDescriptor::initWithPhysicalMask`
+    <- `IOBufferMemoryDescriptor::inTaskWithOptions` <- **`RedwoodGPUUserClient::gemNew`** <-
+    `externalMethod` <- `is_io_connect_method`.
+- **So:** a write-combined IOBMD has its pages' cache attributes changed through the physical
+  aperture (phys base 0x90000000, 6 GB). The allocator also hands out pages below it (0x60de0000,
+  the lower DDR bank), and those have no aperture mapping. Topaz's note named this hazard; R2
+  (§3.2) was right that write-combining does not make a buffer contiguous, but missed this.
+- 0998 (RedwoodGPU cached by default again) is written: compiled with CI's line (0 warnings),
+  replay 244 applied, 4 usual skips. `gpu_cached=1` does the same on #56's kernel:
+  shim/out/shim-boot-57.img.
   - **Left on the phone before the park:** /topaz/sb3 present; the inject with the second source installed
     (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
     for the old behaviour (Settings blocky, Safari black).
