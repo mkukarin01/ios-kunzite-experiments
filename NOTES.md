@@ -42,7 +42,8 @@ same state in all 31 reports, then the undo ran clean (entry after #47). Found: 
 range reads 0 even with GX held; RBBM_NC_MODE_CNTL = 1. **K2 = 0992 (the GPU's own buffers:
 tables on demand, user-range addresses, real map/unmap, step 23) is written**, not built or
 booted: push, CI, then boot #49 with `kgpu=23 kgpu_keep=1 kgpu_keep_s=120` (entry after #48).
-Then K3: submission and fences.
+**K2 done: boot #49 passes** (12 rounds, remap, guard, 34 MB with grown tables, read-only entry,
+undo frees the grown tables after the streams). **Next: K3**, submission and fences.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -979,6 +980,35 @@ skipped, step 23's rounds (0 samples wrong each), "b starts after a and one unma
 "THE GPU WROTE THE NEW PAGES", the 34 MB line with pages made on demand > 0, the read-only bits
 set, "THE GPU'S OWN BUFFERS WORK ... 1 free range", no CONTEXT 0 FAULT. Then kept 120 s and the
 undo, including "undo gpu page tables made on demand: freed N pages", then "run over".
+
+**BOOT #49 (2026-10-24 12:19, shim/out/shim-boot-49.img: standard cmdline + `sweetusb=2 kgpu=23
+kgpu_keep=1 kgpu_keep_s=120`; kernel = CI after e65cf69 (the pushed head), sha256 f82138c9...):
+K2 PASSES - THE GPU'S OWN BUFFERS WORK.** Log: temp/ios-m8/usblog/live-boot49-20261024-1219.txt.
+Steps 1-21 as #48, "22 skipped", then step 23:
+- **12 rounds** (16K..4M, one across a 2M boundary), each at GPU 0x4000000000 (the address comes
+  back each time) over scattered kernel pages from 0xa2967c000 on: **0 samples wrong in every
+  round** (8..2048 each).
+- **Guard:** a at 0x4000000000, b at 0x4000050000, "b starts after a and one unmapped 64K grain".
+- **Remap:** a's address unmapped and mapped onto b's memory, then filled: "a's old memory 0 of
+  128 samples changed, b's memory 0 of 128 wrong: THE GPU WROTE THE NEW PAGES (the TLB was
+  told)".
+- **34 MB:** "27 of 28 tables used, 3 pages of them made on demand"; the last 64K: 0 of 32 wrong.
+- **Read-only entry** 0xa2d514ec3: AP[2] and AP[1] set (+ SH outer, AF, nG).
+- "23 THE GPU'S OWN BUFFERS WORK: ... tables 27 used of 28 (9 before), 3 pages made on demand (0
+  before); all GPU addresses back (1 free range); cb0 fsr 0x400".
+- All 15 step-23 submissions identical: cx_busy 0x71000000 (idle), rbbm_status 0x1, CP
+  interrupt/hw_fault/protect 0, CB0 FSR 0x400; no CONTEXT 0 FAULT line. WPTR ended at 0x40d of
+  8K words (no wrap yet: K3).
+- **Test bug (mine, not the GPU's):** the marker word read 0x6b672300 (round 0's) on every round.
+  Step 23 reads it without `kg_to_memory(scratch)`, unlike step 22, so the CPU kept its cached
+  line. The pixels were checked after invalidating and are right. Fix with K3.
+
+"23 of 23 steps done; 53 writes to undo", kept 120 s (reports at 0/60/120 s as #48: GMEM range
+0, RBBM_NC_MODE_CNTL 1, hbb 14 values). Then the undo in the designed order: stream 0 unrouted,
+stream 5 and CB1 off, **"undo gpu page tables made on demand: freed 3 pages"**, then the pool,
+...; "after undo: cx gdsc 0x22f001 hw_ctrl 0x5ff4 gx gdsc 0x222801" (= #47/#48), "run over". No
+panic; backboardd (56), SpringBoard (26) and the agent as before. Next: glue plan K3, submission
+(`redwood_gpu_submit/_done/_last`, kgsl's IB wrapping, the gen7 fence, ring wrap).
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
