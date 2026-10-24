@@ -1,11 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #53 up to eagl-check, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: U4 way 1 on boot #53, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
 eagl-check passed on softpipe and on the Adreno**: the EAGL table works through iOS's own
-OpenGL ES. Next is the backboardd swap (U4), which needs the user's OK. Glue milestones G1-G3
+OpenGL ES. **U4 is in (way 1, 19:03): backboardd draws with Mesa on the Adreno** - the user
+is to judge the screen (G4: lock screen, home screen, Settings).
+**The phone's root now has (persistent, all over the agent; the user said this iOS root is spare
+firmware, to be configured on the fly):**
+- /topaz/lib/{libOSMesa.8.dylib, libtopaz-gl.dylib, libtopaz-inject.dylib} (0644, dirs 0755);
+- /usr/libexec/real/backboardd: the stock binary, moved;
+- /usr/libexec/backboardd: the wrapper, built with `BBD_REAL=/usr/libexec/real/backboardd`.
+- **Rollback:** `/rm?p=/usr/libexec/backboardd`, `/mv?p=/usr/libexec/real/backboardd&to=/usr/libexec/backboardd`,
+  then `/kill` backboardd. **Off without touching files:** `gl=0` in the cmdline. On a boot
+  without the GPU kept, inject waits 5 s, finds no RedwoodGPU and leaves CoreAnimation on the CPU.
+- **Every boot from now on:** the GPU comes up minutes after backboardd. Once "RedwoodGPU
+  published" is in the log, kill backboardd over the agent so that it comes back on the GPU. Glue milestones G1-G3
 reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7 (freedreno FD710)
 draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha256
 74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
@@ -15,8 +26,8 @@ draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha
 - §4-§7 give the steps and their order.
 The log of K0-U3 is the handoff below this section.
 
-**Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check~~
-(done), then U4 into backboardd -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+**Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
+U4 way 1~~ (done) -> the user looks at the screen -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
 **Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
@@ -1454,7 +1465,40 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
     GMU ERROR or panic.
 - eagl.c's own log: "a frame is waited for by the display's driver, not here" (RedwoodWaitsForGPU),
   plus per-frame and per-call counts and a profile, 0 GL errors.
-- Not done: the swap into backboardd (U4) waits for the user's OK.
+- **U4 way 1 (the user's OK, 19:02).**
+  - Installed:
+    - /topaz and /topaz/lib (0755);
+    - libOSMesa joined straight into /topaz/lib by kjoin (same hash);
+    - libtopaz-gl and libtopaz-inject (0644);
+    - /usr/libexec/real (0755); stock /usr/libexec/backboardd moved there (1184848 bytes);
+    - the wrapper (51376 bytes, `BBD_REAL=/usr/libexec/real/backboardd`) at /usr/libexec/backboardd
+      (0755).
+  - 19:03:55: `/kill` pid 56 (SIGTERM). launchd started it again as pid 367; SpringBoard restarted
+    as pid 369.
+  - The log, in order:
+    - 0914's "exec backboardd" and "topaz: backboardd starts without DYLD_INSERT_LIBRARIES": the
+      wrapper itself;
+    - then "backboardd starts WITH DYLD_INSERT_LIBRARIES";
+    - "7 of 7 methods of EAGLContext are ours", "topaz-gl: GLESContext hooks: function_supported on,
+      function_uniform on", "topaz-crash: handlers set, GL loaded";
+    - "RedwoodGPU: client backboardd (open 2)";
+    - **"redwood-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa ...: OpenGL ES 3.2 Mesa
+      25.0.7; FD710"**;
+    - CoreAnimation reading the extension string and limits;
+    - the 1125x2436 BGRA screen surfaces (ids 12 and 14), each "-attachImage: ... a texture, copied
+      into its memory by the GPU";
+    - LA08 96x96 surfaces as textures;
+    - eagl's own programs for CoreAnimation's program-less draws (functions 20 "c4p", 45 "vcm", 28
+      "ds8", 39 "vrb", and the variable blur);
+    - 0 GL errors.
+  - Frames: "after 800 frames: 393 calls, 67 draws and 337 triangles a frame on average; ... 10156
+    us a frame, of which 2727 handing the commands on, 1214 waiting".
+    - 36 IOSurfaces were textures' memory, 379 had to be copied.
+    - 52 shaders, 49 programs; biggest texture 3088 x 3088.
+  - No CONTEXT 0 FAULT, GMU ERROR or panic. The only CRASH in the log is driverkitd at early boot
+    (jetsam, ns 1 code 7), before the GPU; it is not GPU-related.
+  - Not yet seen: what the screen shows (the user's look), and the keep reports after backboardd
+    started.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
