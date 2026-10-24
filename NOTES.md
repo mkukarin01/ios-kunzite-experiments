@@ -1497,8 +1497,14 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
     - 52 shaders, 49 programs; biggest texture 3088 x 3088.
   - No CONTEXT 0 FAULT, GMU ERROR or panic. The only CRASH in the log is driverkitd at early boot
     (jetsam, ns 1 code 7), before the GPU; it is not GPU-related.
-  - Not yet seen: what the screen shows (the user's look), and the keep reports after backboardd
-    started.
+  - Keep reports after the swap: 600 s fence 13968 of 13968; 660 s **fence 19728 of 19728**
+    (about 95 submissions a second); GPU addresses in 69-72 free ranges.
+  - **PosterBoard[370] (the lock screen's wallpaper process, started with the restart) crashed
+    once:** sig 6, reason ns 2 code 0x6. It printed no lines of its own first. launchd started
+    it again (pid 436), and it was still up at 19:08. It never crashed on #46-#52 (CPU UI).
+    Cause unknown: [guess] something it asks of the GPU path or of backboardd that is not
+    there. Watch whether it repeats.
+  - Not yet seen: what the screen shows (the user's look).
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
