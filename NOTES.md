@@ -1565,6 +1565,24 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
       CoreAnimation stays on the CPU;
     - `/kill` backboardd and look at Safari's keyboard;
     - move the file back and kill backboardd again.
+  - **A/B run (19:19-19:21):**
+    - libtopaz-gl moved to `.off`; backboardd killed. It came back as pid 630 "WITH
+      DYLD_INSERT_LIBRARIES", with no GL context and no RedwoodGPU client: the CPU renderer.
+      **The Safari keyboard was grey (right).**
+    - Moved back and killed again: pid 669, "an OpenGL ES 3 context ... FD710", "RedwoodGPU: client
+      backboardd (open 3)". **The Safari keyboard was right on the GPU this time too.**
+    - So the black keyboard did not repeat. [guess] It was something of that first GPU start's
+      (19:03): a backdrop captured before something was ready, or state left from the CPU
+      renderer that was swapped out under it. Watch for it after the next boot's restart.
+  - **The user's screenshots were not saved.** ScreenshotServicesService ran (its plist and saved
+    state were written), but iOS hands the picture to Photos, and assetsd keeps aborting.
+    `kfind` (new, `userland/gpu/kfind.c`: pictures and recently changed files under a directory,
+    since the phone has no find) found no screenshot under /private/var/mobile, /private/var/tmp,
+    /private/var/root or /tmp.
+  - iOS's app snapshots (SplashBoard, for the app switcher) are rendered by backboardd, so on the GPU
+    now. Safari's two (light and dark, about 19:22) show the keyboard right. Copies are in main
+    repo temp/ios-m8/u4/snapshots/.
+    - The agent's `/get` refuses a URL-encoded path ("ERR bad request"); send it raw with `curl -g`.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
