@@ -10,3 +10,4 @@ xnu/out-*/
 __pycache__/
 agent/out/
 userland/gpu/out/
+userland/build-mesa/

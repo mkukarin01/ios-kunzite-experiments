@@ -1,11 +1,16 @@
 #!/bin/bash
 # Private, local only: Mesa 25.0.7 (freedreno + softpipe) for the iOS 16 userland, built on the Mac
-# with Xcode's clang (adapted from darwin-redwood tools/mk-mesa.sh; their patches in ../mesa).
+# with Xcode's clang (adapted from darwin-redwood tools/mk-mesa.sh; the patches and redwood-drm in
+# userland/mesa).
+#   [MESA_BUILD=DIR] [PYTHON=python3.x] userland/mesa/mk-mesa-mac.sh
+# DIR (default userland/build-mesa) gets the tarball, the tree, a venv with meson and mako, and out/:
+# libOSMesa.8.dylib (install name /topaz/lib/libOSMesa.8.dylib, signed ad hoc), exported-gl.txt, gl.xml.
 set -e
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
-ROOT=$(cd "$(dirname "$0")" && pwd)
-B=$ROOT/build-mesa
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+B=${MESA_BUILD:-$ROOT/build-mesa}
+mkdir -p "$B"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CC=$(xcrun --sdk iphoneos -f clang)
 cd "$B"
@@ -20,9 +25,9 @@ if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null
 fi
 rm -rf mesa-$VERSION/src/redwood-drm
 cp -r "$ROOT/mesa/redwood-drm" mesa-$VERSION/src/redwood-drm
-if [ ! -x venv/bin/python3 ]; then
-	python3 -m venv venv
-	venv/bin/pip -q install mako pyyaml packaging
+if [ ! -x venv/bin/meson ]; then
+	${PYTHON:-python3} -m venv venv
+	venv/bin/pip -q install meson mako pyyaml packaging
 fi
 export PATH=$B/venv/bin:/opt/homebrew/opt/bison/bin:$PATH
 T=(-target arm64-apple-ios16.0 -isysroot "$SDK")
@@ -59,6 +64,12 @@ ninja -C $BUILD > ninja.log
 mkdir -p out
 $(xcrun -f strip) -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
 install_name_tool -id /topaz/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
+# (strip and install_name_tool break the linker's ad-hoc signature: sign again, as agent/build.sh does)
+if command -v ldid >/dev/null; then
+	ldid -S out/libOSMesa.8.dylib
+else
+	codesign -f -s - out/libOSMesa.8.dylib
+fi
 nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
 cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml out/gl.xml
 ls -l out

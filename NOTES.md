@@ -1161,6 +1161,25 @@ temp/ios-m8/usblog/live-boot51-20261024-1313.txt.
 cache clean, write-combined buffers, wrapDelta, read-only client memory), or straight to U1
 (Mesa 25.0.7 + FD710 built on the Mac) and U3 (a triangle through Mesa, before backboardd).
 
+**GLUE U1/U3 started (2026-10-24, Mesa first):**
+- `userland/mesa/mk-mesa-mac.sh` fixed: ROOT is `userland/` (it looked for the patches in
+  `userland/mesa/mesa/`, darwin-redwood's layout); the build folder is `MESA_BUILD` (default
+  userland/build-mesa, gitignored); the venv is made with `PYTHON`, with meson too; the dylib is
+  signed again after strip/install_name_tool (ldid -S).
+- First build (MESA_BUILD=main repo temp/mesa-build, python 3.11, SDK iPhoneOS 27.0, target iOS
+  16.0): meson setup fine, ninja stopped at 65/1134. `ir3_parser.y` uses bison's `%code`; macOS's
+  /usr/bin/bison is 2.3, and Homebrew's bison (the script's PATH has /opt/homebrew/opt/bison/bin)
+  is not installed. Needs bison >= 2.4.
+- `userland/gpu/gl_triangle.c` + `mk-gl-triangle.sh` -> `userland/gpu/out/gl-triangle` (0
+  warnings, signed ad hoc). It dlopens /tmp/libOSMesa.8.dylib (or its argument) and draws two
+  pictures of 256x256: an OpenGL compat triangle (glBegin) and an OpenGL ES 2 one (shaders,
+  glDrawArrays, glReadPixels, 100 frames timed).
+  - Each picture is checked (about 21000 pixels inside, none missing, none outside, the corner
+    colours) and written as a PPM beside the library.
+  - The renderer must be FD710.
+  - `soft` sets OSMESA_SOFTWARE=1 (softpipe, to compare); `debug=` sets FD_MESA_DEBUG. The agent
+    passes no environment, so the program sets these itself.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
