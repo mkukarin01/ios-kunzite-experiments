@@ -1684,6 +1684,35 @@ temp/ios-m8/usblog/live-boot54-20261024-1952.txt.
     CoreAnimation is refused and every draw it makes with no program that we do not draw ("NOT
     DRAWN ..."), with where and what. Open Safari's keyboard, then read the census.
 
+**BOOT #55 (2026-10-24 20:02:23, shim/out/shim-boot-55.img = #54's kernel, cmdline #54's +
+`glcensus=1`).** Logs: temp/ios-m8/usblog/live-boot55-20261024-2002.txt, and the census lines with
+arrival times in census-boot55.txt.
+- backboardd was on the GPU by 20:03:00 (FD710, "open 1"), again without a wait.
+- **The user's keyboards, in order, and what CoreAnimation asked for at the time:**
+  - **Control Center search: right, grey and see-through.** Census at 20:03:29-42: `c4p`, `vcm`,
+    `ds8`, then the variable blur `vrd`/`vrb` (704 x 96) and `hom`. All are drawn by eagl's own
+    programs; no `sb3`.
+  - **Settings (exec Preferences 20:04:01): "grey keyboard with large pixels behind it"**, then
+    right the second time. "topaz-gl: CoreAnimation's GL renderer has no function 40" at
+    20:04:01; the ten-second summary has `40 sb3 x0 (refused x2)`.
+  - **Safari (exec MobileSafari 20:04:49): black keyboard.** Nothing new in the census; the
+    summary has `40 sb3 x0 (refused x3)`.
+- **So the black keyboard comes from `sb3` (function 40), which CoreAnimation's GL renderer says
+  it has none of.**
+  - [guess] It is the small blur over the backdrop shrunk eight times (`ds8`). Refused, CoreAnimation
+    draws the backdrop another way: blocky in Settings, nothing (black) in Safari's case.
+  - Control Center's material uses the variable blur instead, which eagl draws.
+- `edr` (61) and `lub` (66) are "NOT DRAWN" over the whole screen about 10 times a second on
+  every screen, the good ones too. [guess] These are the EDR/brightness stages, with nothing to
+  do on this panel; harmless.
+- **Fix to try:**
+  - topaz_inject's `my_function_supported` says yes for 40, behind a file switch (/topaz/sb3),
+    so it can be tried and undone with a backboardd restart and no boot.
+  - CoreAnimation then draws `sb3` with no program, and eagl draws such a draw plainly ("as the
+    picture it is given").
+  - CoreAnimation's numbers for it get logged ("gives its function 40 numbers"). From those, a
+    real `sb3` program for eagl, like its `ds8` and variable-blur ones.
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
