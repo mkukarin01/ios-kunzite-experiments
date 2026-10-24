@@ -23,10 +23,22 @@ shim-boot.img to shim-boot-NN.img; `fastboot boot`; then `tools/udp-log.py <file
 agent at 192.168.7.2:8022 answers. **Stop the previous listener first** (boot #42: a leftover one
 held the UDP port; the log replays from the kernel's first line on reconnect).
 
-**Next:** the plan's "After K1/K2" - wire the GPU path into the display/eagl glue (chip id
-0x07010000, GMEM 512K); Mesa main now has an FD710 entry (a7xx_base + a7xx_gen1, num_ccu 1,
-a710_raw_magic_regs; copy in temp/gpu-plan-review/regdb-2026-10-24/freedreno_devices.py).
-Unverified: whether 2D/3D work beyond solid fills needs Mesa's a710 magic registers.
+**Glue plan (2026-10-24):** the road from the probe to backboardd drawing with the GPU is the
+main repo's `ios/gpu-glue-plan.md`. Its read-only phase R is done (results in §3.1-3.7, nothing
+written on the phone). Fork commit from it: **a9df00f `userland/mesa/fd710-backport.patch`**
+(Mesa main's FD710 put into 25.0.7's device table: names, magic and raw split, tile_max 1024).
+It was checked by generating the table and applying it with the other two Mesa patches, not built
+(no meson or mako on the Mac yet). Findings that touch this branch:
+- **hbb is 14 here, not 15.** kgsl uses 14 when the FDT's `ddr_device_type` is 7 (LPDDR4X), and
+  the live FDT says 7. The probe's step 20 table (0985) writes hbb 15 values: RB_NC_MODE_CNTL
+  0x814 etc. K1 and step 20 should use 0x812 / 0x2 / 0x22 / 0x20 / 0x200000. Harmless so far
+  (the fills were linear).
+- UCHE_GMEM_RANGE_MIN/MAX read 0 on #41, and they matter: CoreAnimation reads the framebuffer
+  (freedreno-darwin.patch). K1 reads them again.
+
+**Next:** glue plan K0, the build split: two lines out of iokit/conf/files.arm64, and 22
+symbols from kunzite_adreno.c (list in the plan's §3.7). Then K1, keep mode. Each is a patch
+and a boot.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
