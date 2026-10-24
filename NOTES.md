@@ -1,12 +1,20 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: U4 way 1 on boot #53, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: G4 on boot #53, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
 eagl-check passed on softpipe and on the Adreno**: the EAGL table works through iOS's own
-OpenGL ES. **U4 is in (way 1, 19:03): backboardd draws with Mesa on the Adreno** - the user
-is to judge the screen (G4: lock screen, home screen, Settings).
+OpenGL ES. **U4 is in (way 1, 19:03): backboardd draws with Mesa on the Adreno, and G4 is
+reached (the user's look, 19:10).** Seen by the user:
+- the CPU path's redraw artifacts are gone;
+- transparent layers are right;
+- the red tint after the first power-button press (always-on display) is gone, and the colours
+  are right;
+- most animations are smooth;
+- Safari renders correctly;
+- the Settings -> About crash did not show (not sure);
+- the wallpaper cannot be judged: the image has none.
 **The phone's root now has (persistent, all over the agent; the user said this iOS root is spare
 firmware, to be configured on the fly):**
 - /topaz/lib/{libOSMesa.8.dylib, libtopaz-gl.dylib, libtopaz-inject.dylib} (0644, dirs 0755);
@@ -27,7 +35,9 @@ draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha
 The log of K0-U3 is the handoff below this section.
 
 **Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
-U4 way 1~~ (done) -> the user looks at the screen -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+U4 way 1~~ (done) -> **~~G4~~ (reached)** -> the user's wider look (blur and vibrancy, the app
+switcher, sleep and wake, the keyboard, a long run); the PosterBoard/assetsd A/B; making it
+survive a reboot without the manual kill -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
 **Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
@@ -1504,7 +1514,28 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
     it again (pid 436), and it was still up at 19:08. It never crashed on #46-#52 (CPU UI).
     Cause unknown: [guess] something it asks of the GPU path or of backboardd that is not
     there. Watch whether it repeats.
-  - Not yet seen: what the screen shows (the user's look).
+  - **G4 (the user, 19:10):**
+    - the artifacts are gone, transparency is right and the red tint is gone;
+    - animations are mostly smooth and Safari is right;
+    - no wallpaper in the image to judge.
+  - Log at 19:10:
+    - "after 11600 frames: 228 calls, 34 draws and 152 triangles a frame on average; ... 5484 us
+      a frame";
+    - fence 30466 of 30466 at 840 s; GPU addresses in 96 free ranges (69 at 660 s: watch for a
+      leak);
+    - the variable blur ("vrd"/"vrb") ran through eagl's own programs;
+    - once: "topaz-gl: CoreAnimation's GL renderer has no function 40". That is CoreAnimation's
+      own GL renderer refusing it; whatever uses 40 is drawn without it.
+  - **assetsd[451] aborted too**, with the same pc, lr and first frames as PosterBoard. Looked up
+    in the 20H392 cache (slide 0x1ab80000):
+    `__pthread_kill` <- `abort` <- `_objc_terminate` <- `std::terminate` <-
+    `_dispatch_client_callout` <- `_dispatch_main_queue_drain` (PosterBoard) or
+    `_dispatch_continuation_pop` (assetsd). So each is an uncaught exception in a dispatch
+    block. The thrower is past the 10 logged frames, and neither process printed the exception.
+  - Neither loads our libraries. [guess] It is the backboardd restart (#46-#52 never restarted
+    it) or what they ask of CoreImage/IOSurface now. A/B test: rename /topaz/lib/libtopaz-gl.dylib
+    (inject then leaves CoreAnimation on the CPU), restart backboardd, and see whether they
+    abort again.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
