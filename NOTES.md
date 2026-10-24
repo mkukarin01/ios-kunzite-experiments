@@ -1,10 +1,11 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: U2, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #53 up to eagl-check, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
-(K5-min, written and checked, not built by CI yet: the user pushes)**. **U2 is built** (the
-libraries for backboardd, plus eagl-check; Mac-side checks only). Glue milestones G1-G3
+(K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
+eagl-check passed on softpipe and on the Adreno**: the EAGL table works through iOS's own
+OpenGL ES. Next is the backboardd swap (U4), which needs the user's OK. Glue milestones G1-G3
 reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7 (freedreno FD710)
 draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha256
 74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
@@ -14,8 +15,8 @@ draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha
 - §4-§7 give the steps and their order.
 The log of K0-U3 is the handoff below this section.
 
-**Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53 (K5 kernel, eagl-check,
-then U4 into backboardd, in one boot) -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+**Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check~~
+(done), then U4 into backboardd -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
 **Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
@@ -64,7 +65,18 @@ After each step: rewrite this section, an entry below, the plan's progress lines
 - **Not run on the phone yet**: the agent did not answer while U2 was written.
 
 **Next - boot #53: K5 kernel, eagl-check, then U4 (replacing a system file: the user's OK
-first).**
+first).** Steps 1 and 2 are done (log entry "BOOT #53").
+**What the live phone has (read on #53, unchanged from R6):**
+- /usr/libexec/backboardd: 0755 0:0, 1184848 bytes, running as uid 501;
+- no /topaz and no /usr/libexec/real;
+- the job cache /System/Library/xpc/launchd.plist (795414 bytes, binary, last changed
+  2026-10-21 for the agent): `LaunchDaemons` / `/System/Library/LaunchDaemons/com.apple.backboardd.plist`
+  has ProgramArguments [/usr/libexec/backboardd], UserName mobile, POSIXSpawnType Interactive,
+  KeepAlive and RunAtLoad true. A copy is in the main repo's temp/ios-m8/u4/launchd.plist.live.
+- **Which way while the GPU is already up:** way 1 (topaz's) needs no reboot: move the stock
+  binary, put the wrapper (built with BBD_REAL=/usr/libexec/real/backboardd) in its place,
+  then kill backboardd so launchd starts it through the wrapper. Way 2 changes the plist, and
+  launchd reads that only at boot: a reboot, then the kill after "RedwoodGPU published".
 1. **Kernel.** CI after the push of 0995. Check that SHA256SUMS and the run's head sha are the
    commit with 0995. Image as in the procedure below, cmdline standard +
    `sweetusb=2 kgpu=21 kgpu_keep=1`.
@@ -1409,6 +1421,40 @@ not run on the phone).**
   wrong slot shows up there and not in backboardd.
 - The agent did not answer (`/ping` timed out) while U2 was written, so nothing has run on the
   phone yet: boot #53, step 2.
+
+**BOOT #53 (2026-10-24 18:53, shim/out/shim-boot-53.img: CI kernel sha256 5acb4f65... with 0995,
+cmdline standard + `sweetusb=2 kgpu=21 kgpu_keep=1`).** Log:
+temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
+- 0995 is in this kernel: `AppleCLCD::present` calls `sweet_dcache_flush`, and `redwood_gpu_on`
+  has 5 callers (llvm-objdump). (There is no `gh` on this Mac, so the run id was not read.)
+- The agent answered at 18:54:10, 41 s after `fastboot boot`.
+- Uploads to /tmp, sizes as on the Mac: kjoin, eagl-check, libtopaz-gl.dylib, and libOSMesa in
+  8 parts. "kjoin: /tmp/libOSMesa.8.dylib 15000608 bytes fnv1a64 ade89aa3f487b7be" is the Mac's
+  hash.
+- **eagl-check, first try (softpipe): 7 failed.**
+  - The method swap worked: "7 of 7 methods of EAGLContext are ours".
+  - The context was made: "OpenGL ES 3.1 Mesa 25.0.7; softpipe".
+  - `+setCurrentContext:` said YES, but every gl* function of OpenGLES.framework did nothing
+    (glGetString NULL, nothing drawn). **Observed:** after `+setCurrentContext:` the thread's
+    OpenGL slot (TSD 30, [tpidrro_el0 + 0xf0]) was **0**, and `+currentContext` was not ours.
+  - [guess] iOS fills that slot from the context's own fields, which our `-initWithAPI:properties:`
+    never sets up. CoreAnimation calls the table directly, so it does not need the slot. Topaz's
+    UI runs this way, and the slot list's '*' entries are QuartzCore's.
+  - **Watch in U4:** anything in backboardd that calls OpenGLES.framework's gl* functions,
+    rather than the table, silently does nothing.
+- eagl-check was changed to point the slot at the table (table - 0x20), as iOS does for its own
+  contexts. Then:
+  - **softpipe**: "softpipe", "OpenGL ES 3.1"; 20808 pixels, 0 missing, 0 outside; red corner
+    233 16 6, top 6 7 243, clear 0 0 64; 100 frames 640 ms.
+    - (One more failure here was the check's own edge equations, fixed.)
+  - **Adreno** (once "RedwoodGPU published", at about 18:56:40): "FD710", "OpenGL ES 3.2 Mesa
+    25.0.7"; the same picture and counts; 100 frames **65.0 ms**; **"THE TABLE WORKS, THROUGH
+    iOS's OWN OpenGL ES (0 failed)"**.
+  - Kernel: "RedwoodGPU: client eagl-check (open 1)", submissions 1-4 logged, no CONTEXT 0 FAULT,
+    GMU ERROR or panic.
+- eagl.c's own log: "a frame is waited for by the display's driver, not here" (RedwoodWaitsForGPU),
+  plus per-frame and per-call counts and a profile, 0 GL errors.
+- Not done: the swap into backboardd (U4) waits for the user's OK.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

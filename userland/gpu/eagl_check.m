@@ -4,10 +4,16 @@
  * libOSMesa.8.dylib, then libtopaz-gl.dylib (whose constructor takes over six of EAGLContext's
  * methods) from DIR; dyld takes the OSMesa already loaded for libtopaz-gl's
  * /topaz/lib/libOSMesa.8.dylib, by its install name. Then, as CoreAnimation does: an EAGLContext
- * of API 3 (-initWithAPI:properties:), made current, and drawing through OpenGLES.framework's own
- * gl* functions, each of which jumps through the table -getMacroContextPrivate handed out
- * (eagl_gen.h, from eagl/eagl_slots.txt). If that table is wrong, this crashes or draws nothing,
- * not backboardd.
+ * of API 3 (-initWithAPI:properties:) and its table (-getMacroContextPrivate; eagl_gen.h, from
+ * eagl/eagl_slots.txt), entries called as entry(table[0], arguments...).
+ *
+ * The drawing goes through OpenGLES.framework's own gl* functions: each reads the thread's OpenGL
+ * slot (TSD 30, [tpidrro_el0 + 0xf0]) and jumps through [slot + its offset]; the slot + 0x20 is the
+ * table. iOS's +setCurrentContext: fills that slot from the context's own fields, which ours do not
+ * have (boot #53: it said YES and left the gl* functions doing nothing). CoreAnimation does not
+ * need it, as it calls the table directly; so this points the slot at the table as iOS does for its
+ * own contexts, and every gl* function lands on the entry CoreAnimation would call. If the table is
+ * wrong, this crashes or draws nothing, not backboardd.
  *
  *   eagl-check [soft] [DIR]      DIR: default /tmp; soft: OSMESA_SOFTWARE=1 (softpipe, no GPU needed)
  *
@@ -33,6 +39,16 @@
 enum { SIZE = 256 };
 
 static unsigned failed;
+
+/* the thread's OpenGL slot, where OpenGLES.framework's gl* functions find the current table */
+static void **
+gl_slot(void)
+{
+	void **tsd;
+
+	__asm__ volatile ("mrs %0, tpidrro_el0" : "=r"(tsd));
+	return &tsd[30];
+}
 
 static double
 now(void)
@@ -104,9 +120,17 @@ main(int argc, char **argv)
 		return 1;
 	}
 	check([context API] == kEAGLRenderingAPIOpenGLES3, "-API says 3");
-	printf("EAGL CHECK: -getMacroContextPrivate %p\n", [context getMacroContextPrivate]);
+	void **table = [context getMacroContextPrivate];
+	check(table != NULL && table[0] != NULL, "-getMacroContextPrivate: a table, its context in entry 0");
+	if (table == NULL) {
+		return 1;
+	}
 	check([EAGLContext setCurrentContext:context], "+setCurrentContext:");
-	check([EAGLContext currentContext] == context, "+currentContext is ours");
+	void **slot = gl_slot(), *before = *slot;
+	printf("EAGL CHECK: table %p; the thread's OpenGL slot after +setCurrentContext: %p, %s; +currentContext %s\n",
+	    (void *)table, before, before == (char *)table - 0x20 ? "the table already" : "pointed at the table now",
+	    [EAGLContext currentContext] == context ? "ours" : "not ours");
+	*slot = (char *)table - 0x20;
 
 	/* from here on every gl* call is OpenGLES.framework's, through the table */
 	const char *renderer = (const char *)glGetString(GL_RENDERER);
@@ -161,7 +185,7 @@ main(int argc, char **argv)
 			int background = p[0] == 0 && p[1] == 0 && (p[2] == 63 || p[2] == 64);
 			/* (the triangle in pixels, a pixel's centre: well inside, well outside, or the edge) */
 			double fx = (x + 0.5) / SIZE * 2 - 1, fy = (y + 0.5) / SIZE * 2 - 1;
-			double left = 2 * fx + 0.8 - (fy + 0.8), right = -2 * fx + 0.8 - (fy + 0.8);
+			double left = 2 * fx + 0.8 - fy, right = -2 * fx + 0.8 - fy;     /* (the slanted edges: y = +-2x + 0.8) */
 			double inside = fmin(fmin(left, right), fy + 0.8);
 			drawn += !background;
 			missing += background && inside > 0.02;
@@ -184,6 +208,7 @@ main(int argc, char **argv)
 	}
 	printf("EAGL CHECK: 100 frames in %.1f ms\n", (now() - t2) * 1e3);
 
+	*slot = before;
 	[EAGLContext setCurrentContext:nil];
 	[context release];
 	printf("EAGL CHECK: %s (%u failed)\n", failed ? "SOMETHING IS WRONG" : "THE TABLE WORKS, THROUGH iOS's OWN OpenGL ES", failed);
