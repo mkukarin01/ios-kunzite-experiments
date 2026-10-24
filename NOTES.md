@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 0996 + the waiting wrapper, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #54, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -40,6 +40,10 @@ The log of K0-U3 is the handoff below this section.
 **Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
 U4 way 1~~ (done) -> **~~G4~~ (reached)** -> ~~the user's wider look~~ (done) -> **boot #54: 0996
 + the waiting wrapper** (the UI starts on the GPU by itself; the logo gauge) -> the deferred list
+**Boot #54 done (entry in the log): the GPU was kept about 33 s after `fastboot boot` (#53: 3 min
+11 s), and backboardd started directly on it, with no wait and no restart.** Open: the gauge's
+own lines were not captured (see the entry), and the black Safari keyboard came back on the
+boot's first GPU start.
 
 **Next - boot #54 (the user pushes 0996, CI builds).**
 - Image: the CI kernel with 0996 (check that `kg_logo` is in it: `xcrun nm | grep kg_logo` shows
@@ -1640,6 +1644,36 @@ the GPU, and the boot logo shows its progress.
     (open 4)").
 - Who draws the boot logo is not settled: no code in our kernel tree draws an Apple logo (the
   progress spinner is off, -noprogress). The gauge finds it by its pixels, whoever drew it.
+
+**BOOT #54 (2026-10-24 19:52:39, shim/out/shim-boot-54.img: CI kernel sha256 836d48f9... with 0996
+(origin 4d340fd), cmdline standard + `sweetusb=2 kgpu=21 kgpu_keep=1`).** Log:
+temp/ios-m8/usblog/live-boot54-20261024-1952.txt.
+- **The GPU is up about 33 s after `fastboot boot`.**
+  - The kernel clock counts from before `fastboot boot`: kernel 162.5 s was 19:54:46, so kernel 0
+    was about 19:52:03, and `fastboot boot` was at about kernel 35.5 s.
+  - The 60 s keep report was at kernel 128.62 s, so the GPU was kept at kernel 68.6 s, about
+    19:53:12.
+- **backboardd started on the GPU by itself.**
+  - Its IOKit match for RedwoodGPU found it on the wrapper's first check ("IOK backboardd:
+    matching1 ... -> RedwoodGPU", before "starts WITH DYLD_INSERT_LIBRARIES"), so no wait.
+  - Then "RedwoodGPU: client backboardd (open 1)" and the FD710 context (about 19:53:16).
+  - The agent answered at 19:53:20.
+- After 60 s of keep: fence 1246 of 1246; GPU addresses in 11 free ranges; hw_fault 0; CB0 FSR 0x400.
+- **Not captured:**
+  - The USB live log starts only once USB networking is up ("SWEET USB: setup"), and the kept run
+    was over before that. So no "keep mode: ... after N ms" line and no "logo gauge" lines.
+  - New `userland/gpu/kdmesg` (the kernel's message buffer through `proc_kmsgbuf()`, which the
+    phone lacks as dmesg) found the 128 KB buffer already wrapped. Only the 60 s report was left.
+  - The persistent log (the last 4 MiB of userdata) should have it all: not read yet.
+  - **The user saw a flicker in the middle of the screen while the boot's text ran.** [guess] The
+    gauge's 21 amber redraws and the green one, all within a few seconds.
+- **The black Safari keyboard came back.**
+  - It happens on the boot's first GPU start: #53 at 19:03 and #54 now. It was right after #53's
+    CPU -> GPU restart.
+  - It is not "function 40": CoreAnimation's GL renderer refused 40 on every GPU start, the good
+    one included (#53 line 19963).
+  - 19:57:15: backboardd restarted GPU -> GPU (pid 56 -> 319, FD710, "open 2") to see whether a
+    restart alone fixes it.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
