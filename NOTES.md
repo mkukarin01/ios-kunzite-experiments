@@ -1204,6 +1204,41 @@ Expect "THE ADRENO 710 DREW BOTH PICTURES, THROUGH MESA": renderer FD710, both p
 glReadPixels matching, 100 frames timed. In the kernel log: "RedwoodGPU: client gl-triangle",
 the fence moving past 402 in the keep reports, no CONTEXT 0 FAULT.
 
+**BOOT #52 (2026-10-24 13:38, shim/out/shim-boot-52.img = #51's kernel, cmdline standard +
+`sweetusb=2 kgpu=24 kgpu_keep=1 kgpu_keep_s=900`): U3 PASSES - MESA DRAWS ON THE ADRENO 710.**
+Log: temp/ios-m8/usblog/live-boot52-20261024-1338.txt.
+- **Uploading the library:** the agent holds a `/put` body in memory, and jetsam killed it
+  during the 15 MB libOSMesa upload (curl: connection reset after ~5.6 MB; log: `CRASH
+  kunzite-agent[224] sig 9 ... reason ns 1 code 0x7`; launchd restarted it, pid 234).
+  - Workaround: 2 MB parts (`split`) plus `userland/gpu/kjoin.c` (join on the phone, print size
+    and FNV-1a 64). /tmp/libOSMesa.8.dylib: 15000608 bytes, fnv1a64 ade89aa3f487b7be, the same
+    as the Mac's.
+  - [plan] A fix belongs in the agent (stream `/put` to disk, or JetsamProperties in its plist):
+    that replaces a system file, so ask first.
+- **GPU run** `/run?a=/tmp/gl-triangle` -> **"THE ADRENO 710 DREW BOTH PICTURES, THROUGH MESA (0
+  failed)"**:
+  - library loaded in 30 ms;
+  - OpenGL: "freedreno / FD710 / 4.6 (Compatibility Profile) Mesa 25.0.7"; context + draw +
+    finish 98.7 ms; 20808 pixels drawn (20971 is the exact area), 0 missing inside, 0 drawn
+    outside; near the red corner 233 16 6, near the top 6 7 243;
+  - OpenGL ES 2: "freedreno / FD710 / OpenGL ES 3.2 Mesa 25.0.7"; shaders compiled and linked;
+    67.6 ms; the same counts and colours; glReadPixels matches;
+  - **100 frames (clear, draw, finish) in 153.9 ms**;
+  - Mesa printed its `os_same_file_description` warning (no KCMP on Darwin): harmless.
+- **Softpipe run** (`a=soft`): "Mesa / softpipe / 3.3" and "OpenGL ES 3.1", the same counts and
+  colours, 100 frames in 658.2 ms (the GPU about 4x faster here). It never opens RedwoodGPU.
+- **Pictures** (main repo temp/gpu-glue-r/u3/): GPU vs softpipe differ by at most 1 in a channel
+  (62 of 65536 pixels for GL, 1590 for ES). Side by side: u3-gpu-vs-softpipe.png.
+- **Kernel side:** "RedwoodGPU: client gl-triangle (open 1)", then "submission 403: 1 command
+  buffers, the first at 0x4000498000, 257 words" and on: Mesa's own IBs from its own buffers.
+  Keep report at 60 s: **fence 607 of 607** (205 submissions from Mesa, all retired); ring wptr
+  2291 (wrapped again); CP idle, hw_fault 0, CB0 FSR 0x400; GPU addresses in 1 free range. No
+  CONTEXT 0 FAULT, no GMU ERROR, no panic.
+
+**Milestone G3 is reached: Mesa draws a triangle on the Adreno 710**, OpenGL and OpenGL ES with
+shaders, checked against softpipe. Next is U2 (eagl/inject libraries), then K5 and U4
+(backboardd: ask first).
+
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
   CoreAnimation 60 Hz (before: frames paced 50 ms apart), but with sweetfb_hz=30 the panel still
