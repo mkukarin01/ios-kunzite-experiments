@@ -195,6 +195,34 @@ iOS** (log entry). shim/out/shim-boot-58c.img is the same with gpu_cached=1.
 6. the agent's in-memory `/put` (ask first);
 7. the tag-build cache scope in the CI workflow.
 
+**Scouted on #58 (2026-10-24 21:20): why Photos is blank, the wallpaper list is empty and assetsd /
+PosterBoard abort.** Not GPU work; it predates it. ReportCrash works on this port:
+/private/var/mobile/Library/Logs/CrashReporter has .ips reports (169 files). Copies are in the main
+repo's temp/ios-m8/crashes/.
+- **assetsd** (10+ reports, e.g. assetsd-1969-12-31-160233.000.ips):
+  - it threw an exception inside `-[PLLibraryServicesOperation _runOperationBlock:]`, from its own
+    code at offset 0x162f0;
+  - assetsd, copied off the phone and disassembled, loads **@"assetsd requires TCCPhotosService
+    access"** just before `objc_exception_throw`;
+  - so assetsd is denied Photos by TCC and throws. The Photos app's reports are `bug_type 509`
+    stackshots: it hangs waiting on assetsd. The wallpaper picker lists Photos, so it is empty.
+- assetsd's signature carries `com.apple.private.tcc.allow` = kTCCServicePhotos, kTCCServiceAddressBook
+  (ldid -e). tccd normally grants that from the entitlement alone.
+- TCC.db (copied with its -wal): 34 access rows (Liverpool, Motion, Ubiquity..., auth_reason 4/5),
+  **no Photos row**. tccd works; it only fails to honour assetsd's entitlement.
+  - [guess] It does not see it: how tccd reads a client's entitlements (csops / the audit token ->
+    CS_OPS_DER_ENTITLEMENTS_BLOB, or a platform-binary check) is answered by our AMFI stand-in.
+- **Next for it:**
+  - a small tool for the agent that calls `csops(pid, CS_OPS_STATUS)` and the entitlements-blob ops
+    for a running assetsd and for a daemon whose private entitlements do work: does the kernel hand
+    tccd the entitlements, and does it mark them platform?
+  - Workaround to try: an access row kTCCServicePhotos / com.apple.assetsd / auth_value 2. Edit
+    TCC.db only with tccd stopped, as it keeps a WAL.
+- **PosterBoard** (6 reports): `-[PBFHomeScreenPreviewImageBuilder _imageForView:]` builds an
+  NSDictionary with a nil object ("attempt to insert nil", via `dictionaryWithObjects:forKeys:count:`).
+  The home-screen preview image of a view comes back nil. [guess] It is the same Photos/wallpaper
+  chain (no poster image), or a view snapshot this port does not give; check again once assetsd lives.
+
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
 - **If it panics again: the same image with `gpu_cached=1` added** (cached buffers, like #57), and
