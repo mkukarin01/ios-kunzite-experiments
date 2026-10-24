@@ -1,0 +1,74 @@
+kunzite: the real cause of boot #56's panic, and write-combined RedwoodGPU buffers by default again.
+pmap_sync_page_attributes_phys() did flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), ...) with pp a
+32-bit ppnum_t: the shift ran in 32 bits, so a page above 4 GiB lost its top bits. #56's page
+0x1_60de0000 (page number 0x58378 with 16 KiB pages) became 0x60de0000, and flush_dcache's
+phystokv_range() panicked: "illegal PA 0x60de0000; phys base 0x90000000". It is reached whenever a
+page's cache attributes change from write-back (pmap_set_cache_attributes -> pmap_sync_wimg), e.g.
+for a write-combined IOBufferMemoryDescriptor. Apple's IO-coherent SoCs never flush here; this
+kernel does. Now ptoa(pp), which widens before it shifts. There is no "lower DDR bank": 0998's
+reading, and topaz's old note in RedwoodGPU, were this truncation. With it fixed, RedwoodGPU's
+buffers are write-combined by default again (0997's intent); gpu_cached=1 keeps them cached.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index dd2d1b6..e25fab5 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -14,10 +14,10 @@
+  * What there is of the interface is what freedreno uses to draw: parameters, buffers (made,
+  * told their address in the GPU's address space, mapped, given back), submission of command
+  * buffers, and waiting for one to be done. A buffer is wired kernel memory entered into the 3D
+- * core's SMMU context; it is zero when made, and ordinary cached memory, pushed out of the cache
+- * whenever the GPU is given something to do (see submit()); boot-arg gpu_cached=0 makes it
+- * write-combined, as Linux maps them for freedreno, where the kernel can change its pages' cache
+- * attributes (see RedwoodGPUStart).
++ * core's SMMU context; it is zero when made, and write-combined: what the program writes goes to
++ * memory, where the GPU reads it, and not into this processor's cache (as Linux maps them for
++ * freedreno; boot-arg gpu_cached=1 makes them ordinary memory, pushed out of the cache whenever
++ * the GPU is given something to do: see submit()).
+  *
+  * One request is not Linux's: a buffer that is the memory of an IOSurface (surfaceBuffer()), for
+  * drawing into what the display shows and for reading pictures where other programs have drawn
+@@ -325,16 +325,16 @@ RedwoodGPUStart(void)
+ 	uint32_t cached = 0;
+ 
+ 	/*
+-	 * Translated: buffers are ordinary cached memory, pushed out of the cache whenever the GPU is
+-	 * given something to do (submit()); gpu_cached=0 asks for write-combined. Not by default: a
+-	 * write-combined IOBMD has its pages' cache attributes changed (mach_make_memory_entry ->
+-	 * pmap_set_cache_attributes), which goes through the kernel's physical aperture, and that
+-	 * covers 0x90000000 + 6 GB only, while the allocator also hands out pages below it, of the
+-	 * lower DDR bank: kunzite boot #56 panicked at its first buffer, "phystokv_range: illegal PA
+-	 * 0x60de0000; phys base 0x90000000" (topaz's old note here: "from the lower DDR bank the kernel
+-	 * cannot map back"). Identity: pool memory is write-combined already.
++	 * Buffers are write-combined by default, as Linux's msm gives freedreno: nothing of the
++	 * program's to push out of the cache at each submission, and what the GPU writes is what the
++	 * CPU reads. gpu_cached=1 makes them ordinary cached memory. Making a buffer write-combined has
++	 * each of its pages flushed by physical address (pmap_sync_wimg ->
++	 * pmap_sync_page_attributes_phys), and that shifted the page number in 32 bits: kunzite boot
++	 * #56 panicked at its first buffer on page 0x1_60de0000 taken for 0x60de0000 ("phystokv_range:
++	 * illegal PA"). Fixed in pmap.c by the same patch; topaz's old note here ("from the lower DDR
++	 * bank the kernel cannot map back") was most likely that panic too.
+ 	 */
+-	cached = redwood_gpu_identity() ? 0 : 1;
++	cached = 0;
+ 	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
+ 	gGPUCached = cached != 0;
+ 	gGPULock = IOLockAlloc();
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index c240258..75366a1 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,12 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * SWEET (kunzite boot #56): ptoa(), not pp << PAGE_SHIFT, which shifts the 32-bit page number in
++	 * 32 bits: a page above 4 GiB (0x1_60de0000) became 0x60de0000, and flush_dcache's
++	 * phystokv_range() panicked on it. Apple's coherent SoCs never flush here; this kernel does.
++	 */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP

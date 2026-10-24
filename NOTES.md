@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #57 (0998), 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 0999 (the real write-combine fix), 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -179,9 +179,34 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
   - old or garbage pixels: F6 coherency, or the deferred `gpu_cached=0`;
   - wrong blending: framebuffer fetch, the open GMEM-range question below.
 
-**Next: the user's choice from the deferred list.** Boot #57 is the current good state: shim/out/
-shim-boot-57.img, CI kernel 887472f9 with 0998, cmdline #54's. Write-combined buffers need the
-lower bank's pages kept out of them, or a physical-aperture mapping for that bank (deferred).
+**0999 written: #56's panic was a 32-bit shift, not a "lower DDR bank".** In
+`pmap_sync_page_attributes_phys`, `pp << PAGE_SHIFT` with a 32-bit page number turned page 0x1_60de0000
+into 0x60de0000. 0999 uses `ptoa(pp)` and makes write-combined buffers the default again (log entry
+"0999"). Boot #57 (CI 887472f9, 0998, cached buffers) is the last good state.
+
+**Next - boot #58 (the user pushes and tags 0999, CI builds).**
+- Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
+- **If it panics again: the same image with `gpu_cached=1` added** (cached buffers, like #57), and
+  the panic's backtrace symbolized with `xcrun atos -o xnu/out/xnu-kernel/kernel.development.sweet
+  -arch arm64e -l 0 <lr...>`.
+- Expect:
+  - backboardd on the GPU;
+  - eagl-check passing (`/run?a=/tmp/eagl-check&a=/topaz/lib`);
+  - RedwoodGPU's statistics line ("N submissions in M ms: ... KB out of the cache") dropping from
+    #57's 12-22 MB per line to only the surfaces' pushes;
+  - the user's look.
+
+**Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
+```
+cd ios/ios-topaz-experiments && python3 tools/udp-log.py ../../temp/ios-m8/usblog/live-bootNN-long.txt
+```
+and in a second terminal, the failures and the 60 s keep reports (fence N of N, free GPU ranges):
+```
+tail -F temp/ios-m8/usblog/live-bootNN-long.txt | grep -E --line-buffered 'CONTEXT 0 FAULT|GMU ERROR|panic\(|CRASH (backboardd|SpringBoard)|RedwoodGPU: no memory|kept [0-9]+ s: gmu2host'
+```
+- Good: every "kept N s" line has "fence X of X" (both equal) and no other lines.
+- Bad: a fault, a GMU ERROR, a fence that stops moving while the UI is used, or free ranges that
+  climb without end.
 - Old plan for #56, valid for #57 minus write-combining. Cmdline: #54's (standard + `sweetusb=2
   kgpu=21 kgpu_keep=1`).
 - Check, in order:
@@ -1815,6 +1840,26 @@ gpu_cached=1, was never booted.)
 - The user: tag-triggered CI runs take about 8 min against 4-5 for manual runs. [guess] GitHub's
   cache is scoped by ref, and a tag run cannot restore caches saved on the branch, so every tag
   build starts cold.
+
+**0999 `0999-kunzite-pmap-wimg-flush-64bit.patch` (2026-10-24, written; not built by CI yet).**
+- Following #56's panic down: `pmap_set_cache_attributes_priv` returns early for unmanaged pages
+  (`!pa_valid`), and `vm_first_phys = gPhysBase` = 0x90000000, so 0x60de0000 could not be a page
+  it was given.
+- On a change from write-back, `pmap_sync_wimg` calls `pmap_sync_page_attributes_phys(pn)`, which
+  did `flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE)` with `pp` a 32-bit
+  `ppnum_t`. 0x58378 << 14 in 32 bits is 0x60de0000; the page was 0x1_60de0000, inside the
+  aperture. caches.c's `flush_dcache` (phys) then panics in `phystokv_range`.
+- Apple's coherent SoCs never flush there; this kernel does.
+- No other `pp/pn << PAGE_SHIFT` in osfmk/arm or osfmk/arm64. `ptoa(x)` is `((vm_address_t)(x) <<
+  PAGE_SHIFT)`, and pmap.c already uses it on page numbers.
+- 0999:
+  - uses `ptoa(pp)` there;
+  - makes RedwoodGPU's buffers write-combined by default again (`gpu_cached=1` for cached);
+  - **0998's "lower DDR bank" reading, and topaz's old note, were this truncation.**
+- Checked:
+  - RedwoodGPU.cpp compiled with CI's line, 0 warnings;
+  - pmap.c not compiled locally (no CI compile line for osfmk at hand): a one-macro change;
+  - replay: 245 applied, the 4 usual skips.
   - **Left on the phone before the park:** /topaz/sb3 present; the inject with the second source installed
     (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
     for the old behaviour (Settings blocky, Safari black).
