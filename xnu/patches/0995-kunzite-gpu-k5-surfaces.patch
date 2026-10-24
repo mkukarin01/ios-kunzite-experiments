@@ -1,0 +1,140 @@
+kunzite: Adreno 710, glue plan K5-min (main repo ios/gpu-glue-plan.md 3.1, 4): surfaces for the
+GPU path. SweetSurface's three raw `gpu` boot-arg reads become the hardware layer's answers:
+redwood_gpu_on() (the GPU path runs this boot: topaz gpu=1, kunzite keep mode) and
+redwood_gpu_identity() (GPU addresses are physical). Scanout slots (S1) are off whenever the GPU
+path runs; the 64 guard rows (S5a) come with redwood_gpu_on(), since RedwoodGPU's translated
+import takes no surface without them; the GPU pool (S2), the 12 MB reserves (S5b, and
+sweet_res_give, S6) and contiguous memory (S5c) only when both answer true, so never on kunzite,
+where the SMMU translates and 0x90000000 is the modem's. The presenter's copy (F6): a surface
+the GPU drew (drawn != 0, not pool memory) whose last submission is done gets its rows cleaned and
+invalidated (sweet_dcache_flush, dc civac) before the memcpy, so no line the CPU held from before
+is copied as old pixels. Left for later: RedwoodGPU's wrapDelta, read-only client memory and
+gpu_cached=0 (glue plan 3.2). Test: comes with U4 (kgpu=21 kgpu_keep=1, backboardd on the GPU);
+without GPU boot-args nothing changes.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cf4ddf6..9537838 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -93,6 +93,7 @@ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);  /* (dc civac) */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+@@ -1378,7 +1379,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+-		(void)topaz_surface_drawn(s, 100);
++		/* (drawn by the GPU: true once its last submission naming the surface is done, or 100 ms) */
++		bool gpuDrawn = s->drawn != 0 && !s->gpuPool;
++		gpuDrawn = topaz_surface_drawn(s, 100) && gpuDrawn;
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -1423,6 +1426,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			/*
++			 * kunzite (glue plan K5, F6): the surface is cached memory the GPU wrote behind the CPU's
++			 * cache; a line the CPU still holds from before would be copied as old pixels. Clean and
++			 * invalidate the rows about to be copied (clean too, so a line the CPU wrote since is not
++			 * thrown away). Pool memory (topaz) is write-combined: nothing to do.
++			 */
++			if (gpuDrawn) {
++				uint64_t first = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++				sweet_dcache_flush(src + first, (unsigned)(last - first));
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e17297a..b765ca2 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -50,6 +50,20 @@
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++/*
++ * The GPU's hardware layer: does this boot run the GPU path (topaz: gpu=1; kunzite: keep mode,
++ * bsd/dev/kunzite_adreno.c), and is a GPU address the physical one (topaz's pass-through SMMU)?
++ * kunzite translates: guard rows yes; pool, reserves and contiguous memory no.
++ */
++extern "C" bool redwood_gpu_on(void);
++extern "C" bool redwood_gpu_identity(void);
++
++/* the GPU reads surfaces by physical address: pool, 12 MB reserves and contiguous memory */
++static bool
++sweet_gpu_physical(void)
++{
++	return redwood_gpu_on() && redwood_gpu_identity();
++}
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -139,10 +153,10 @@ sweet_scanout_eligible(const SweetSurface *s)
+ 		/*
+ 		 * topaz GPU: with gpu=1 the window server's frames come from the GPU pool; the scanout slots
+ 		 * (cached CPU memory below 4 GiB) would be handed to the GPU as they are, which reads DRAM
+-		 * behind the CPU's cache: applications' pixels came out as garbage (text, images).
++		 * behind the CPU's cache: applications' pixels came out as garbage (text, images). Off
++		 * whenever the GPU path runs (kunzite: they only serve the MDP's direct present, unused).
+ 		 */
+-		uint32_t gpu = 0;
+-		if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
++		if (redwood_gpu_on()) {
+ 			on = 0;
+ 		}
+ 		sweet_scanout_enabled = on;
+@@ -231,7 +245,8 @@ sweet_res_give(IOMemoryDescriptor *md)
+ 	IOBufferMemoryDescriptor *mem = OSDynamicCast(IOBufferMemoryDescriptor, md);
+ 	bool kept = false;
+ 
+-	if (mem == NULL || mem->getCapacity() != SWEET_RES_SIZE) {
++	/* (only with the reserves: otherwise a stray 12 MB surface would wait here for ever) */
++	if (mem == NULL || mem->getCapacity() != SWEET_RES_SIZE || !sweet_gpu_physical()) {
+ 		return false;
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+@@ -494,8 +509,7 @@ sweet_gpu_pool_eligible(const SweetSurface *s)
+ {
+ 	static int gpu = -1;
+ 	if (gpu < 0) {
+-		uint32_t on = 0;
+-		gpu = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
++		gpu = sweet_gpu_physical();     /* (kunzite: off, 0x90000000 is the modem's there) */
+ 		uint32_t pool = 1;
+ 		if (PE_parse_boot_argn("gpu_fbpool", &pool, sizeof(pool)) && pool == 0) {
+ 			gpu = 0;
+@@ -1069,11 +1083,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			static int gpu_low = -1;        /* boot-arg gpu=1: surfaces the Adreno draws into stay below 4 GiB */
+-			if (gpu_low < 0) {
+-				uint32_t on = 0;
+-				gpu_low = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
+-			}
++			bool gpu_low = sweet_gpu_physical();    /* topaz gpu=1: surfaces the Adreno draws into stay below 4 GiB */
++			bool gpu_rows = redwood_gpu_on();       /* the GPU path, both: the guard rows below */
+ 			/*
+ 			 * gpu=1: physically contiguous memory (up to 16 MB: a full screen, 1125x2436, is 11 MB), so that the Adreno, whose
+ 			 * addresses are physical with the SMMU in pass-through, reads the surface where it
+@@ -1083,9 +1094,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			/*
+ 			 * gpu=1: 64 rows more than the picture, as for the pool's screens: the GPU writes whole
+ 			 * tiles, and the rows past the height (2436 is no multiple of a tile) went into whatever
+-			 * pages came next. (The descriptor keeps them: RedwoodGPU gives them to the GPU.)
++			 * pages came next. (The descriptor keeps them: RedwoodGPU gives them to the GPU, and with a
++			 * translating SMMU it imports no surface without them.)
+ 			 */
+-			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
++			uint64_t take = gpu_rows ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
+ 			if (gpu_low) {
+ 				sweet_res_fill();
+ 				if (s->width >= 1000 && s->height >= 2000 && s->bytesPerElement == 4) {

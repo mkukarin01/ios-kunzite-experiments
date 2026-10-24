@@ -1,48 +1,45 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: U3, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: K5-min, 2026-10-24) <<<
 
-**Where things stand.** Branch `kunzite-topaz-gpu`, 236 patches, last kernel patch 0994. Glue
-milestones G1-G3 reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7
-(freedreno FD710) draws through it (boot #52). Last booted kernel: the CI build after 91ef60f
-(sha256 74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
+**Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
+(K5-min, written and checked, not built by CI yet: the user pushes)**. Glue milestones G1-G3
+reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7 (freedreno FD710)
+draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha256
+74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
 `ios/gpu-glue-plan.md`:
 - §3.1 is R1's gate table, i.e. what K5 edits, with line numbers in the series' files;
 - §3.5 and §3.6 hold the facts U2 and U4 need;
 - §4-§7 give the steps and their order.
 The log of K0-U3 is the handoff below this section.
 
-**Order from here:** K5-min -> U2 -> boot #53 (K5 kernel + U2 libraries + U4 into backboardd, in
-one boot) -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+**Order from here:** ~~K5-min~~ (done, 0995) -> U2 (while CI builds 0995) -> boot #53 (K5 kernel
++ U2 libraries + U4 into backboardd, in one boot) -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
-**Step 1 - K5-min, patch 0995 (kernel; CI; no boot of its own).**
-- `redwood_gpu_on()` exists already (0991: kgpu_keep != 0 and kgpu >= 21, read from the
-  boot-args, so it is settled before the first surface). Nothing to add in kunzite_adreno.c.
-- SweetSurface.cpp (§3.1 rows S2-S6): replace the raw `gpu` boot-arg reads.
-  - S2 (pool) keys on `redwood_gpu_on() && redwood_gpu_identity()`, so it is off here.
-  - S5a (+64 guard rows) keys on `redwood_gpu_on()`, so it is on.
-  - S5b (12 MB reserves) and S5c (contiguous, 36-bit) key on `redwood_gpu_identity()`, so
-    they are off.
-  - S6: `sweet_res_give` only when S5b is on.
-  - TopazAdreno.cpp is not built here. If this goes upstream, it needs a `redwood_gpu_on` that
-    answers `gpu=1`, so topaz keeps its behaviour.
-- SweetFramebuffer.cpp, F6 (the copy path: `topaz_surface_drawn(s, 100)` then `memcpy` from
-  `kernelAddress()`): when `s->drawn != 0` and the wait succeeded, `sweet_dcache_flush`
-  (`dc civac`) over the rows about to be copied, before the memcpy.
-- Left out on purpose, to the deferred list: RedwoodGPU's wrapDelta, `MSM_BO_GPU_READONLY`,
-  and `gpu_cached=0` as the default (§3.2, R2).
-- How to work:
-  - get the files as the series makes them:
-    `temp/ios-m8/series-check/replay.sh xnu/patches <outtree>` (main repo temp/);
-  - write 0995 against them; replay again. Expected skips: TrustCache, iobuffermemd_monterey,
-    skywalk_sonoma, syntax_checker_sonoma;
-  - compile the two files with CI's exact lines from the last job log (xnu/out/job-logs.txt),
-    rebuilt locally against temp/ios-m8/buildtree headers;
-  - commit. The user pushes, and CI builds.
-- Done when CI links.
+**Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
+- SweetSurface.cpp: `sweet_gpu_physical()` = `redwood_gpu_on() && redwood_gpu_identity()`.
+  - Scanout slots (S1) are off when `redwood_gpu_on()`.
+  - The 64 guard rows (S5a) come with `redwood_gpu_on()`.
+  - The pool (S2), the reserves (S5b, and `sweet_res_give`, S6) and contiguous memory (S5c)
+    come only with `sweet_gpu_physical()`, which is never true on kunzite.
+- SweetFramebuffer.cpp `AppleCLCD::present`, the copy loop:
+  - `gpuDrawn` = `s->drawn != 0 && !s->gpuPool` and the 100 ms wait succeeded;
+  - when it is set, `sweet_dcache_flush(src + first, last - first)` runs over the copied rows
+    before the memcpy.
+- Checked:
+  - replay with 241 applied and only the 4 expected skips;
+  - both files compiled with CI's lines with 0 warnings;
+  - the new undefined symbols (`_redwood_gpu_on`, `_redwood_gpu_identity`,
+    `_sweet_dcache_flush`) are all defined in the current CI kernel.
+- **Still open:** CI must link it; with no GPU boot-args nothing changes (#53 shows both).
+- **How to redo such a check:**
+  - `bash temp/ios-m8/series-check/replay.sh <fork>/xnu/patches <tree>` (main repo);
+  - `bash temp/ios-m8/series-check/ci-cxx.sh <tree>/iokit/Kernel/arm/X.cpp out.o` (or
+    `ci-cc.sh` for bsd/ C). These are CI's compile lines against temp/ios-m8/buildtree;
+  - `xcrun nm -u` on the object, against `xcrun nm` of xnu/out/xnu-kernel/kernel.development.sweet.
 
-**Step 2 - U2: `userland/gpu/mk-topaz-gl.sh` (Mac only), modelled on mk-gl-triangle.sh and
+**Step 1 - U2: `userland/gpu/mk-topaz-gl.sh` (Mac only), modelled on mk-gl-triangle.sh and
 HackiOS `userland/build.sh` :293 and :345-348** (main repo
 temp/kunzite-research/hackios-xnu-userland/userland/).
 - `mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt eagl.c > out/eagl_gen.h`:
@@ -61,7 +58,7 @@ temp/kunzite-research/hackios-xnu-userland/userland/).
 - Optional phone check before U4: HackiOS `src/gl_test.c` (EAGL without backboardd) over the
   agent.
 
-**Step 3 - boot #53: K5 + U4 (replacing a system file: the user's OK first).**
+**Step 2 - boot #53: K5 + U4 (replacing a system file: the user's OK first).**
 - Cmdline: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
   - No `kgpu_keep_s`: the GPU is kept until reboot, and reboot runs the undo through
     `kunzite_adreno_shutdown`.
@@ -1351,6 +1348,25 @@ Log: temp/ios-m8/usblog/live-boot52-20261024-1338.txt.
 **Milestone G3 is reached: Mesa draws a triangle on the Adreno 710**, OpenGL and OpenGL ES with
 shaders, checked against softpipe. Next is U2 (eagl/inject libraries), then K5 and U4
 (backboardd: ask first).
+
+**K5-min = 0995 `0995-kunzite-gpu-k5-surfaces.patch` (2026-10-24; written, not built by CI yet).**
+The plan was re-aligned after G3: K5 is cut to the SweetSurface gates and F6, and its R2 part
+moves after G4.
+- SweetSurface's three raw `gpu` boot-arg reads now ask the hardware layer.
+  - Scanout slots are off with `redwood_gpu_on()`.
+  - The 64 guard rows come with `redwood_gpu_on()`.
+  - The pool, the 12 MB reserves (`sweet_res_give` too) and contiguous memory come only with
+    `redwood_gpu_on() && redwood_gpu_identity()`, which is never true here.
+- The presenter's copy runs `dc civac` over the rows of a GPU-drawn surface (drawn != 0, not
+  pool, the wait done) before the memcpy.
+- Checked:
+  - replay: 241 applied, skips TrustCache, iobuffermemd_monterey, skywalk_sonoma,
+    syntax_checker_sonoma;
+  - SweetSurface.cpp and SweetFramebuffer.cpp built with CI's lines: 0 warnings, 0 errors;
+  - new undefined symbols `_redwood_gpu_on`, `_redwood_gpu_identity`, `_sweet_dcache_flush`, all
+    in the CI kernel after 91ef60f.
+- [guess] Cost: the flush walks every 64-byte line of the copied rows, about 10 MB for a full
+  screen, each frame the GPU drew. Measure it on #53 before blaming it for frame time.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
