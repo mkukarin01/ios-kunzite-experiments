@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #56's panic and 0998, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #57 (0998), 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -41,9 +41,10 @@ The log of K0-U3 is the handoff below this section.
 U4 way 1~~ (done) -> **~~G4~~ (reached)** -> ~~the user's wider look~~ (done) -> **boot #54: 0996
 + the waiting wrapper** (the UI starts on the GPU by itself; the logo gauge) -> the deferred list
 **Boot #56 (0997) panicked at backboardd's first GPU buffer: write-combined IOBMDs cannot be made
-from the lower DDR bank's pages** (log entry). 0998 makes buffers cached by default again; until it
-is built, `gpu_cached=1` in the cmdline does the same (shim/out/shim-boot-57.img has it). 0997's
-other changes (push at creation, wrapDelta, read-only client memory) stay. The keyboard blur (`sb3`) is parked
+from the lower DDR bank's pages** (log entry). **0998 (cached by default again) is in CI's kernel
+887472f9 (tag xnu-boot-57): boot #57 is up, with the UI on the GPU and eagl-check passing** (log
+entry). `gpu_cached=1` is no longer needed. 0997's other changes (push at creation, wrapDelta,
+read-only client memory) are in; no visible check of those yet. The keyboard blur (`sb3`) is parked
 with /topaz/sb3 on and the plain four-tap source: Settings' keyboard right, Safari's black (boot
 #55 entry).
 **Boot #54 done (entry in the log): the GPU was kept about 33 s after `fastboot boot` (#53: 3 min
@@ -178,9 +179,9 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
   - old or garbage pixels: F6 coherency, or the deferred `gpu_cached=0`;
   - wrong blending: framebuffer fetch, the open GMEM-range question below.
 
-**Next - boot #57: #56's kernel (0997) + `gpu_cached=1`** (shim/out/shim-boot-57.img, built), then
-the CI kernel with 0998 without the boot-arg. Write-combined buffers need the lower bank's pages kept
-out of them, or given a physical-aperture mapping (deferred).
+**Next: the user's choice from the deferred list.** Boot #57 is the current good state: shim/out/
+shim-boot-57.img, CI kernel 887472f9 with 0998, cmdline #54's. Write-combined buffers need the
+lower bank's pages kept out of them, or a physical-aperture mapping for that bank (deferred).
 - Old plan for #56, valid for #57 minus write-combining. Cmdline: #54's (standard + `sweetusb=2
   kgpu=21 kgpu_keep=1`).
 - Check, in order:
@@ -1796,6 +1797,24 @@ origin 50c3831 = 0997 + the user's xnu.yml change (CI now on tags), cmdline #54'
 - 0998 (RedwoodGPU cached by default again) is written: compiled with CI's line (0 warnings),
   replay 244 applied, 4 usual skips. `gpu_cached=1` does the same on #56's kernel:
   shim/out/shim-boot-57.img.
+
+**BOOT #57 (2026-10-24 20:49:35, shim/out/shim-boot-57.img rebuilt for CI kernel sha256 887472f9...
+with 0998, tag xnu-boot-57 on 9a90a5d; cmdline #54's, no gpu_cached).** Log:
+temp/ios-m8/usblog/live-boot57-20261024-2049.txt. (The image first built as #57, #56's kernel with
+gpu_cached=1, was never booted.)
+- 0998 is in the kernel: `RedwoodGPUStart` calls `_redwood_gpu_identity` again (0997's `cached = 0`
+  made no call; llvm-objdump).
+- backboardd on the GPU at 20:50:12 ("open 1", the FD710 context), past where #56 panicked. The agent
+  answered at 20:50:16.
+- eagl-check from /topaz/lib (`/run?a=/tmp/eagl-check&a=/topaz/lib`): FD710, 20808 pixels, 0
+  missing, 0 outside, 100 frames 66.2 ms, "THE TABLE WORKS" (0 failed).
+- RedwoodGPU's first statistics line: "7 submissions in 7229 ms: ... 22390 KB out of the cache in 886
+  us a submission". Cached mode, the same order as #55 (21381 KB, 900 us).
+- No CONTEXT 0 FAULT and no panic.
+- /tmp on this phone keeps its files across boots: /tmp/libOSMesa.8.dylib from #53 was still there.
+- The user: tag-triggered CI runs take about 8 min against 4-5 for manual runs. [guess] GitHub's
+  cache is scoped by ref, and a tag run cannot restore caches saved on the branch, so every tag
+  build starts cold.
   - **Left on the phone before the park:** /topaz/sb3 present; the inject with the second source installed
     (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
     for the old behaviour (Settings blocky, Safari black).
