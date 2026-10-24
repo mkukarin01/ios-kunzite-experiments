@@ -30,15 +30,14 @@ written on the phone). Fork commit from it: **a9df00f `userland/mesa/fd710-backp
 It was checked by generating the table and applying it with the other two Mesa patches, not built
 (no meson or mako on the Mac yet). Findings that touch this branch:
 - **hbb is 14 here, not 15.** kgsl uses 14 when the FDT's `ddr_device_type` is 7 (LPDDR4X), and
-  the live FDT says 7. The probe's step 20 table (0985) writes hbb 15 values: RB_NC_MODE_CNTL
-  0x814 etc. K1 and step 20 should use 0x812 / 0x2 / 0x22 / 0x20 / 0x200000. Harmless so far
-  (the fills were linear).
+  the live FDT says 7. 0985 wrote hbb 15 values; 0990 (K0) changes step 20 to 0x812 / 0x2 /
+  0x22 / 0x20 / 0x200000. Harmless so far (the fills were linear).
 - UCHE_GMEM_RANGE_MIN/MAX read 0 on #41, and they matter: CoreAnimation reads the framebuffer
   (freedreno-darwin.patch). K1 reads them again.
 
-**Next:** glue plan K0, the build split: two lines out of iokit/conf/files.arm64, and 22
-symbols from kunzite_adreno.c (list in the plan's §3.7). Then K1, keep mode. Each is a patch
-and a boot.
+**Next:** glue plan K0 is written as **0990** (build split, interface stubs, step 20 with hbb 14:
+entry below boot #45), not built or booted. Push, CI, then two boots: no GPU boot-args, then
+`kgpu=22`. After that, K1: keep mode.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -808,6 +807,29 @@ RSC/PDC words back, GMU memory and tables freed, stream 5 unrouted, CB1 off, clo
 0x22f001, GX GDSC 0x222801; "run over"; no panic, agent up. **K1 and K2 of the port map are
 proven on kunzite: from a powered-off GPU, under Gunyah, to a picture drawn by the Adreno 710
 on the panel and everything taken back down.**
+
+**GLUE K0 = 0990 (2026-10-24, written, NOT built/booted): topaz's A610 driver out of the build,
+the hardware interface from kunzite_adreno.c, step 20 with hbb 14.** Main repo
+ios/gpu-glue-plan.md 3.7. `iokit/conf/files.arm64` drops TopazAdreno.cpp and TopazAdrenoFw.cpp
+(sources kept, unbuilt). kunzite_adreno.c defines the 21 functions RedwoodGPU.cpp,
+SweetSurface.cpp and SweetFramebuffer.cpp took from them, by their C names (the #45 kernel's
+nm shows them unmangled), plus `redwood_gpu_on()` for K5. All are safe stubs until K1-K4:
+never ready (so RedwoodGPU's user client does not start and RedwoodGPUStart() is not
+called), identity false, no pool; `redwood_gpu_to_memory` is real (dc civac, dsb).
+`topaz_adreno_init()` only prints a line for `gpu=1`, which now starts no driver. Keep `gpu=1`
+off anyway: SweetSurface still takes contiguous memory and 120 MB of reserves for it, until K5.
+The probe no longer refuses `gpu=1`. Step 20: hbb 14 as kgsl on LPDDR4X (FDT
+`ddr_device_type = <0x07>`): RB_NC_MODE_CNTL 0x812, TPL1 0x2, SP 0x22, GRAS 0x20,
+UCHE_MODE_CNTL 0x200000 (were the hbb 15 values). Verified:
+- the series replays in CI's order (temp/ios-m8/series-check/replay.sh: 236 applied, the four
+  known skips) and reproduces both files byte for byte; nothing else in the tree changes;
+- no build list, Makefile or exports file names TopazAdreno;
+- kcc.sh: 0 diagnostics; with -Wextra -Wmissing-prototypes the same 4 warnings as before;
+- the object defines all 22 symbols.
+
+Series: 232 patches. **Test:** a boot without GPU boot-args (as #24, nothing GPU-related in
+the log), then `kgpu=22` (as #45: 22 of 22, undo clean; step 20's write lines show the new
+values). On the Mac: `nm` of the kernel has no `_topaz_fw_sqe_fw` and has `_redwood_gpu_ready`.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

@@ -1,0 +1,297 @@
+kunzite: Adreno 710, glue plan K0 (main repo ios/gpu-glue-plan.md 3.7): topaz's A610 driver out of
+the build, the hardware interface from kunzite_adreno.c, and step 20's gen7_start with hbb 14.
+iokit/conf/files.arm64 no longer lists TopazAdreno.cpp and TopazAdrenoFw.cpp (the sources stay,
+unbuilt; their A610 zap and A630 SQE arrays, about 41 KB, go with them). kunzite_adreno.c defines,
+by their C names, the 21 functions RedwoodGPU.cpp, SweetSurface.cpp and SweetFramebuffer.cpp took
+from TopazAdreno.cpp, plus redwood_gpu_on() for K5: the SMMU translates (identity false), no GPU
+pool (alloc 0, md NULL), never ready until keep mode (K1), so RedwoodGPU's user client does not
+start and RedwoodGPUStart() is not called; redwood_gpu_to_memory is the real thing (dc civac,
+dsb); topaz_adreno_init() (AppleCLCD::start) only says that gpu=1 has no driver now. The probe
+no longer refuses gpu=1. Step 20 programs hbb 14 instead of gen7_3_0's 15, as kgsl gen7_init does
+on LPDDR4X (of_fdt_get_ddrtype() == 7; the live FDT's /memory has ddr_device_type = <0x07>):
+RB_NC_MODE_CNTL 0x814 -> 0x812, TPL1_NC_MODE_CNTL 0x4 -> 0x2, SP_NC_MODE_CNTL 0x24 -> 0x22,
+GRAS_NC_MODE_CNTL 0x40 -> 0x20, UCHE_MODE_CNTL 0x400000 -> 0x200000 (boot #45's fills were
+linear, so nothing seen depended on it). Test: boots as before without GPU boot-args; kgpu=22
+passes as on boot #45; nm has no _topaz_fw_sqe_fw and has _redwood_gpu_ready.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 3b7b812..f8849ac 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -16,7 +16,7 @@
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+  * hypervisor does not like resets the SoC), the line has reached the USB
+  * log and the persistent log. A step that does not find what the next one
+- * needs ends the run. Never together with gpu=1 (topaz's A610 driver).
++ * needs ends the run.
+  *
+  *  1  GCC (gcc-parrot.c): GPU_CFG_AHB 0x81004 (Linux keeps it on; GPU_CC is
+  *     only readable with it), MEMNOC_GFX 0x81010, SNOC_DVM_GFX 0x81018, the
+@@ -125,6 +125,10 @@
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+  * nothing of the GPU block outlives the run.
++ *
++ * At the end of the file: the hardware interface RedwoodGPU.cpp, SweetSurface.cpp
++ * and SweetFramebuffer.cpp call (redwood_gpu_*, topaz_gpu_*, topaz_adreno_init),
++ * in place of topaz's A610 driver TopazAdreno.cpp, which kunzite does not build.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -2778,7 +2782,11 @@ struct kg_reg {
+ 	uint32_t reg, val;
+ };
+ 
+-/* gen7_start for gen7_3_0, the plain writes in its order (hbb 15: lo 2, hi 0; mal 32; UBWC 4.0; no_cb family) */
++/*
++ * gen7_start for gen7_3_0, the plain writes in its order (hbb 14: lo 1, hi 0; mal 32; UBWC 4.0;
++ * no_cb family). hbb: gen7_3_0's 15, but kgsl gen7_init makes it 14 when of_fdt_get_ddrtype() is 7
++ * (LPDDR4X), and the FDT's /memory says ddr_device_type = <0x07> here.
++ */
+ static const struct kg_reg kg_gen7_start_regs[] = {
+ 	{ 0x0011, 0x00000003 },         /* RBBM_GBIF_CLIENT_QOS_CNTL (gen7_3_0) */
+ 	{ 0x0e3a, 0x010240e0 },         /* UCHE_GBIF_GX_CONFIG */
+@@ -2793,11 +2801,11 @@ static const struct kg_reg kg_gen7_start_regs[] = {
+ 	{ 0x0e0e, 0x00000000 },
+ 	{ 0x0e17, 0x00800000 },         /* UCHE_CACHE_WAYS */
+ 	{ 0x0e3c, 0x0006690e },         /* UCHE_CMDQ_CONFIG */
+-	{ 0x8e08, 0x00000814 },         /* RB_NC_MODE_CNTL: rgb565 predicator, AMSBC, hbb_lo */
+-	{ 0xb604, 0x00000004 },         /* TPL1_NC_MODE_CNTL */
+-	{ 0xae02, 0x00000024 },         /* SP_NC_MODE_CNTL */
+-	{ 0x8602, 0x00000040 },         /* GRAS_NC_MODE_CNTL (no BR/BV apertures) */
+-	{ 0x0e01, 0x00400000 },         /* UCHE_MODE_CNTL */
++	{ 0x8e08, 0x00000812 },         /* RB_NC_MODE_CNTL: rgb565 predicator, AMSBC, hbb_lo */
++	{ 0xb604, 0x00000002 },         /* TPL1_NC_MODE_CNTL */
++	{ 0xae02, 0x00000022 },         /* SP_NC_MODE_CNTL */
++	{ 0x8602, 0x00000020 },         /* GRAS_NC_MODE_CNTL (no BR/BV apertures) */
++	{ 0x0e01, 0x00200000 },         /* UCHE_MODE_CNTL */
+ 	{ 0x001f, 0x40cfffff },         /* RBBM_INTERFACE_HANG_INT_CNTL: hang_detect_cycles 0xcfffff */
+ 	{ 0x0e19, 0x00000081 },         /* UCHE_CLIENT_PF: uche_client_pf 1 */
+ };
+@@ -3472,17 +3480,13 @@ kg_thread(void *arg, wait_result_t result)
+ void
+ kunzite_adreno_init(void)
+ {
+-	int last = 0, delay_s = 60, pause_ms = 1500, hold_s = 5, gpu = 0;
++	int last = 0, delay_s = 60, pause_ms = 1500, hold_s = 5;
+ 	thread_t thread;
+ 
+ 	if (kg.started || !PE_parse_boot_argn("kgpu", &last, sizeof(last)) || last <= 0) {
+ 		return;
+ 	}
+ 	kg.started = true;
+-	if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
+-		printf("SWEET KGPU: not with gpu=%d (topaz's A610 driver); off\n", gpu);
+-		return;
+-	}
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+@@ -3501,4 +3505,194 @@ kunzite_adreno_init(void)
+ 		printf("SWEET KGPU: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++/*
++ * ---- the hardware interface, in place of TopazAdreno.cpp ----
++ *
++ * RedwoodGPU.cpp (the msm DRM user client Mesa talks to), SweetSurface.cpp and
++ * SweetFramebuffer.cpp call these by their C names (extern "C" there). Topaz's
++ * A610 driver, TopazAdreno.cpp and its firmware TopazAdrenoFw.cpp, is not built
++ * for kunzite (iokit/conf/files.arm64); this is its place (main repo
++ * ios/gpu-glue-plan.md 3.2, 3.7). Here the SMMU translates: no identity mode, and no
++ * GPU pool below 4 GiB (0x90000000 is the modem's carveout). Until keep mode
++ * (glue plan K1) holds the GPU up, it is never ready: RedwoodGPU's user client
++ * does not start and RedwoodGPUStart() is not called, so nothing below that
++ * needs a running GPU is reached yet.
++ */
++bool redwood_gpu_on(void);
++bool redwood_gpu_identity(void);
++bool topaz_gpu_midmem(void);
++uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++void *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
++bool redwood_gpu_ready(void);
++bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t redwood_gpu_address(uint64_t size);
++void redwood_gpu_address_free(uint64_t address, uint64_t size);
++bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void redwood_gpu_mapped(void);
++void redwood_gpu_unmap(uint64_t address, uint64_t size);
++void redwood_gpu_to_memory(void *start, uint64_t size);
++uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool redwood_gpu_done(uint32_t fence);
++uint32_t redwood_gpu_last(void);
++void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void redwood_gpu_report(const char *why);
++void redwood_gpu_stop(void);
++void redwood_tl(const char *format, ...) __printflike(1, 2);
++void topaz_adreno_init(void);
++
++/* the GPU path runs this boot: SweetSurface's surfaces then get the rows the GPU's tiles run into (K1, K5) */
++bool
++redwood_gpu_on(void)
++{
++	return false;
++}
++
++/* GPU address = physical address: never here, the SMMU translates */
++bool
++redwood_gpu_identity(void)
++{
++	return false;
++}
++
++/* topaz's "the kernel has RAM below 4 GiB" (ADT --midmem): not here */
++bool
++topaz_gpu_midmem(void)
++{
++	return false;
++}
++
++/* no GPU pool: 0 */
++uint64_t
++topaz_gpu_pool_alloc(__unused uint64_t size, void **va)
++{
++	if (va != NULL) {
++		*va = NULL;
++	}
++	return 0;
++}
++
++/* (an IOMemoryDescriptor * in SweetSurface.cpp and RedwoodGPU.cpp) */
++void *
++topaz_gpu_pool_md(__unused uint64_t pa, __unused uint64_t size)
++{
++	return NULL;
++}
++
++void
++topaz_gpu_pool_free(__unused uint64_t pa, __unused uint64_t size)
++{
++}
++
++bool
++redwood_gpu_ready(void)
++{
++	return false;
++}
++
++/* the answers of glue plan 3.3 come with K4 */
++bool
++redwood_gpu_parameter(__unused uint32_t which, __unused uint64_t *value)
++{
++	return false;
++}
++
++/* GPU addresses and page tables for programs' buffers come with K2 */
++uint64_t
++redwood_gpu_address(__unused uint64_t size)
++{
++	return 0;
++}
++
++void
++redwood_gpu_address_free(__unused uint64_t address, __unused uint64_t size)
++{
++}
++
++bool
++redwood_gpu_map(__unused uint64_t address, __unused uint64_t phys, __unused bool read_only)
++{
++	return false;
++}
++
++void
++redwood_gpu_mapped(void)
++{
++}
++
++void
++redwood_gpu_unmap(__unused uint64_t address, __unused uint64_t size)
++{
++}
++
++/* out of this processor's cache into memory (clean + invalidate); (NULL, 0): the barrier alone */
++void
++redwood_gpu_to_memory(void *start, uint64_t size)
++{
++	if (start != NULL && size != 0) {
++		kg_to_memory((vm_offset_t)start, (vm_size_t)size);
++	} else {
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++/* submission and fences come with K3: nothing is taken, and nothing is ever outstanding */
++uint32_t
++redwood_gpu_submit(__unused const uint64_t *addresses, __unused const uint32_t *words, __unused uint32_t count)
++{
++	return 0;
++}
++
++bool
++redwood_gpu_done(__unused uint32_t fence)
++{
++	return true;
++}
++
++uint32_t
++redwood_gpu_last(void)
++{
++	return 0;
++}
++
++void
++redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	*microseconds = 0;
++	*submissions = 0;
++	bzero(by, 7 * sizeof(uint32_t));
++}
++
++void
++redwood_gpu_report(const char *why)
++{
++	printf("SWEET KGPU: RedwoodGPU reports \"%s\", with no GPU behind it yet\n", why);
++}
++
++void
++redwood_gpu_stop(void)
++{
++}
++
++void
++redwood_tl(__unused const char *format, ...)
++{
++}
++
++/*
++ * From AppleCLCD::start (SweetFramebuffer.cpp), before the first IOSurface. Keep
++ * mode (K1) starts here; until then only a word for gpu=1, which asked for topaz's
++ * driver (and which SweetSurface still reads: contiguous memory for its surfaces).
++ */
++void
++topaz_adreno_init(void)
++{
++	int gpu = 0;
++
++	if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
++		printf("SWEET KGPU: gpu=%d asks for topaz's A610 driver, which kunzite does not build; "
++		    "no GPU path yet (glue plan K1)\n", gpu);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index c92beb0..8f7aa26 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -22,8 +22,6 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+-iokit/Kernel/arm/TopazAdreno.cpp                                 optional iokitcpp
+-iokit/Kernel/arm/TopazAdrenoFw.cpp                               optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
