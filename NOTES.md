@@ -39,9 +39,10 @@ It was checked by generating the table and applying it with the other two Mesa p
 both pass on the CI kernel after 5b87e5c, sha256 99274a14...; entries below boot #45). **K1 =
 0991 (keep mode) is done**: boot #48 kept the GPU 30 min under iOS with no GMU message and the
 same state in all 31 reports, then the undo ran clean (entry after #47). Found: the UCHE GMEM
-range reads 0 even with GX held; RBBM_NC_MODE_CNTL = 1. **Next: K2 + K3** (glue plan section
-4: page tables on demand, then submission and fences), each a patch and a boot on top of keep
-mode.
+range reads 0 even with GX held; RBBM_NC_MODE_CNTL = 1. **K2 = 0992 (the GPU's own buffers:
+tables on demand, user-range addresses, real map/unmap, step 23) is written**, not built or
+booted: push, CI, then boot #49 with `kgpu=23 kgpu_keep=1 kgpu_keep_s=120` (entry after #48).
+Then K3: submission and fences.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -937,6 +938,47 @@ to undo", then "THE GPU IS KEPT ... for 1800 s".
 Not tested: the exit from `reboot_kernel()` (only the timed exit ran). It is the same undo, run
 by the same thread, woken by `kunzite_adreno_shutdown()`. Next: glue plan K2 (page tables on
 demand, `redwood_gpu_map/unmap/address`) and K3 (submission), on top of keep mode.
+
+**GLUE K2 = 0992 (2026-10-24, written, NOT built/booted): the GPU's own buffers.** Main repo
+ios/gpu-glue-plan.md 3.2, 4.
+- **Tables on demand:** step 13's pool of 16 serves steps 13-22 as before. Beyond it, a page of
+  tables (4 with 16K pages) is made when needed, zeroed and cleaned to memory before any entry
+  leads to it; at most 1024 tables. Grown pages are freed with the pool, after the streams are
+  unrouted, by one undo entry pushed with it (`KG_UNDO_TABLES`; keep runs now have 53 undo
+  entries). Written entries are cleaned per page (dirty flags) in `redwood_gpu_mapped/_unmap`;
+  `kg_space_commit` still cleans everything for steps 13-22.
+- **GPU addresses:** kgsl's user range 0x40_0000_0000-0x80_0000_0000, first fit in 64K grains,
+  one unmapped grain after each buffer.
+- `redwood_gpu_address/_address_free/_map/_mapped/_unmap` are real:
+  - map is one 4K page of the user range, PTE_GMU | AP_UNPRIV, plus AP[2] when read-only;
+  - mapped cleans the dirty table pages, then TLBIASID 0 + TLBSYNC on context 0;
+  - unmap clears the entries and does the same before it returns.
+- **Step 23** (`kgpu=23`; with `kgpu_keep`: 1-21, 22 skipped, 23, then kept). Step 22's fill now
+  takes any address and pitch; 22's own stream is unchanged.
+  - 12 rounds of buffers from 16K to 4M (one crosses a 2M boundary): scattered kernel pages
+    mapped 4K at a time, filled by the 2D engine, each row's first and last pixel checked,
+    taken back;
+  - two 256K buffers at once: the second must start one grain after the first;
+  - the first's address unmapped and mapped onto the second's memory, then filled: the old
+    memory must not change and the new one must (the TLB invalidate works);
+  - a 34 MB buffer whose last 64K need grown tables;
+  - one read-only entry (AP[2] and AP[1] set).
+
+  Everything is freed in the step, and at the end all GPU addresses must be back (one free
+  range). Success line: "23 THE GPU'S OWN BUFFERS WORK".
+- Verified:
+  - the replay: 238 applied, the four known skips, kunzite_adreno.c byte-identical, nothing
+    else changed; series 234 patches;
+  - kcc.sh 0 diagnostics (strict: the same 4 old ones); CI's full -Weverything set: 49 warnings
+    before and after, the same kinds;
+  - CI's compile line builds it; all 32 undefined symbols resolve in #48's kernel; it exports
+    the 25 expected.
+
+**Test (boot #49):** standard cmdline + `sweetusb=2 kgpu=23 kgpu_keep=1 kgpu_keep_s=120`. Expect 22
+skipped, step 23's rounds (0 samples wrong each), "b starts after a and one unmapped 64K grain",
+"THE GPU WROTE THE NEW PAGES", the 34 MB line with pages made on demand > 0, the read-only bits
+set, "THE GPU'S OWN BUFFERS WORK ... 1 free range", no CONTEXT 0 FAULT. Then kept 120 s and the
+undo, including "undo gpu page tables made on demand: freed N pages", then "run over".
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

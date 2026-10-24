@@ -1,0 +1,771 @@
+kunzite: Adreno 710, glue plan K2 (main repo ios/gpu-glue-plan.md 3.2, 4): the GPU's own buffers.
+Page tables on demand: step 13's pool of 16 serves steps 13-22 as before; beyond it a page of tables
+is made when needed, zeroed and cleaned to memory before an entry leads to it, and freed with the
+pool after the streams are unrouted (KG_UNDO_TABLES, pushed with the pool); at most 1024 tables (2
+GB of 4K pages); entries written are cleaned page by page (dirty). GPU addresses for buffers from
+kgsl's user range 0x40_0000_0000-0x80_0000_0000, first fit in 64K grains, each buffer followed by
+one unmapped grain. redwood_gpu_address/_address_free/_map/_mapped/_unmap are now real: a map enters
+one 4K page of the user range (AP[1] for the 2D/3D engines, AP[2] for read-only), _mapped cleans the
+dirty table pages and has context 0 drop ASID 0 (TLBIASID, TLBSYNC), _unmap clears the entries and
+does the same before it returns. Step 23 (kgpu=23; with kgpu_keep: steps 1-21, 22 skipped, 23, then
+kept) exercises them: 12 rounds of buffers of 16K to 4M made from scattered kernel pages, filled by
+the 2D engine (step 22's fill, now at any address and pitch, its own stream unchanged), every row's
+first and last pixel checked, then taken back; two buffers at once, the second one grain after the
+first; the first's address unmapped and mapped onto the second's memory, filled again: the old
+memory must stay as it was and the new one change (the TLB was told); a 34 MB buffer whose last 64K
+need tables beyond the pool; one read-only entry's bits. Everything is freed in the step; the tables
+made stay. Test: kgpu=23 kgpu_keep=1 kgpu_keep_s=120: "THE GPU'S OWN BUFFERS WORK", then kept and
+undone as on #48.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 0f379be..68434f2 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -19,7 +19,8 @@
+  * needs ends the run.
+  *
+  * Keep mode (glue plan K1, main repo ios/gpu-glue-plan.md 4): with kgpu_keep=1
+- * the run stops after step 21 and is not undone: GX stays on (OOB_GPU held),
++ * the run stops after step 21 (or runs 23 after it, with kgpu=23; 22's
++ * picture is for runs that end) and is not undone: GX stays on (OOB_GPU held),
+  * HFI stays up, the CP runs out of secure mode, and redwood_gpu_ready() is
+  * true. Every kgpu_keep_report seconds (default 60, 0 = never) two lines of
+  * the GPU's state, and whatever the GMU has queued. It goes by the same undo
+@@ -129,6 +130,11 @@
+  *  22 the port map's 22: three 2D fills (Mesa's a7xx clear path) into a
+  *     1080x2400 picture at GPU 0xe0200000, caches cleaned, samples checked,
+  *     then copied to the panel memory 0xb8000000 for 15 s.
++ *  23 glue plan K2: the GPU's own buffers, as RedwoodGPU will make them:
++ *     addresses from 0x40_0000_0000, scattered pages mapped one by one,
++ *     tables made on demand, one TLB invalidate per batch; buffers filled
++ *     by the 2D engine, checked, unmapped, an address used again for other
++ *     memory. All freed in the step; the tables made stay with the pool.
+  * Every write is printed before it is made and kept on an undo list. After
+  * the last step the state is shown for kgpu_hold seconds (default 5), then
+  * the list is undone in reverse (branches, sources, GCC, CX collapse last):
+@@ -295,6 +301,7 @@ void kunzite_adreno_shutdown(int howto);
+ #define PTE_PAGE         3ull
+ #define PTE_GMU          (2ull << 8 | 1ull << 10 | 1ull << 11)  /* outer shareable, accessed, not global; attr 0 */
+ #define PTE_AP_UNPRIV    (1ull << 6)     /* AP[1]: unprivileged access too (io-pgtable-arm without IOMMU_PRIV) */
++#define PTE_AP_RO        (1ull << 7)     /* AP[2]: read-only (MSM_BO_GPU_READONLY) */
+ /* TrustZone (qcom_scm.c / qcom_scm-smc.c: SiP, SMC64, yielding; the same as TopazModem's) */
+ #define KG_SCM_FN(call)          (0x42000000u | (call))         /* the SMC function number */
+ #define KG_SCM_ID(call)          (0x02000000u | (call))         /* the same call as an argument */
+@@ -325,7 +332,7 @@ void kunzite_adreno_shutdown(int howto);
+ 
+ enum kg_undo_kind {
+ 	KG_UNDO_WORD, KG_UNDO_CLEAR, KG_UNDO_RCG, KG_UNDO_GDSC, KG_UNDO_KFREE, KG_UNDO_CM3, KG_UNDO_UNMAP,
+-	KG_UNDO_SLUMBER,
++	KG_UNDO_SLUMBER, KG_UNDO_TABLES,
+ };
+ 
+ static struct {
+@@ -439,6 +446,7 @@ kg_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned m
+ }
+ 
+ static void kg_slumber(void);
++static void kg_space_shrink(const char *name);
+ 
+ /* undo the newest write on the list (the end of the run does all of them, in reverse) */
+ static void
+@@ -487,6 +495,9 @@ kg_undo_pop(void)
+ 	case KG_UNDO_SLUMBER:           /* the GMU powers the GPU down (step 18) */
+ 		kg_slumber();
+ 		return;
++	case KG_UNDO_TABLES:            /* the table pages made on demand (K2): after the streams are unrouted */
++		kg_space_shrink(name);
++		return;
+ 	}
+ 	printf("SWEET KGPU: undo %s +%#x: now %#x\n", name, off, kg_rd(base, off));
+ }
+@@ -1274,71 +1285,134 @@ kg_to_memory(vm_offset_t start, vm_size_t size)
+ 
+ /*
+  * The GMU's page tables: 3 levels of 4K tables, 39-bit addresses, table 0 the
+- * root. All of them come from a pool made in step 13, before the context is
+- * on, so no table is allocated (or freed) while the SMMU may walk them; the
+- * pool's pages are freed at the end, after stream 5 is unrouted.
++ * root. A pool made in step 13, before the context is on, serves steps 13-22;
++ * its pages are freed at the end, after stream 5 is unrouted. Tables needed
++ * beyond it (K2: the GPU's own buffers, step 23 and RedwoodGPU) come from
++ * pages made then, zeroed in memory before any entry leads to them; they are
++ * freed with the pool (KG_UNDO_TABLES, pushed with it). A table is never freed
++ * while the run lasts. Entries written are cleaned to memory page by page
++ * (dirty) or all at once (kg_space_commit).
+  */
+-#define KG_SPACE_TABLES  16u             /* the GMU's 7 (boot #35), the GPU's 2 (step 19), 5 for the picture (22) */
++#define KG_SPACE_TABLES  16u             /* the pool: the GMU's 7 (boot #35), the GPU's 2 (step 19), 5 for the picture (22) */
++#define KG_SPACE_MAX     1024u           /* 4 MB of tables: up to 2 GB of the GPU's own buffers in 4K pages */
+ static struct {
+-	uint64_t *table[KG_SPACE_TABLES];
+-	uint64_t phys[KG_SPACE_TABLES];
+-	vm_offset_t page[KG_SPACE_TABLES];
+-	unsigned npages, ntables, used;
++	uint64_t *table[KG_SPACE_MAX];
++	uint64_t phys[KG_SPACE_MAX];
++	vm_offset_t page[KG_SPACE_MAX];
++	bool dirty[KG_SPACE_MAX];       /* per page: entries written and not yet cleaned to memory */
++	unsigned npages, ntables, used, per_page, pool_pages;
+ } kg_space;
+ 
++/* the tables of one more page */
++static void
++kg_space_add(vm_offset_t page)
++{
++	kg_space.page[kg_space.npages++] = page;
++	for (unsigned i = 0; i < kg_space.per_page; i++) {
++		kg_space.table[kg_space.ntables] = (uint64_t *)(page + 0x1000u * i);
++		kg_space.phys[kg_space.ntables] = kvtophys(page + 0x1000u * i);
++		kg_space.ntables++;
++	}
++}
++
+ static bool
+ kg_space_pool(void)
+ {
+-	unsigned per_page = (unsigned)(PAGE_SIZE / 0x1000);
+-
++	kg_space.per_page = (unsigned)(PAGE_SIZE / 0x1000);
+ 	while (kg_space.ntables < KG_SPACE_TABLES) {
+ 		vm_offset_t page = 0;
+ 		if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+ 			return false;
+ 		}
+ 		kg_undo_push(KG_UNDO_KFREE, page, 0, (uint32_t)PAGE_SIZE, "gmu page tables");
+-		kg_space.page[kg_space.npages++] = page;
+-		for (unsigned i = 0; i < per_page && kg_space.ntables < KG_SPACE_TABLES; i++) {
+-			kg_space.table[kg_space.ntables] = (uint64_t *)(page + 0x1000u * i);
+-			kg_space.phys[kg_space.ntables] = kvtophys(page + 0x1000u * i);
+-			kg_space.ntables++;
+-		}
++		kg_space_add(page);
+ 	}
++	kg_space.pool_pages = kg_space.npages;
++	kg_undo_push(KG_UNDO_TABLES, 0, 0, 0, "gpu page tables made on demand");
+ 	kg_space.used = 1;              /* table 0 is the root */
+ 	return true;
+ }
+ 
+-/* the table an entry leads to, made (from the pool) if the entry is empty */
+-static uint64_t *
+-kg_space_next(uint64_t *entry)
++/* one more page of tables, while the SMMU may walk the others: zeroes in memory first */
++static bool
++kg_space_grow(void)
++{
++	vm_offset_t page = 0;
++
++	if (kg_space.ntables + kg_space.per_page > KG_SPACE_MAX ||
++	    kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		return false;
++	}
++	kg_to_memory(page, PAGE_SIZE);
++	kg_space_add(page);
++	return true;
++}
++
++/* the undo of KG_UNDO_TABLES: the pages made on demand, after the streams are unrouted */
++static void
++kg_space_shrink(const char *name)
+ {
++	unsigned n = kg_space.npages - kg_space.pool_pages;
++
++	for (unsigned i = kg_space.pool_pages; i < kg_space.npages; i++) {
++		kmem_free(kernel_map, kg_space.page[i], PAGE_SIZE);
++	}
++	kg_space.npages = kg_space.pool_pages;
++	kg_space.ntables = kg_space.pool_pages * kg_space.per_page;
++	if (kg_space.used > kg_space.ntables) {
++		kg_space.used = kg_space.ntables;
++	}
++	printf("SWEET KGPU: undo %s: freed %u pages\n", name, n);
++}
++
++/* the index of the table entry `slot` of table t leads to, made if it is empty and `make`; -1: none */
++static int
++kg_space_next(unsigned t, unsigned slot, bool make)
++{
++	uint64_t *entry = &kg_space.table[t][slot];
++
+ 	if (*entry & 1u) {
+ 		for (unsigned i = 0; i < kg_space.used; i++) {
+ 			if (kg_space.phys[i] == (*entry & 0x0000fffffffff000ull)) {
+-				return kg_space.table[i];
++				return (int)i;
+ 			}
+ 		}
+-		return NULL;
++		return -1;
+ 	}
+-	if (kg_space.used == kg_space.ntables) {
+-		return NULL;
++	if (!make || (kg_space.used == kg_space.ntables && !kg_space_grow())) {
++		return -1;
+ 	}
+ 	*entry = kg_space.phys[kg_space.used] | PTE_TABLE;
+-	return kg_space.table[kg_space.used++];
++	kg_space.dirty[t / kg_space.per_page] = true;
++	return (int)kg_space.used++;
+ }
+ 
+-/* one 4K page of the GMU's address space */
++/* the last-level entry for va (its tables made if `make`), marked dirty; NULL if there is none */
++static uint64_t *
++kg_space_pte(uint64_t va, bool make)
++{
++	int l2 = (va >> 39) ? -1 : kg_space_next(0, (va >> 30) & 0x1ffu, make);
++	int l3 = l2 >= 0 ? kg_space_next((unsigned)l2, (va >> 21) & 0x1ffu, make) : -1;
++
++	if (l3 < 0) {
++		return NULL;
++	}
++	kg_space.dirty[(unsigned)l3 / kg_space.per_page] = true;
++	return &kg_space.table[l3][(va >> 12) & 0x1ffu];
++}
++
++/* one 4K page of the GMU's (and the GPU's) address space */
+ static bool
+ kg_space_map(uint64_t va, uint64_t pa, uint64_t attrs)
+ {
+-	uint64_t *l2 = (va >> 39) ? NULL : kg_space_next(&kg_space.table[0][(va >> 30) & 0x1ffu]);
+-	uint64_t *l3 = l2 != NULL ? kg_space_next(&l2[(va >> 21) & 0x1ffu]) : NULL;
++	uint64_t *pte = kg_space_pte(va, true);
+ 
+-	if (l3 == NULL) {
+-		printf("SWEET KGPU: %u no page table for GMU %#llx (pool of %u used up?)\n", kg.step, va, kg_space.ntables);
++	if (pte == NULL) {
++		printf("SWEET KGPU: %u no page table for GMU %#llx (%u tables, at most %u)\n", kg.step, va, kg_space.ntables,
++		    KG_SPACE_MAX);
+ 		return false;
+ 	}
+-	l3[(va >> 12) & 0x1ffu] = pa | attrs | PTE_PAGE;
++	*pte = pa | attrs | PTE_PAGE;
+ 	return true;
+ }
+ 
+@@ -1347,9 +1421,26 @@ kg_space_commit(void)
+ {
+ 	for (unsigned i = 0; i < kg_space.npages; i++) {
+ 		kg_to_memory(kg_space.page[i], PAGE_SIZE);
++		kg_space.dirty[i] = false;
+ 	}
+ }
+ 
++/* the pages with entries written since the last clean, to memory; false if there was none */
++static bool
++kg_space_commit_dirty(void)
++{
++	bool any = false;
++
++	for (unsigned i = 0; i < kg_space.npages; i++) {
++		if (kg_space.dirty[i]) {
++			kg_to_memory(kg_space.page[i], PAGE_SIZE);
++			kg_space.dirty[i] = false;
++			any = true;
++		}
++	}
++	return any;
++}
++
+ /*
+  * Stream 5 (the GMU) through HLOS entry 1 and context 1, with tables of
+  * ours (3 levels of 4K pages, 39-bit addresses), mapping one test page at the
+@@ -3294,9 +3385,11 @@ kg_cs_reg(uint32_t reg, uint32_t val)
+ 	kg_cs[kg_cs_n++] = val;
+ }
+ 
+-/* one band: fd6_clear_surface's registers for a linear 8888 target, then emit_blit_fini */
++/* one band of a linear 8888 target at GPU va, rows `pitch` bytes apart (64-byte units), `width` pixels wide:
++ * fd6_clear_surface's registers, then emit_blit_fini */
+ static void
+-kg_cs_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
++kg_cs_fill_at(uint64_t va, uint32_t pitch, uint32_t width, uint32_t top, uint32_t bottom, uint32_t r, uint32_t g,
++    uint32_t b)
+ {
+ 	kg_cs_reg(0x8c00, KG_A2D_SOLID_8888);           /* RB_A2D_BLT_CNTL */
+ 	kg_cs_reg(0x8400, KG_A2D_SOLID_8888);           /* GRAS_A2D_BLT_CNTL */
+@@ -3314,17 +3407,24 @@ kg_cs_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
+ 		kg_cs_reg(reg, 0);                      /* GRAS_A2D_SRC_XMIN..YMAX */
+ 	}
+ 	kg_cs_reg(0x8c17, 0x30u | 1u << 10);            /* RB_A2D_DEST_BUFFER_INFO: 8888, linear, WXYZ (blue first) */
+-	kg_cs_reg(0x8c18, (uint32_t)KG_GPU_PIC_VA);     /* RB_A2D_DEST_BUFFER_BASE */
+-	kg_cs_reg(0x8c19, (uint32_t)(KG_GPU_PIC_VA >> 32));
+-	kg_cs_reg(0x8c1a, KG_PIC_ROW >> 6);             /* RB_A2D_DEST_BUFFER_PITCH, 64-byte units */
++	kg_cs_reg(0x8c18, (uint32_t)va);                /* RB_A2D_DEST_BUFFER_BASE */
++	kg_cs_reg(0x8c19, (uint32_t)(va >> 32));
++	kg_cs_reg(0x8c1a, pitch >> 6);                  /* RB_A2D_DEST_BUFFER_PITCH, 64-byte units */
+ 	kg_cs_reg(0x8405, top << 16);                   /* GRAS_A2D_DEST_TL */
+-	kg_cs_reg(0x8406, (KG_PIC_W - 1) | (bottom - 1) << 16);  /* GRAS_A2D_DEST_BR */
++	kg_cs_reg(0x8406, (width - 1) | (bottom - 1) << 16);  /* GRAS_A2D_DEST_BR */
+ 	kg_cs_pkt7(0x46, 1);                            /* CP_EVENT_WRITE7 DEBUG_LABEL (Mesa's FD_LABEL) */
+ 	kg_cs_word(0x3f);
+ 	kg_cs_pkt7(0x2c, 1);                            /* CP_BLIT BLIT_OP_SCALE */
+ 	kg_cs_word(3);
+ }
+ 
++/* one band of step 22's picture */
++static void
++kg_cs_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
++{
++	kg_cs_fill_at(KG_GPU_PIC_VA, KG_PIC_ROW, KG_PIC_W, top, bottom, r, g, b);
++}
++
+ static bool
+ kg_pixel_is(const volatile uint8_t *p, uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b)
+ {
+@@ -3438,6 +3538,353 @@ kg_step22(void)
+ 	return true;
+ }
+ 
++/* ---- the GPU's own buffers (glue plan K2): addresses, tables on demand, map and unmap ---- */
++
++/*
++ * kgsl's 64-bit user range (kgsl_iommu.h KGSL_IOMMU_VA_BASE64/END64): inside our
++ * 39-bit tables, clear of the secure range at 0x1_0000_0000 and of the kernel's
++ * own addresses at 0xe0000000. Sizes go in 64K grains, and each buffer has one
++ * unmapped grain after it: a write past its end faults instead of landing in the
++ * next buffer.
++ */
++#define KG_UVA_START     0x4000000000ull
++#define KG_UVA_END       0x8000000000ull
++#define KG_UVA_GRAIN     0x10000ull
++#define KG_UVA_HOLES     256u
++static struct {
++	uint64_t start, size;
++} kg_uva[KG_UVA_HOLES];                 /* the free ranges, in address order */
++static unsigned kg_uva_n;
++static bool kg_uva_ready;
++
++static uint64_t
++kg_uva_need(uint64_t size)
++{
++	return ((size + KG_UVA_GRAIN - 1) & ~(KG_UVA_GRAIN - 1)) + KG_UVA_GRAIN;
++}
++
++/* a GPU address for `size` bytes (first fit); 0 if there is none */
++static uint64_t
++kg_uva_alloc(uint64_t size)
++{
++	uint64_t need = kg_uva_need(size);
++
++	if (!kg_uva_ready) {
++		kg_uva[0].start = KG_UVA_START;
++		kg_uva[0].size = KG_UVA_END - KG_UVA_START;
++		kg_uva_n = 1;
++		kg_uva_ready = true;
++	}
++	if (size == 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < kg_uva_n; i++) {
++		if (kg_uva[i].size >= need) {
++			uint64_t va = kg_uva[i].start;
++			kg_uva[i].start += need;
++			kg_uva[i].size -= need;
++			if (kg_uva[i].size == 0) {
++				memmove(&kg_uva[i], &kg_uva[i + 1], (--kg_uva_n - i) * sizeof(kg_uva[0]));
++			}
++			return va;
++		}
++	}
++	return 0;
++}
++
++/* the range back (its grain after it too), merged with its neighbours */
++static void
++kg_uva_free(uint64_t va, uint64_t size)
++{
++	uint64_t need = kg_uva_need(size);
++	unsigned at;
++
++	if (size == 0 || va < KG_UVA_START || va + need > KG_UVA_END) {
++		return;
++	}
++	for (at = 0; at < kg_uva_n && kg_uva[at].start < va; at++) {
++	}
++	if (at > 0 && kg_uva[at - 1].start + kg_uva[at - 1].size == va) {
++		kg_uva[at - 1].size += need;
++		if (at < kg_uva_n && va + need == kg_uva[at].start) {
++			kg_uva[at - 1].size += kg_uva[at].size;
++			memmove(&kg_uva[at], &kg_uva[at + 1], (--kg_uva_n - at) * sizeof(kg_uva[0]));
++		}
++	} else if (at < kg_uva_n && va + need == kg_uva[at].start) {
++		kg_uva[at].start = va;
++		kg_uva[at].size += need;
++	} else if (kg_uva_n < KG_UVA_HOLES) {
++		memmove(&kg_uva[at + 1], &kg_uva[at], (kg_uva_n++ - at) * sizeof(kg_uva[0]));
++		kg_uva[at].start = va;
++		kg_uva[at].size = need;
++	} else {
++		printf("SWEET KGPU: GPU addresses %#llx + %#llx not taken back: %u holes already\n", va, need, KG_UVA_HOLES);
++	}
++}
++
++/* context 0's TLB (ASID 0) dropped, then a sync waited for; false if it does not finish */
++static bool
++kg_gpu_tlbi(void)
++{
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
++
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBIASID, KG_GPU_CB);
++	kg_wr(kg.smmu, cb + SMMU_CB_TLBSYNC, 1);
++	return kg_poll(kg.smmu, cb + SMMU_CB_TLBSTATUS, 1u, 0, 100);
++}
++
++/* one 4K page of the user range; the 2D/3D engines' access (AP[1]), read-only with AP[2] */
++static bool
++kg_umap(uint64_t va, uint64_t pa, bool read_only)
++{
++	if (kg_space.ntables == 0 || va < KG_UVA_START || va >= KG_UVA_END || ((va | pa) & 0xfffu) != 0 || (pa >> 36) != 0) {
++		return false;
++	}
++	return kg_space_map(va, pa, PTE_GMU | PTE_AP_UNPRIV | (read_only ? PTE_AP_RO : 0));
++}
++
++/* after a batch of kg_umap: the entries to memory, then the TLB */
++static void
++kg_umapped(void)
++{
++	if (kg_space.ntables != 0 && kg_space_commit_dirty() && !kg_gpu_tlbi()) {
++		printf("SWEET KGPU: context 0's TLB sync does not finish (after a map)\n");
++	}
++}
++
++/* the entries cleared and the TLB told before this returns: the memory may go right after */
++static void
++kg_uunmap(uint64_t va, uint64_t size)
++{
++	if (kg_space.ntables == 0 || va < KG_UVA_START || va + size > KG_UVA_END) {
++		return;
++	}
++	for (uint64_t o = 0; o < size; o += 0x1000u) {
++		uint64_t *pte = kg_space_pte(va + o, false);
++		if (pte != NULL) {
++			*pte = 0;
++		}
++	}
++	(void)kg_space_commit_dirty();
++	if (!kg_gpu_tlbi()) {
++		printf("SWEET KGPU: context 0's TLB sync does not finish (after an unmap)\n");
++	}
++}
++
++/*
++ * Step 23 (glue plan K2): buffers as RedwoodGPU will make them for Mesa, through the
++ * functions above, which redwood_gpu_address/_map/_mapped/_unmap are. Kernel memory
++ * (scattered pages, entered 4K at a time), a GPU address from the user range, filled
++ * by the 2D engine and checked from our side, then unmapped, its address given back,
++ * the memory freed. Checked: rounds of 16K to 4M; two buffers live at once, the
++ * second after the first's guard grain; an address used again for other memory after
++ * an unmap (the GPU must write the new pages, not the old ones: the TLB was told);
++ * a 34 MB buffer, whose last pages need tables beyond step 13's pool; a read-only
++ * entry. Nothing to undo: every buffer goes in the step; the tables made stay.
++ */
++#define KG_U_PITCH       4096u           /* 1024 pixels of 8888 a row */
++#define KG_U_ROUNDS      12u
++struct kg_ubuf {
++	vm_offset_t mem;
++	uint64_t va, size;
++};
++
++static bool
++kg_ubuf_make(struct kg_ubuf *b, uint64_t size, bool read_only)
++{
++	b->mem = 0;
++	b->va = 0;
++	b->size = size;
++	if (kmem_alloc(kernel_map, &b->mem, (vm_size_t)size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		b->mem = 0;
++		printf("SWEET KGPU: 23 no memory for a buffer of %llu KB\n", size >> 10);
++		return false;
++	}
++	kg_to_memory(b->mem, (vm_size_t)size);     /* the zeroes to memory, where the GPU reads */
++	b->va = kg_uva_alloc(size);
++	if (b->va == 0) {
++		printf("SWEET KGPU: 23 no GPU address for %llu KB\n", size >> 10);
++		return false;
++	}
++	for (uint64_t o = 0; o < size; o += 0x1000u) {
++		if (!kg_umap(b->va + o, kvtophys(b->mem + o), read_only)) {
++			printf("SWEET KGPU: 23 GPU %#llx not mapped\n", b->va + o);
++			return false;
++		}
++	}
++	kg_umapped();
++	return true;
++}
++
++static void
++kg_ubuf_drop(struct kg_ubuf *b)
++{
++	if (b->va != 0) {
++		kg_uunmap(b->va, b->size);
++		kg_uva_free(b->va, b->size);
++		b->va = 0;
++	}
++	if (b->mem != 0) {
++		kmem_free(kernel_map, b->mem, (vm_size_t)b->size);
++		b->mem = 0;
++	}
++}
++
++/* rows [0, rows) of 1024 pixels at GPU va filled with one colour, the caches to memory, idle, a marker */
++static bool
++kg_ufill(const char *what, uint64_t va, uint32_t rows, uint8_t r, uint8_t g, uint8_t b, uint32_t mark)
++{
++	uint64_t at = KG_GPU_SCRATCH_VA + KG_GPU_WORD_OFF + 8;
++
++	kg_cs_n = 0;
++	kg_cs_pkt7(0x46, 1);                            /* CCU_INVALIDATE_COLOR */
++	kg_cs_word(0x19);
++	kg_cs_pkt7(0x65, 1);                            /* CP_SET_MARKER RM6_BLIT2DSCALE */
++	kg_cs_word(12);
++	kg_cs_reg(0x88e5, 0x40u << 23);                 /* RB_CCU_CACHE_CNTL, as step 22 */
++	kg_cs_fill_at(va, KG_U_PITCH, KG_U_PITCH / 4u, 0, rows, r, g, b);
++	kg_cs_pkt7(0x46, 1);                            /* CCU_CLEAN_COLOR */
++	kg_cs_word(0x21);
++	kg_cs_pkt7(0x46, 1);                            /* CACHE_CLEAN */
++	kg_cs_word(0x31);
++	kg_cs_pkt7(0x26, 0);                            /* CP_WAIT_FOR_IDLE */
++	kg_cs_pkt7(0x3d, 3);                            /* CP_MEM_WRITE: the marker */
++	kg_cs_word((uint32_t)at);
++	kg_cs_word((uint32_t)(at >> 32));
++	kg_cs_word(mark);
++	kg_cs_pkt7(0x12, 0);                            /* CP_WAIT_MEM_WRITES */
++	return kg_cp_submit(what, kg_cs, kg_cs_n);
++}
++
++/* every row's first and last pixel of rows [0, rows) at kernel address p; the number that are not (r, g, b) */
++static unsigned
++kg_ucheck(vm_offset_t p, uint32_t rows, uint8_t r, uint8_t g, uint8_t b)
++{
++	unsigned bad = 0;
++
++	kg_to_memory(p, (vm_size_t)rows * KG_U_PITCH);
++	for (uint32_t y = 0; y < rows; y++) {
++		const volatile uint8_t *q = (const volatile uint8_t *)(p + (vm_offset_t)y * KG_U_PITCH);
++		bad += !(q[0] == b && q[1] == g && q[2] == r && q[3] == 0xff);
++		bad += !(q[KG_U_PITCH - 4] == b && q[KG_U_PITCH - 3] == g && q[KG_U_PITCH - 2] == r && q[KG_U_PITCH - 1] == 0xff);
++	}
++	return bad;
++}
++
++static bool
++kg_step23(void)
++{
++	static const uint64_t size[KG_U_ROUNDS] = {
++		0x4000, 0x10000, 0x1c000, 0x40000, 0x100000, 0x210000, 0x300000, 0xc000, 0x80000, 0x104000, 0x4000, 0x400000,
++	};
++	vm_offset_t scratch = kg_undo_mem("gpu scratch page");
++	struct kg_ubuf a, b;
++	unsigned bad, old, now, used0 = kg_space.used, made0 = kg_space.npages - kg_space.pool_pages;
++	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
++	uint64_t *pte, entry;
++	bool ok = false;
++
++	if (!kg_gpu_wrote || scratch == 0 || !kg_gx_on()) {
++		printf("SWEET KGPU: 23 needs steps 1-21 (the CP running out of secure mode, in this run)\n");
++		return false;
++	}
++	bzero(&a, sizeof(a));
++	bzero(&b, sizeof(b));
++	kg_next(23, "the GPU's own buffers: addresses from 0x40_0000_0000, pages mapped 4K at a time, tables on demand, "
++	    "filled by the 2D engine, checked, unmapped");
++
++	for (unsigned i = 0; i < KG_U_ROUNDS; i++) {
++		uint32_t rows = (uint32_t)(size[i] / KG_U_PITCH), mark = 0x6b672300u | i;
++		uint8_t r = (uint8_t)(20u * i), g = (uint8_t)(255u - 20u * i), bl = 0x55;
++
++		if (!kg_ubuf_make(&a, size[i], false) || !kg_ufill("cp_rb_wptr (2d fill, own buffer)", a.va, rows, r, g, bl, mark)) {
++			goto out;
++		}
++		bad = kg_ucheck(a.mem, rows, r, g, bl);
++		printf("SWEET KGPU: 23 round %u: GPU %#llx..%#llx (%llu KB) -> memory %#llx..: marker %#x (%#x wanted), %u of %u "
++		    "samples wrong\n", i, a.va, a.va + a.size, a.size >> 10, kvtophys(a.mem),
++		    *(volatile uint32_t *)(scratch + KG_GPU_WORD_OFF + 8), mark, bad, 2u * rows);
++		kg_ubuf_drop(&a);
++		if (bad != 0) {
++			goto out;
++		}
++	}
++
++	kg_next(23, "two buffers at once (the second after the first's unmapped grain), then the first's address "
++	    "unmapped and mapped again onto other memory: the GPU must write the new pages, not the old");
++	if (!kg_ubuf_make(&a, 0x40000, false) || !kg_ubuf_make(&b, 0x40000, false)) {
++		goto out;
++	}
++	printf("SWEET KGPU: 23 a at %#llx, b at %#llx: %s\n", a.va, b.va,
++	    b.va == a.va + 0x40000u + KG_UVA_GRAIN ? "b starts after a and one unmapped 64K grain" : "NOT where expected");
++	if (b.va != a.va + 0x40000u + KG_UVA_GRAIN || !kg_ufill("cp_rb_wptr (2d fill, a)", a.va, 64, 200, 40, 40, 0x6b6723a0u)) {
++		goto out;
++	}
++	bad = kg_ucheck(a.mem, 64, 200, 40, 40);
++	/* a's address now onto b's memory, a's own memory kept to look at */
++	kg_uunmap(a.va, a.size);
++	for (uint64_t o = 0; o < b.size && bad == 0; o += 0x1000u) {
++		bad += !kg_umap(a.va + o, kvtophys(b.mem + o), false);
++	}
++	kg_umapped();
++	if (bad != 0 || !kg_ufill("cp_rb_wptr (2d fill, a's address on b's memory)", a.va, 64, 40, 200, 40, 0x6b6723a1u)) {
++		goto out;
++	}
++	old = kg_ucheck(a.mem, 64, 200, 40, 40);
++	now = kg_ucheck(b.mem, 64, 40, 200, 40);
++	printf("SWEET KGPU: 23 after the remap: a's old memory %u of 128 samples changed, b's memory %u of 128 wrong%s\n", old,
++	    now, old == 0 && now == 0 ? ": THE GPU WROTE THE NEW PAGES (the TLB was told)" : "");
++	kg_uunmap(a.va, a.size);        /* (b's memory, under a's address) */
++	kg_uva_free(a.va, a.size);
++	a.va = 0;
++	kg_ubuf_drop(&a);
++	kg_ubuf_drop(&b);
++	if (old != 0 || now != 0) {
++		goto out;
++	}
++
++	kg_next(23, "a 34 MB buffer: its last pages need tables beyond step 13's pool; the last 64K filled");
++	if (!kg_ubuf_make(&a, 34u << 20, false)) {
++		goto out;
++	}
++	printf("SWEET KGPU: 23 GPU %#llx..%#llx (34 MB): %u of %u tables used, %u pages of them made on demand\n", a.va,
++	    a.va + a.size, kg_space.used, kg_space.ntables, kg_space.npages - kg_space.pool_pages);
++	if (!kg_ufill("cp_rb_wptr (2d fill, the last 64K of 34 MB)", a.va + a.size - 0x10000u, 16, 10, 20, 250, 0x6b6723b0u)) {
++		goto out;
++	}
++	bad = kg_ucheck(a.mem + (vm_offset_t)a.size - 0x10000u, 16, 10, 20, 250);
++	printf("SWEET KGPU: 23 the last 64K: %u of 32 samples wrong\n", bad);
++	kg_ubuf_drop(&a);
++	if (bad != 0) {
++		goto out;
++	}
++
++	if (!kg_ubuf_make(&a, 0x4000, true)) {
++		goto out;
++	}
++	pte = kg_space_pte(a.va, false);
++	entry = pte != NULL ? *pte : 0;
++	printf("SWEET KGPU: 23 a read-only page at %#llx: entry %#llx (AP[2] read-only %s, AP[1] unprivileged %s)\n", a.va, entry,
++	    (entry & PTE_AP_RO) ? "set" : "MISSING", (entry & PTE_AP_UNPRIV) ? "set" : "MISSING");
++	kg_ubuf_drop(&a);
++	if ((entry & (PTE_AP_RO | PTE_AP_UNPRIV)) != (PTE_AP_RO | PTE_AP_UNPRIV)) {
++		goto out;
++	}
++
++	printf("SWEET KGPU: 23 THE GPU'S OWN BUFFERS WORK: %u rounds, two at once, a remap, 34 MB; tables %u used of %u "
++	    "(%u before), %u pages made on demand (%u before); all GPU addresses back (%u free range%s); cb0 fsr %#x\n",
++	    KG_U_ROUNDS, kg_space.used, kg_space.ntables, used0, kg_space.npages - kg_space.pool_pages, made0, kg_uva_n,
++	    kg_uva_n == 1 ? "" : "s", kg_rd(kg.smmu, cb + SMMU_CB_FSR));
++	ok = kg_uva_n == 1;
++out:
++	kg_ubuf_drop(&a);
++	kg_ubuf_drop(&b);
++	if (!ok) {
++		printf("SWEET KGPU: 23 the GPU's own buffers do not work as they should (see above)\n");
++	}
++	return ok;
++}
++
+ /* ---- end of the run: undo every write, in reverse ---- */
+ 
+ static void
+@@ -3549,16 +3996,21 @@ kg_keep(void)
+ static void
+ kg_thread(void *arg, wait_result_t result)
+ {
+-	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21, kg_step22 };
++	static bool (*const steps[])(void) = { kg_step1, kg_step2, kg_step3, kg_step4, kg_step5, kg_step6, kg_step7, kg_step8, kg_step9, kg_step10, kg_step11, kg_step12, kg_step13, kg_step14, kg_step15, kg_step16, kg_step17, kg_step18, kg_step19, kg_step20, kg_step21, kg_step22, kg_step23 };
+ 	unsigned done = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+ 	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture", kg.pause_ms);
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture; 23 the GPU's own buffers", kg.pause_ms);
+ 	while (done < kg.last && !kg.exit_asked) {
+ 		kg.step = done + 1;
++		if (kg.keep && kg.step == 22) {
++			printf("SWEET KGPU: 22 skipped: its picture is for runs that end\n");
++			++done;
++			continue;
++		}
+ 		if (!steps[done]()) {
+ 			break;
+ 		}
+@@ -3593,24 +4045,26 @@ kunzite_adreno_init(void)
+ 	(void)PE_parse_boot_argn("kgpu_keep", &keep, sizeof(keep));
+ 	(void)PE_parse_boot_argn("kgpu_keep_s", &keep_s, sizeof(keep_s));
+ 	(void)PE_parse_boot_argn("kgpu_keep_report", &report_s, sizeof(report_s));
+-	kg.last = last > 22 ? 22u : (unsigned)last;
++	kg.last = last > 23 ? 23u : (unsigned)last;
+ 	kg.delay_s = delay_s >= 0 && delay_s <= 600 ? (unsigned)delay_s : 60u;
+ 	kg.pause_ms = pause_ms >= 0 && pause_ms <= 10000 ? (unsigned)pause_ms : 1500u;
+ 	kg.hold_s = hold_s >= 0 && hold_s <= 600 ? (unsigned)hold_s : 5u;
+-	if (last > 22) {
+-		printf("SWEET KGPU: kgpu=%d, but only steps 1..22 exist; running those\n", last);
++	if (last > 23) {
++		printf("SWEET KGPU: kgpu=%d, but only steps 1..23 exist; running those\n", last);
+ 	}
+ 	if (keep != 0 && kg.last < 21) {
+ 		printf("SWEET KGPU: kgpu_keep wants the CP running (step 21), kgpu=%d: not kept, undone at the end\n", last);
+ 	} else if (keep != 0) {
+-		if (kg.last > 21) {
++		if (kg.last == 22) {
+ 			printf("SWEET KGPU: kgpu_keep: steps 1..21 (step 22's picture is for runs that end)\n");
++		} else if (kg.last == 23) {
++			printf("SWEET KGPU: kgpu_keep: steps 1..21 and 23 (step 22's picture is for runs that end)\n");
+ 		}
+-		kg.last = 21;
++		kg.last = kg.last == 23 ? 23u : 21u;
+ 		kg.keep = true;
+ 		kg.keep_s = keep_s > 0 ? (unsigned)keep_s : 0u;
+ 		kg.report_s = report_s > 0 ? (unsigned)report_s : 0u;
+-		printf("SWEET KGPU: kgpu_keep: the GPU is kept after step 21, %s; a report every %u s (0: none)\n",
++		printf("SWEET KGPU: kgpu_keep: the GPU is kept after step %u, %s; a report every %u s (0: none)\n", kg.last,
+ 		    kg.keep_s != 0 ? "for kgpu_keep_s seconds" : "until the system shuts down", kg.report_s);
+ 	}
+ 	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
+@@ -3755,32 +4209,37 @@ redwood_gpu_parameter(__unused uint32_t which, __unused uint64_t *value)
+ 	return false;
+ }
+ 
+-/* GPU addresses and page tables for programs' buffers come with K2 */
++/* GPU addresses for programs' buffers (K2): kgsl's user range, 64K grains, an unmapped grain after each */
+ uint64_t
+-redwood_gpu_address(__unused uint64_t size)
++redwood_gpu_address(uint64_t size)
+ {
+-	return 0;
++	return kg_uva_alloc(size);
+ }
+ 
+ void
+-redwood_gpu_address_free(__unused uint64_t address, __unused uint64_t size)
++redwood_gpu_address_free(uint64_t address, uint64_t size)
+ {
++	kg_uva_free(address, size);
+ }
+ 
++/* one 4K page; the tables made on demand; nothing reaches the GPU before redwood_gpu_mapped */
+ bool
+-redwood_gpu_map(__unused uint64_t address, __unused uint64_t phys, __unused bool read_only)
++redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ {
+-	return false;
++	return kg_umap(address, phys, read_only);
+ }
+ 
+ void
+ redwood_gpu_mapped(void)
+ {
++	kg_umapped();
+ }
+ 
++/* the GPU no longer reaches [address, + size) when this returns */
+ void
+-redwood_gpu_unmap(__unused uint64_t address, __unused uint64_t size)
++redwood_gpu_unmap(uint64_t address, uint64_t size)
+ {
++	kg_uunmap(address, size);
+ }
+ 
+ /* out of this processor's cache into memory (clean + invalidate); (NULL, 0): the barrier alone */
