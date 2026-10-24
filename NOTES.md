@@ -35,10 +35,10 @@ It was checked by generating the table and applying it with the other two Mesa p
 - UCHE_GMEM_RANGE_MIN/MAX read 0 on #41, and they matter: CoreAnimation reads the framebuffer
   (freedreno-darwin.patch). K1 reads them again.
 
-**Next:** glue plan K0 is **0990** (build split, interface stubs, step 20 with hbb 14: entry below
-boot #45). Its first CI run (40057032499 @ 3ca0f7e) failed to link on `_gpu_log`. 0990 is fixed
-and re-verified against objects; push, CI, then two boots: no GPU boot-args, then `kgpu=22`.
-After that, K1: keep mode.
+**Next:** glue plan K0 = **0990 is done** (boots #46 without GPU boot-args and #47 with `kgpu=22`
+both pass on the CI kernel after 5b87e5c, sha256 99274a14...; entries below boot #45). Next is
+**K1: keep mode** (glue plan section 4): steps 1-21 without the undo, the GPU held up,
+`redwood_gpu_ready()` true, and an exit path for reboots.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -859,6 +859,20 @@ and K0's gpu=1 line is in. Boot: the agent answered about 30 s after `fastboot b
 backboardd (501), SpringBoard (501) and kunzite-agent; AppleCLCD answers backboardd's selectors
 as before. No KGPU/TopazGPU/RedwoodGPU line, no fault, no panic, as expected without boot-args.
 Next: #47 = the same kernel with `kgpu=22` (shim/out/shim-boot-47.img, built).
+
+**BOOT #47 (2026-10-24 08:37, shim/out/shim-boot-47.img = #46 + `kgpu=22`, same kernel): K0 WITH
+kgpu=22 PASSES, AS #45 - GLUE K0 IS DONE.** Log: temp/ios-m8/usblog/live-boot47-20261024-0837.txt.
+"22 of 22 steps done; 53 writes to undo", "run over", no panic; afterwards backboardd,
+SpringBoard and the agent run. Step 20: gen7_start's 20 plain writes are read back one by one
+and only the mismatches printed. The only ones are #41/#45's three: 0x50b 0x2f7fff, and
+**UCHE_GMEM_RANGE_MIN/MAX (0xe0b/0xe0d) read 0 again**. So the five hbb-14 values hold:
+RB_NC_MODE_CNTL 0x812, TPL1 0x2, SP 0x22, GRAS 0x20, UCHE_MODE_CNTL 0x200000. hwcg: 0x260 and
+0x533 read 0 as before. Step 22: 2D stream consumed in 0.8 ms, no CP fault, CB0 FSR 0x400;
+marker 0x6b677022; **0 of 144 samples wrong**; picture on the panel for 15 s. Undo: picture
+freed, slumber (GX off, RSC sleep done), "after undo: cx gdsc 0x22f001 hw_ctrl 0x5ff4 gx gdsc
+0x222801" (as #45). **Next: glue plan K1, keep mode** (kgpu=21 kgpu_keep=1: steps 1-21, no
+undo, GPU held up, redwood_gpu_ready()). It also programs hbb 14 there and reads the UCHE GMEM
+range again once GX is held.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
