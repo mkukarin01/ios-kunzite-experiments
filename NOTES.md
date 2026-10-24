@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: fairplayd's job hidden, 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #60 (fairplayd hidden), 2026-10-25) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -314,6 +314,33 @@ tag xnu-boot-59; cmdline #54's).** Log: temp/ios-m8/usblog/live-boot59-20261025-
     fails fast; takes effect at the next boot;
   - (b) a FairPlayIOKit stub in our kernel so fairplayd stays up (big; it would still have no keys).
 
+**BOOT #60 (2026-10-25 03:31:21, shim/out/shim-boot-60.img = #59's kernel and cmdline; fairplayd's
+job hidden in the launchd.plist cache).** Log: temp/ios-m8/usblog/live-boot60-20261025-0331.txt.
+- **No "exec fairplayd" all boot.** The UI is on the GPU at 03:32:06.
+- **assetsd** was started early (pid 207, before the user touched anything) and **stays up**: no
+  CRASH and no new assetsd report. On #53-#58 it threw "assetsd requires TCCPhotosService access"
+  within minutes. So **1000 (CS_ENTITLEMENTS_VALIDATED) most likely fixed assetsd's TCC check.**
+  - [guess] Its exception path was not shown directly, since no assetsd report means nothing to read.
+- **Photos (03:32:40, with checkpointd started alongside) no longer hangs: it crashes further on.**
+  MobileSlideShow-...-160138 (bug_type 309):
+  - NSInternalInconsistencyException from `-[PXZoomableInlineHeadersDataSourceManager
+    initWithAssetsDataSourceManager:]` (PhotosUICore), inside `-[PXCuratedLibraryUIViewController
+    viewDidLoad]`;
+  - the assertion, from its CFStrings in the 20H392 cache (PhotosUICore __TEXT 0x1a5007000 +
+    frame offset 0xcb1e4 = 0x1a50d21e4): **"Invalid parameter not satisfying:
+    assetsDataSourceManager.dataSource.numberOfSections == 1"**
+    (PXZoomableInlineHeadersDataSourceManager.m);
+  - again at 03:33:38 (the user's retry), and PosterBoard aborted too (its nil preview image).
+- /private/var/mobile/Media/PhotoData has only Thumbnails/: **no Photos.sqlite, so the photo library
+  was never created**, and Photos' data source has no sections.
+- **The Photos chain now:** fairplayd/checkpointd fixed (fairplayd hidden); assetsd/TCC fixed (1000,
+  likely); next, why assetsd creates no library.
+  - [guess] Data protection (the AKS stand-in, "SWEET AKS" lines), the 1969 date, or a missing
+    first-boot setup step.
+- Note for symbolizing .ips frames: use the image's unslid __TEXT from the cache (`ipsw dyld macho
+  CACHE /full/path/of/image`) plus `imageOffset`. The report's own image base was 0x18000 off for
+  PhotosUICore.
+
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
 - **If it panics again: the same image with `gpu_cached=1` added** (cached buffers, like #57), and
@@ -338,7 +365,10 @@ screen turned out to be a different chain: Photos -> checkpointd -> fairplayd, w
 - **Rollback:** `/mv?p=/System/Library/xpc/launchd.plist.pre-fairplay&to=/System/Library/xpc/launchd.plist`
   (after `/rm` of the new one), then reboot.
 
-**Next - boot #60** (shim/out/shim-boot-60.img = #59's kernel and cmdline):
+**Boot #60 done (log entry): with fairplayd hidden, Photos gets past checkpointd, and assetsd stays
+up (1000 most likely fixed its TCC check). Photos now asserts on an empty library: Photos.sqlite was
+never created.** Next: why assetsd does not create the library.
+Old plan for #60 (done):
 - no "exec fairplayd.H2" in the log;
 - open Photos: does it draw, does checkpointd answer, does assetsd start, and with 1000 does it get
   past "assetsd requires TCCPhotosService access"?
