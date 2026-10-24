@@ -46,9 +46,10 @@ booted: push, CI, then boot #49 with `kgpu=23 kgpu_keep=1 kgpu_keep_s=120` (entr
 undo frees the grown tables after the streams). **K3 = 0993 (submission: kgsl's gen7 wrapping,
 the fence through an uncached word, ring wrap, step 24) is done: boot #50** (one IB, two IBs, 400
 submissions around the ring, all fences in order, no fault; entry after #49). **Next: K4**
-(parameters, `RedwoodGPUStart()`, a userland client). **K4 = 0994 + redwood-check is written**,
-not built or booted: push, CI, then boot #51 with `kgpu=24 kgpu_keep=1 kgpu_keep_s=600` and the
-client over the agent (entry after #50).
+(parameters, `RedwoodGPUStart()`, a userland client). **K4 = 0994 + redwood-check is done: boot
+#51** (userland read all 14 parameters and made, mapped, wrote and freed buffers through
+RedwoodGPU; entry after #50). Watch: the CX GDSC read 0x5022f001 after #51's undo. **Next:** K5
+or U1 + U3.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -1125,6 +1126,40 @@ parameters, RedwoodGPU published, a userland client.** Main repo ios/gpu-glue-pl
 - `curl -s 'http://192.168.7.2:8022/run?a=/tmp/redwood-check'` -> "ALL AS PLANNED";
 - the next keep report shows "GPU addresses in 1 free range" (all given back);
 - then the undo with RedwoodGPUStop first.
+
+**BOOT #51 (2026-10-24 13:13, shim/out/shim-boot-51.img: standard cmdline + `sweetusb=2 kgpu=24
+kgpu_keep=1 kgpu_keep_s=600`; kernel = CI after 91ef60f (the pushed head), sha256 74d75394...):
+K4 PASSES - USERLAND TALKS TO THE GPU'S DRIVER.** Log:
+temp/ios-m8/usblog/live-boot51-20261024-1313.txt.
+- Steps 23 and 24 as #50; the three keep-report lines now arrive whole (under 256 bytes).
+- "RedwoodGPU published: the msm DRM user client for Mesa" at kept 0 s.
+- Over the agent: `/put` -> /tmp/redwood-check (new, 52240 bytes, 0755), then `/run`:
+  **"REDWOOD CHECK: ALL AS PLANNED (0 failed)", exit 0.**
+  - all 14 params as glue plan 3.3: GPU_ID 0x2c6 (710), GMEM_SIZE 0x80000, CHIP_ID 0x7010000,
+    MAX_FREQ 0x14904840 (345 MHz), GMEM_BASE 0x1000000, PRIORITIES 1, 0s, HIGHEST_BANK_BIT 0xe,
+    UBWC_SWIZZLE 6, MACROTILE_MODE 1;
+  - TIMESTAMP 0x81c63e69 then 0x81c654b4 (moving: 0x164b ticks, ~0.3 ms at 19.2 MHz);
+  - buffer 1 (64K) at GPU 0x4000000000 and buffer 2 (1M) at 0x4000020000: "the second after the
+    first and one 64K grain"; offset 0x100000000 (handle << 32), flags 0x20000 (MSM_BO_WC);
+  - buffer 2 mapped at 0x104600000, 1 MB: 0 words not zero when made, 0 of 262144 wrong after
+    writing;
+  - after both were closed, buffer 3 (64K) got 0x4000000000 again.
+- Kernel side: "RedwoodGPU: client redwood-check (open 1)". The keep report at 60 s (and 300,
+  600) says "GPU addresses in 1 free range": the client's buffers all went back when it closed,
+  including the 1M one RedwoodGPU's kept-buffer cache held until then. Fence still 402 (the
+  client did not submit).
+- "the kept GPU goes after 600 s", RedwoodGPUStop, the undo as #50 (fence alias unmapped first,
+  slumber, grown tables freed), "run over". No panic, no CONTEXT 0 FAULT, no GMU ERROR;
+  backboardd (56), SpringBoard (26) and the agent as before.
+- **New, not understood:** the CX GDSC after the undo read **0x5022f001** (both right after its
+  collapse and in "after undo"), where #47-#50 read 0x22f001. PWR_ON (bit 31) is clear, so CX is
+  off, but bits 30 and 28 stay set ([guess] the GDSC FSM's state field, 30:27 = 0xa). What #51 did
+  differently: a 600 s keep (not 120), RedwoodGPU published, a client. Watch it on the next
+  boots; the hardware reset at the next boot clears it anyway.
+
+**Next:** glue plan K5 (surfaces and RedwoodGPU's own changes: SweetSurface gates, the presenter's
+cache clean, write-combined buffers, wrapDelta, read-only client memory), or straight to U1
+(Mesa 25.0.7 + FD710 built on the Mac) and U3 (a triangle through Mesa, before backboardd).
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
