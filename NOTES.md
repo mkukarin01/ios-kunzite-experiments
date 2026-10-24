@@ -35,9 +35,10 @@ It was checked by generating the table and applying it with the other two Mesa p
 - UCHE_GMEM_RANGE_MIN/MAX read 0 on #41, and they matter: CoreAnimation reads the framebuffer
   (freedreno-darwin.patch). K1 reads them again.
 
-**Next:** glue plan K0 is written as **0990** (build split, interface stubs, step 20 with hbb 14:
-entry below boot #45), not built or booted. Push, CI, then two boots: no GPU boot-args, then
-`kgpu=22`. After that, K1: keep mode.
+**Next:** glue plan K0 is **0990** (build split, interface stubs, step 20 with hbb 14: entry below
+boot #45). Its first CI run (40057032499 @ 3ca0f7e) failed to link on `_gpu_log`. 0990 is fixed
+and re-verified against objects; push, CI, then two boots: no GPU boot-args, then `kgpu=22`.
+After that, K1: keep mode.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -830,6 +831,24 @@ UCHE_MODE_CNTL 0x200000 (were the hbb 15 values). Verified:
 Series: 232 patches. **Test:** a boot without GPU boot-args (as #24, nothing GPU-related in
 the log), then `kgpu=22` (as #45: 22 of 22, undo clean; step 20's write lines show the new
 values). On the Mac: `nm` of the kernel has no `_topaz_fw_sqe_fw` and has `_redwood_gpu_ready`.
+
+**CI 40057032499 @ 3ca0f7e (0990 as first written): LINK FAILED**, `Undefined symbols: "_gpu_log",
+referenced from RedwoodGPUUserClient::submit in RedwoodGPU.cpo`. TopazAdreno.cpp also defined a
+variable, `uint32_t gpu_log;` (RedwoodGPU's per-submission trace switch, `extern` in its C block,
+never set). R7's survey had listed functions only. **0990 fixed:** kunzite_adreno.c defines
+`uint32_t gpu_log;` (zero, never set, as in topaz). Verified this time from objects, not text:
+- CI's own compile lines, taken from the job log, rebuilt locally for TopazAdreno.cpp,
+  TopazAdrenoFw.cpp, RedwoodGPU.cpp, SweetSurface.cpp, SweetFramebuffer.cpp and kunzite_adreno.c
+  (scratch cxx.sh/cc.sh, local buildtree headers);
+- `nm`: TopazAdreno*.o define 28 globals, 22 of them used by the three glue objects, and all 22
+  are now in kunzite_adreno.o (gpu_log as a plain data symbol under -fno-common);
+- a link check: every undefined symbol of the four objects is defined by the #45 kernel minus
+  TopazAdreno's 28, or by the new kunzite_adreno.o. The only names left over are private
+  kernel symbols the same code already used (`_kernel_startup_tunable_init`,
+  `_kmem_alloc_guard/_free_guard`);
+- the replay: 236 applied, the four known skips, both files byte-identical.
+
+Lesson: for a build split, check the objects' undefined symbols, not the source text.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

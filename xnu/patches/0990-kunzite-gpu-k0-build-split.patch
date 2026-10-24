@@ -3,19 +3,20 @@ the build, the hardware interface from kunzite_adreno.c, and step 20's gen7_star
 iokit/conf/files.arm64 no longer lists TopazAdreno.cpp and TopazAdrenoFw.cpp (the sources stay,
 unbuilt; their A610 zap and A630 SQE arrays, about 41 KB, go with them). kunzite_adreno.c defines,
 by their C names, the 21 functions RedwoodGPU.cpp, SweetSurface.cpp and SweetFramebuffer.cpp took
-from TopazAdreno.cpp, plus redwood_gpu_on() for K5: the SMMU translates (identity false), no GPU
-pool (alloc 0, md NULL), never ready until keep mode (K1), so RedwoodGPU's user client does not
-start and RedwoodGPUStart() is not called; redwood_gpu_to_memory is the real thing (dc civac,
-dsb); topaz_adreno_init() (AppleCLCD::start) only says that gpu=1 has no driver now. The probe
-no longer refuses gpu=1. Step 20 programs hbb 14 instead of gen7_3_0's 15, as kgsl gen7_init does
-on LPDDR4X (of_fdt_get_ddrtype() == 7; the live FDT's /memory has ddr_device_type = <0x07>):
-RB_NC_MODE_CNTL 0x814 -> 0x812, TPL1_NC_MODE_CNTL 0x4 -> 0x2, SP_NC_MODE_CNTL 0x24 -> 0x22,
-GRAS_NC_MODE_CNTL 0x40 -> 0x20, UCHE_MODE_CNTL 0x400000 -> 0x200000 (boot #45's fills were
-linear, so nothing seen depended on it). Test: boots as before without GPU boot-args; kgpu=22
-passes as on boot #45; nm has no _topaz_fw_sqe_fw and has _redwood_gpu_ready.
+from TopazAdreno.cpp and its variable gpu_log (RedwoodGPU's per-submission trace switch, never set;
+the first CI run of this patch failed to link without it), plus redwood_gpu_on() for K5: the SMMU
+translates (identity false), no GPU pool (alloc 0, md NULL), never ready until keep mode (K1), so
+RedwoodGPU's user client does not start and RedwoodGPUStart() is not called; redwood_gpu_to_memory
+is the real thing (dc civac, dsb); topaz_adreno_init() (AppleCLCD::start) only says that gpu=1 has
+no driver now. The probe no longer refuses gpu=1. Step 20 programs hbb 14 instead of gen7_3_0's 15,
+as kgsl gen7_init does on LPDDR4X (of_fdt_get_ddrtype() == 7; the live FDT's /memory has
+ddr_device_type = <0x07>): RB_NC_MODE_CNTL 0x814 -> 0x812, TPL1_NC_MODE_CNTL 0x4 -> 0x2,
+SP_NC_MODE_CNTL 0x24 -> 0x22, GRAS_NC_MODE_CNTL 0x40 -> 0x20, UCHE_MODE_CNTL 0x400000 -> 0x200000
+(boot #45's fills were linear, so nothing seen depended on it). Test: boots as before without GPU
+boot-args; kgpu=22 passes as on boot #45; nm has no _topaz_fw_sqe_fw and has _redwood_gpu_ready.
 
 diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
-index 3b7b812..f8849ac 100644
+index 3b7b812..43241f4 100644
 --- a/bsd/dev/kunzite_adreno.c
 +++ b/bsd/dev/kunzite_adreno.c
 @@ -16,7 +16,7 @@
@@ -87,7 +88,7 @@ index 3b7b812..f8849ac 100644
  	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
  	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
  	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
-@@ -3501,4 +3505,194 @@ kunzite_adreno_init(void)
+@@ -3501,4 +3505,197 @@ kunzite_adreno_init(void)
  		printf("SWEET KGPU: kernel_thread_start failed %d\n", kr);
  	}
  }
@@ -96,7 +97,7 @@ index 3b7b812..f8849ac 100644
 + * ---- the hardware interface, in place of TopazAdreno.cpp ----
 + *
 + * RedwoodGPU.cpp (the msm DRM user client Mesa talks to), SweetSurface.cpp and
-+ * SweetFramebuffer.cpp call these by their C names (extern "C" there). Topaz's
++ * SweetFramebuffer.cpp use these by their C names (extern "C" there). Topaz's
 + * A610 driver, TopazAdreno.cpp and its firmware TopazAdrenoFw.cpp, is not built
 + * for kunzite (iokit/conf/files.arm64); this is its place (main repo
 + * ios/gpu-glue-plan.md 3.2, 3.7). Here the SMMU translates: no identity mode, and no
@@ -127,6 +128,9 @@ index 3b7b812..f8849ac 100644
 +void redwood_gpu_stop(void);
 +void redwood_tl(const char *format, ...) __printflike(1, 2);
 +void topaz_adreno_init(void);
++
++/* RedwoodGPU.cpp's switch for a "tl: Q" line per submission (through redwood_tl); never set, as in topaz */
++uint32_t gpu_log;
 +
 +/* the GPU path runs this boot: SweetSurface's surfaces then get the rows the GPU's tiles run into (K1, K5) */
 +bool
