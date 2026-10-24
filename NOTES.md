@@ -1536,6 +1536,14 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
     it) or what they ask of CoreImage/IOSurface now. A/B test: rename /topaz/lib/libtopaz-gl.dylib
     (inject then leaves CoreAnimation on the CPU), restart backboardd, and see whether they
     abort again.
+  - **Settled later (19:15): the assetsd abort is older than the GPU work.**
+    - Unslid, the stack is the same frame for frame on live-20261021-001701 and boot #25,
+      both CPU UI: 18dc5c4b8 1d1adef54 1d1acfa4c 1800d2afc 1d1ade424 1d1ade3d4 18db98794
+      18db6fd48.
+    - On #53 assetsd aborted 4 times (451, 453, 547, 552), and PosterBoard twice (370, 436).
+      PosterBoard's stack is the same except the dispatch frame (main queue).
+    - [guess] They share a cause on the Photos/assets side of this userland, which wallpaper
+      and Photos both reach. It is not the GPU path. The A/B test is not needed for assetsd.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
