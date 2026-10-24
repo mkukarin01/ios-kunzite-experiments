@@ -1544,6 +1544,27 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
       PosterBoard's stack is the same except the dispatch frame (main queue).
     - [guess] They share a cause on the Photos/assets side of this userland, which wallpaper
       and Photos both reach. It is not the GPU path. The A/B test is not needed for assetsd.
+  - **The user's wider look (19:16):**
+    - fine: blur and vibrancy (Control Center, Notification Center, Spotlight, folders, dock), the
+      app switcher, sleep and wake;
+    - wallpaper: Settings offers only "pick an image", and the list is empty, so there is nothing to
+      draw;
+    - **the keyboard in Safari is all black**; in Control Center's search it is grey and
+      see-through, as it should be;
+    - Settings: the crashes in its panes are gone except **Date & Time**. "exec Preferences"
+      appears twice in the log with no CRASH line between, so the app exits without a signal our
+      hook logs. [guess] It is the missing RTC or time zone, not the GPU: Date & Time crashed on
+      the CPU UI too.
+  - Long run, keep reports 540-1200 s: the fence always caught up (47166 of 47166 at 1200 s); GPU
+    free ranges go up and down between 68 and 105, so no leak shows. After 17600 frames, 5.8 ms a
+    frame.
+  - Black Safari keyboard: [guess] its backdrop material (blur plus colour matrix over what is
+    behind) is lost on the GL path, maybe through the one function CoreAnimation's GL renderer
+    refused (40). **A/B to tell:**
+    - `/mv` /topaz/lib/libtopaz-gl.dylib aside; inject then logs "no GPU service" or skips, and
+      CoreAnimation stays on the CPU;
+    - `/kill` backboardd and look at Safari's keyboard;
+    - move the file back and kill backboardd again.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
