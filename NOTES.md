@@ -46,8 +46,9 @@ booted: push, CI, then boot #49 with `kgpu=23 kgpu_keep=1 kgpu_keep_s=120` (entr
 undo frees the grown tables after the streams). **K3 = 0993 (submission: kgsl's gen7 wrapping,
 the fence through an uncached word, ring wrap, step 24) is done: boot #50** (one IB, two IBs, 400
 submissions around the ring, all fences in order, no fault; entry after #49). **Next: K4**
-(parameters, `RedwoodGPUStart()`, a userland client). Also split the keep report's first line
-(256-byte console limit).
+(parameters, `RedwoodGPUStart()`, a userland client). **K4 = 0994 + redwood-check is written**,
+not built or booted: push, CI, then boot #51 with `kgpu=24 kgpu_keep=1 kgpu_keep_s=600` and the
+client over the agent (entry after #50).
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -1084,6 +1085,46 @@ K3 PASSES - THE GPU RUNS SUBMISSIONS.** Log: temp/ios-m8/usblog/live-boot50-2026
 with fences, all through `redwood_gpu_*`. Next is glue plan K4: `redwood_gpu_parameter` with the
 3.3 values, `RedwoodGPUStart()` publishing RedwoodGPU, and a small userland client over the
 agent.
+
+**GLUE K4 = 0994 + userland/gpu/redwood_check.c (2026-10-24, written, NOT built/booted):
+parameters, RedwoodGPU published, a userland client.** Main repo ios/gpu-glue-plan.md 3.3, 4.
+- **`redwood_gpu_parameter`** answers MSM_PARAM_* with 3.3's values: GPU_ID 710, GMEM_SIZE
+  0x80000, CHIP_ID 0x07010000, MAX_FREQ 345 MHz, TIMESTAMP from the GMU always-on counter (19.2
+  MHz, hi/lo/hi read), GMEM_BASE 0x1000000, PRIORITIES 1, PP_PGTABLE/FAULTS/SUSPENDS/RAYTRACING 0,
+  HIGHEST_BANK_BIT 14, UBWC_SWIZZLE 6, MACROTILE_MODE 1. VA_START/SIZE are not answered.
+- **Publish:** keep mode calls `RedwoodGPUStart()` once kept and submission is set up ("RedwoodGPU
+  published"). When the kept GPU goes, `RedwoodGPUStop()` comes first (RedwoodGPU's lock, so no
+  client is mid-request; our `redwood_gpu_stop()` clears ready), then the last fence, then the
+  undo. RedwoodGPU's own buffer default is still cached (`gpu_cached` 1 in translated mode):
+  glue plan K5 changes it.
+- **Lines under 256 bytes:** the keep report is now three lines (plus the number of free GPU
+  address ranges), the run's opening step list two, `redwood_gpu_report`'s first line two.
+- **The client:** `userland/gpu/redwood_check.c` + `mk-redwood-check.sh` (clang for arm64 iOS 16,
+  IOKit + CoreFoundation, ldid with agent/entitlements.plist) -> `userland/gpu/out/redwood-check`
+  (gitignored). It opens RedwoodGPU as redwood-drm does, then:
+  - reads 14 params and compares them with 3.3; TIMESTAMP must move; VA_START must not answer;
+  - makes a 64K and a 1M buffer, gets their GET_IOVA (user range; the second at first + 64K +
+    the 64K grain), offset and flags;
+  - maps the 1M one (client memory of its handle, as `redwood_drm_mmap`), checks it zero, writes
+    a pattern, reads it back, unmaps;
+  - closes both; a third 64K buffer must get the first's address again;
+  - prints "REDWOOD CHECK: ALL AS PLANNED" and exits 0.
+- Verified:
+  - kernel: replay 240 applied, the four known skips, byte-identical, nothing else changed;
+    series 236; kcc.sh 0 diagnostics; CI's full warning set unchanged from K3 (55); 38
+    undefined symbols resolve against #50's kernel (`_RedwoodGPUStart/_Stop` among them);
+    RedwoodGPU.o's 20 imports all come from kunzite_adreno.o;
+  - client: builds with 0 warnings; arm64, platform iOS, minos 16.0; signed ad hoc; links IOKit
+    at `/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit`, the install name 20H392's
+    dyld cache has.
+
+**Test (boot #51):** standard cmdline + `sweetusb=2 kgpu=24 kgpu_keep=1 kgpu_keep_s=600`. Once
+"RedwoodGPU published" is in the log:
+- `curl -s -T userland/gpu/out/redwood-check 'http://192.168.7.2:8022/put?p=/tmp/redwood-check&m=755'`
+  (a new file in /tmp);
+- `curl -s 'http://192.168.7.2:8022/run?a=/tmp/redwood-check'` -> "ALL AS PLANNED";
+- the next keep report shows "GPU addresses in 1 free range" (all given back);
+- then the undo with RedwoodGPUStop first.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

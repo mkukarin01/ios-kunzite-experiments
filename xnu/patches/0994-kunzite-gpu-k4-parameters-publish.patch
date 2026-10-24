@@ -1,0 +1,212 @@
+kunzite: Adreno 710, glue plan K4 (main repo ios/gpu-glue-plan.md 3.3, 4): parameters, and
+RedwoodGPU published. redwood_gpu_parameter answers MSM_PARAM_* as Linux's adreno_get_param does,
+with glue plan 3.3's values: GPU_ID 710, GMEM_SIZE 0x80000, CHIP_ID 0x07010000 (FDT qcom,chipid),
+MAX_FREQ 345 MHz (the level held), TIMESTAMP the GMU's always-on counter (19.2 MHz; kgsl gen7 reads
+that one), GMEM_BASE 0x1000000 (kgsl's uche_gmem_base), PRIORITIES 1,
+PP_PGTABLE/FAULTS/SUSPENDS/RAYTRACING 0, HIGHEST_BANK_BIT 14 (LPDDR4X), UBWC_SWIZZLE 6,
+MACROTILE_MODE 1 (RBBM_NC_MODE_CNTL 1, boot #48); VA_START/VA_SIZE stay unanswered (the kernel hands
+out addresses). Keep mode calls RedwoodGPUStart() once the GPU is kept and submission is set up: the
+RedwoodGPU service (msm DRM selectors 0x40-0x4c, 0x7e) is registered for userland. When the kept GPU
+goes, RedwoodGPUStop() first (RedwoodGPU's lock taken, so no client is in the middle of a request;
+redwood_gpu_stop makes the GPU not ready), then the last fence, then the undo. Log lines under 256
+bytes (the console cuts there and drops the newline, boot #50): the keep report is three lines (now
+with the number of free GPU address ranges), the run's opening step list two, redwood_gpu_report's
+first line two. Test: kgpu=24 kgpu_keep=1 kgpu_keep_s=600, then userland/gpu/redwood-check (built on
+the Mac, put in /tmp and run over the agent) reads the parameters and makes, maps, writes, reads
+back and frees a buffer.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index d8b76d0..6f16565 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -22,8 +22,9 @@
+  * the run stops after step 21 (or runs 23, 24 after it, with kgpu=23, 24;
+  * 22's picture is for runs that end) and is not undone: GX stays on (OOB_GPU held),
+  * HFI stays up, the CP runs out of secure mode, and redwood_gpu_ready() is
+- * true. Every kgpu_keep_report seconds (default 60, 0 = never) two lines of
+- * the GPU's state, and whatever the GMU has queued. It goes by the same undo
++ * true. Once kept, RedwoodGPUStart() publishes RedwoodGPU, the msm DRM user client
++ * Mesa talks to (glue plan K4). Every kgpu_keep_report seconds (default 60,
++ * 0 = never) three lines of the GPU's state, and whatever the GMU has queued. It goes by the same undo
+  * as at the end of a run: after kgpu_keep_s seconds (default 0 = never), or
+  * when the system shuts down (reboot_kernel calls kunzite_adreno_shutdown).
+  *
+@@ -4084,16 +4085,17 @@ kg_gpu_report(const char *why)
+ 	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
+ 
+ 	kg_wr(kg.gpu, 4u * GEN7_CP_SQE_STAT_ADDR, 1);
+-	printf("SWEET KGPU: report (%s): fence %u, done %u; ring rptr %u wptr %u (%u wraps); rbbm_status %#x "
+-	    "cp_hw_fault %#x interrupt %#x protect %#x sqe_stat %#x; ib1 %#x:%08x rem %u, ib2 %#x:%08x rem %u\n", why,
+-	    kg_sub.seqno, kg_sub.ready ? *kg_sub.fence : 0, kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr, kg_sub.wraps,
+-	    kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
++	/* (lines under 256 bytes: the console cuts there) */
++	printf("SWEET KGPU: report (%s): fence %u, done %u; ring rptr %u wptr %u (%u wraps)\n", why, kg_sub.seqno,
++	    kg_sub.ready ? *kg_sub.fence : 0, kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr, kg_sub.wraps);
++	printf("SWEET KGPU: report: rbbm_status %#x cp_hw_fault %#x interrupt %#x protect %#x sqe_stat %#x; ib1 %#x:%08x "
++	    "rem %u, ib2 %#x:%08x rem %u\n", kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_INTERRUPT_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_PROTECT_STATUS),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_SQE_STAT_DATA), kg_rd(kg.gpu, 4u * GEN7_CP_IB1_BASE_HI),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_IB1_BASE), kg_rd(kg.gpu, 4u * GEN7_CP_IB1_REM_SIZE),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_IB2_BASE_HI), kg_rd(kg.gpu, 4u * GEN7_CP_IB2_BASE),
+ 	    kg_rd(kg.gpu, 4u * GEN7_CP_IB2_REM_SIZE));
+-	printf("SWEET KGPU: report (%s): cb0 fsr %#x far %#x:%08x fsynr0 %#x\n", why, kg_rd(kg.smmu, cb + SMMU_CB_FSR),
++	printf("SWEET KGPU: report: cb0 fsr %#x far %#x:%08x fsynr0 %#x\n", kg_rd(kg.smmu, cb + SMMU_CB_FSR),
+ 	    kg_rd(kg.smmu, cb + SMMU_CB_FAR + 4), kg_rd(kg.smmu, cb + SMMU_CB_FAR), kg_rd(kg.smmu, cb + SMMU_CB_FSYNR0));
+ }
+ 
+@@ -4297,14 +4299,16 @@ kg_keep_report(unsigned s)
+ {
+ 	uint32_t cb = (kg.smmu_pages + KG_GPU_CB) * kg.smmu_page;
+ 
++	/* (three lines: the console cuts a line at 256 bytes, boot #50) */
+ 	printf("SWEET KGPU: kept %u s: gx gdsc %#x rpmh_power_state %#x gfx_pwr_clk_status %#x cx_busy %#x; "
+-	    "rbbm_status %#x cp rptr/wptr %u/%u sqe_cntl %#x hw_fault %#x; cb0 fsr %#x; gmu2host_intr_info %#x, "
+-	    "hfi message r/w %u/%u debug r/w %u/%u; fence %u of %u, %u submissions\n", s, kg_rd(kg.gpucc, KG_GX_GDSCR),
++	    "rbbm_status %#x cp rptr/wptr %u/%u sqe_cntl %#x hw_fault %#x; cb0 fsr %#x\n", s, kg_rd(kg.gpucc, KG_GX_GDSCR),
+ 	    kg_gmu(GEN7_GMU_RPMH_POWER_STATE), kg_gmu(GEN7_GMU_GFX_PWR_CLK_STATUS), kg_gmu(GEN7_GMU_AO_GPU_CX_BUSY_STATUS),
+ 	    kg_rd(kg.gpu, 4u * GEN7_RBBM_STATUS), kg_rd(kg.gpu, 4u * GEN7_CP_RB_RPTR), kg_rb_wptr,
+-	    kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT), kg_rd(kg.smmu, cb + SMMU_CB_FSR),
+-	    kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO), kg_hfi->q[1].read_index, kg_hfi->q[1].write_index, kg_hfi->q[2].read_index,
+-	    kg_hfi->q[2].write_index, kg_sub.ready ? *kg_sub.fence : 0, kg_sub.seqno, kg_sub.submits);
++	    kg_rd(kg.gpu, 4u * GEN7_CP_SQE_CNTL), kg_rd(kg.gpu, 4u * GEN7_CP_HW_FAULT), kg_rd(kg.smmu, cb + SMMU_CB_FSR));
++	printf("SWEET KGPU: kept %u s: gmu2host_intr_info %#x, hfi message r/w %u/%u debug r/w %u/%u; fence %u of %u, "
++	    "%u submissions; GPU addresses in %u free range%s\n", s, kg_gmu(GEN7_GMU_GMU2HOST_INTR_INFO),
++	    kg_hfi->q[1].read_index, kg_hfi->q[1].write_index, kg_hfi->q[2].read_index, kg_hfi->q[2].write_index,
++	    kg_sub.ready ? *kg_sub.fence : 0, kg_sub.seqno, kg_sub.submits, kg_uva_n, kg_uva_n == 1 ? "" : "s");
+ 	/* glue plan 3.3: the GMEM range gen7_start wrote (read 0 right after it on #41/#45/#47), hbb 14, macrotile */
+ 	printf("SWEET KGPU: kept %u s: uche_gmem_range min %#x:%08x max %#x:%08x; rbbm_nc_mode_cntl %#x; "
+ 	    "rb_nc_mode_cntl %#x tpl1 %#x sp %#x gras %#x uche_mode_cntl %#x\n", s,
+@@ -4315,10 +4319,15 @@ kg_keep_report(unsigned s)
+ 	kg_hfi_drain(2);
+ }
+ 
++/* iokit/Kernel/arm/RedwoodGPU.cpp (extern "C" there) */
++void RedwoodGPUStart(void);
++void RedwoodGPUStop(void);
++static bool kg_redwood;                 /* RedwoodGPUStart() was called */
++
+ /*
+  * Steps 1-21 done and nothing undone: hold the GPU until kgpu_keep_s runs out or the
+- * system shuts down, with a report every kgpu_keep_report seconds. Returns when it is
+- * to go; the caller undoes the run.
++ * system shuts down, with a report every kgpu_keep_report seconds; RedwoodGPU
++ * published meanwhile. Returns when it is to go; the caller undoes the run.
+  */
+ static void
+ kg_keep(void)
+@@ -4336,6 +4345,11 @@ kg_keep(void)
+ 		printf("SWEET KGPU: THE GPU IS KEPT: GX on (OOB_GPU held), HFI up, the CP running out of secure mode, "
+ 		    "idle; redwood_gpu_ready() true; until the system shuts down\n");
+ 	}
++	if (kg_sub.ready && !kg_redwood) {
++		kg_redwood = true;
++		RedwoodGPUStart();
++		printf("SWEET KGPU: RedwoodGPU published: the msm DRM user client for Mesa (selectors 0x40-0x4c, 0x7e)\n");
++	}
+ 	for (;;) {
+ 		unsigned next = kg.report_s != 0 ? said + kg.report_s : ~0u;
+ 
+@@ -4356,6 +4370,9 @@ kg_keep(void)
+ 			said = s;
+ 		}
+ 	}
++	if (kg_redwood) {
++		RedwoodGPUStop();       /* RedwoodGPU's lock taken: no client is in the middle of a request; not ready after */
++	}
+ 	kg.kept = false;
+ 	kg.hold_s = s;
+ 	if (kg_sub.ready && kg_fence_wait(kg_sub.seqno, 1000) == ~0u) {
+@@ -4374,8 +4391,15 @@ kg_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 	kg_wait(kg.delay_s * 1000u);
+-	printf("SWEET KGPU: steps 1..%u (%s), %u ms pause before each group\n", kg.last,
+-	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; 11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end; 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; 19 GPU context, ring, SQE; 20 zap, gen7_start, CP start; 21 out of secure mode, a word; 22 a picture; 23 the GPU's own buffers; 24 submissions", kg.pause_ms);
++	/* (two lines: the console cuts a line at 256 bytes, boot #50) */
++	printf("SWEET KGPU: steps 1..%u, %u ms pause before each group; %s\n", kg.last, kg.pause_ms,
++	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; "
++	    "11-12 TrustZone; 13 SMMU, undone; 14 GMU firmware; 15 GMU start, back into reset at the end");
++	if (kg.last > 15) {
++		printf("SWEET KGPU: 16 RSC/PDC, undone, and HFI start; 17 HFI messages; 18 GX on, slumber at the end; "
++		    "19 GPU context, ring, SQE; 20 zap, CP start; 21 out of secure mode; 22 a picture; 23 own buffers; "
++		    "24 submissions\n");
++	}
+ 	while (done < kg.last && !kg.exit_asked) {
+ 		kg.step = done + 1;
+ 		if (kg.keep && kg.step == 22) {
+@@ -4574,11 +4598,64 @@ redwood_gpu_ready(void)
+ 	return kg.kept && kg_sub.ready;
+ }
+ 
+-/* the answers of glue plan 3.3 come with K4 */
++/*
++ * MSM_PARAM_*, as Linux's adreno_get_param answers them, with glue plan 3.3's values for
++ * the 710 here: chip id from the FDT, GMEM 512K at kgsl's 16M, hbb 14 (LPDDR4X), UBWC
++ * swizzle levels 2 and 3, macrotile 8 channels (RBBM_NC_MODE_CNTL 1, boot #48). VA_START
++ * and VA_SIZE are not answered: RedwoodGPU hands out the addresses (MSM_INFO_GET_IOVA).
++ */
+ bool
+-redwood_gpu_parameter(__unused uint32_t which, __unused uint64_t *value)
++redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ {
+-	return false;
++	uint32_t hi, lo;
++
++	switch (which) {
++	case 0x01:                                      /* GPU_ID */
++		*value = 710;
++		return true;
++	case 0x02:                                      /* GMEM_SIZE */
++		*value = 0x80000;
++		return true;
++	case 0x03:                                      /* CHIP_ID: FDT qcom,chipid */
++		*value = 0x07010000;
++		return true;
++	case 0x04:                                      /* MAX_FREQ: the level held (perf 2) */
++		*value = 345000000;
++		return true;
++	case 0x05:                                      /* TIMESTAMP: the GMU's always-on counter, 19.2 MHz */
++		if (!kg.kept || kg.gmu == 0) {
++			return false;
++		}
++		do {
++			hi = kg_gmu(GEN7_GMU_ALWAYS_ON_COUNTER_H);
++			lo = kg_gmu(GEN7_GMU_ALWAYS_ON_COUNTER_L);
++		} while (hi != kg_gmu(GEN7_GMU_ALWAYS_ON_COUNTER_H));
++		*value = (uint64_t)hi << 32 | lo;
++		return true;
++	case 0x06:                                      /* GMEM_BASE: kgsl's uche_gmem_base */
++		*value = 0x1000000;
++		return true;
++	case 0x07:                                      /* PRIORITIES: one ring */
++		*value = 1;
++		return true;
++	case 0x08:                                      /* PP_PGTABLE */
++	case 0x09:                                      /* FAULTS */
++	case 0x0a:                                      /* SUSPENDS */
++	case 0x11:                                      /* RAYTRACING */
++		*value = 0;
++		return true;
++	case 0x10:                                      /* HIGHEST_BANK_BIT */
++		*value = 14;
++		return true;
++	case 0x12:                                      /* UBWC_SWIZZLE */
++		*value = 6;
++		return true;
++	case 0x13:                                      /* MACROTILE_MODE */
++		*value = 1;
++		return true;
++	default:
++		return false;
++	}
+ }
+ 
+ /* GPU addresses for programs' buffers (K2): kgsl's user range, 64K grains, an unmapped grain after each */
+@@ -4667,6 +4744,7 @@ redwood_gpu_report(const char *why)
+ void
+ redwood_gpu_stop(void)
+ {
++	kg.kept = false;                /* (RedwoodGPUStop, with RedwoodGPU's lock held: not ready from now on) */
+ }
+ 
+ void

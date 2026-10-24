@@ -9,3 +9,4 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 agent/out/
+userland/gpu/out/
