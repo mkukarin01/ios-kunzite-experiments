@@ -318,9 +318,10 @@ tag xnu-boot-59; cmdline #54's).** Log: temp/ios-m8/usblog/live-boot59-20261025-
 job hidden in the launchd.plist cache).** Log: temp/ios-m8/usblog/live-boot60-20261025-0331.txt.
 - **No "exec fairplayd" all boot.** The UI is on the GPU at 03:32:06.
 - **assetsd** was started early (pid 207, before the user touched anything) and **stays up**: no
-  CRASH and no new assetsd report. On #53-#58 it threw "assetsd requires TCCPhotosService access"
-  within minutes. So **1000 (CS_ENTITLEMENTS_VALIDATED) most likely fixed assetsd's TCC check.**
-  - [guess] Its exception path was not shown directly, since no assetsd report means nothing to read.
+  CRASH for its first 4 minutes, then **at 03:36:21 it aborted with the same throw at 0x162f0
+  ("assetsd requires TCCPhotosService access")**, twice (207, 313), when the user's screenshot
+  asked it for the library (a ScreenshotServicesService report too). **So 1000 did not fix TCC**;
+  assetsd had only not been asked yet.
 - **Photos (03:32:40, with checkpointd started alongside) no longer hangs: it crashes further on.**
   MobileSlideShow-...-160138 (bug_type 309):
   - NSInternalInconsistencyException from `-[PXZoomableInlineHeadersDataSourceManager
@@ -333,8 +334,9 @@ job hidden in the launchd.plist cache).** Log: temp/ios-m8/usblog/live-boot60-20
   - again at 03:33:38 (the user's retry), and PosterBoard aborted too (its nil preview image).
 - /private/var/mobile/Media/PhotoData has only Thumbnails/: **no Photos.sqlite, so the photo library
   was never created**, and Photos' data source has no sections.
-- **The Photos chain now:** fairplayd/checkpointd fixed (fairplayd hidden); assetsd/TCC fixed (1000,
-  likely); next, why assetsd creates no library.
+- **The Photos chain now:** fairplayd/checkpointd fixed (fairplayd hidden). assetsd/TCC is still
+  denied (1000 sets ENTITLEMENTS_VALIDATED, and it was not the gate). The library is never created,
+  [guess] because assetsd dies whenever it is asked.
   - [guess] Data protection (the AKS stand-in, "SWEET AKS" lines), the 1969 date, or a missing
     first-boot setup step.
 - Note for symbolizing .ips frames: use the image's unslid __TEXT from the cache (`ipsw dyld macho
@@ -365,9 +367,11 @@ screen turned out to be a different chain: Photos -> checkpointd -> fairplayd, w
 - **Rollback:** `/mv?p=/System/Library/xpc/launchd.plist.pre-fairplay&to=/System/Library/xpc/launchd.plist`
   (after `/rm` of the new one), then reboot.
 
-**Boot #60 done (log entry): with fairplayd hidden, Photos gets past checkpointd, and assetsd stays
-up (1000 most likely fixed its TCC check). Photos now asserts on an empty library: Photos.sqlite was
-never created.** Next: why assetsd does not create the library.
+**Boot #60 done (log entry): with fairplayd hidden, Photos gets past checkpointd, and then asserts
+on an empty library (no Photos.sqlite). assetsd still throws "requires TCCPhotosService access"
+once asked (03:36, the user's screenshot): 1000 did NOT fix TCC.** Next: read tccd's and assetsd's
+own os_log (/private/var/db/diagnostics + uuidtext -> a .logarchive for `log show` on the Mac) for
+why tccd denies, or whether assetsd ever reaches tccd (ktcc could not: an XPC fault on the lookup).
 Old plan for #60 (done):
 - no "exec fairplayd.H2" in the log;
 - open Photos: does it draw, does checkpointd answer, does assetsd start, and with 1000 does it get
