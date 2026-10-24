@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: G4 on boot #53, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 0996 + the waiting wrapper, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -23,8 +23,11 @@ firmware, to be configured on the fly):**
 - **Rollback:** `/rm?p=/usr/libexec/backboardd`, `/mv?p=/usr/libexec/real/backboardd&to=/usr/libexec/backboardd`,
   then `/kill` backboardd. **Off without touching files:** `gl=0` in the cmdline. On a boot
   without the GPU kept, inject waits 5 s, finds no RedwoodGPU and leaves CoreAnimation on the CPU.
-- **Every boot from now on:** the GPU comes up minutes after backboardd. Once "RedwoodGPU
-  published" is in the log, kill backboardd over the agent so that it comes back on the GPU. Glue milestones G1-G3
+- **Every boot from now on:** the GPU comes up after backboardd would start, so the wrapper
+  (installed 19:41, the previous one kept as /usr/libexec/backboardd.prev) waits for RedwoodGPU
+  up to 90 s. If the GPU is not there by then, backboardd starts on the CPU and a child of the
+  wrapper restarts it once the GPU comes. No manual kill. Fork 0996 makes the GPU come sooner and
+  shows it on the boot logo. Glue milestones G1-G3
 reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7 (freedreno FD710)
 draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha256
 74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
@@ -35,9 +38,30 @@ draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha
 The log of K0-U3 is the handoff below this section.
 
 **Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
-U4 way 1~~ (done) -> **~~G4~~ (reached)** -> the user's wider look (blur and vibrancy, the app
-switcher, sleep and wake, the keyboard, a long run); the PosterBoard/assetsd A/B; making it
-survive a reboot without the manual kill -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+U4 way 1~~ (done) -> **~~G4~~ (reached)** -> ~~the user's wider look~~ (done) -> **boot #54: 0996
++ the waiting wrapper** (the UI starts on the GPU by itself; the logo gauge) -> the deferred list
+
+**Next - boot #54 (the user pushes 0996, CI builds).**
+- Image: the CI kernel with 0996 (check that `kg_logo` is in it: `xcrun nm | grep kg_logo` shows
+  nothing, the functions are static, so look for the string "logo gauge"). Cmdline standard
+  + `sweetusb=2 kgpu=21 kgpu_keep=1`. No kgpu_delay: it is now the most keep mode waits for the
+  root filesystem, 60 s by default.
+- Expect in the log, in order:
+  - "keep mode: the root filesystem is mounted after N ms; the run starts";
+  - "logo gauge: the logo at X,Y, W x H";
+  - steps 1-21 with no pauses;
+  - "RedwoodGPU published", then "logo gauge: green, the GPU is ready";
+  - the wrapper's "topaz: the window server waits for the GPU (up to 90 s)", then "the GPU is
+    there after N s: the window server starts on it", or no wait if the GPU came first;
+  - "backboardd starts WITH DYLD_INSERT_LIBRARIES", an FD710 context, "RedwoodGPU: client
+    backboardd (open 1)". No kill by hand.
+- On the panel (the user): the logo fills amber from the bottom, turns green, then iOS draws.
+- Measure: `fastboot boot` -> agent up -> "RedwoodGPU published" -> first frame (#53: 41 s to the
+  agent, 3 min 11 s to RedwoodGPU).
+- If the logo turns red, or the run fails early: the run now starts right after the root mount,
+  not 60 s into the boot. [guess] Something a step needs may not be up that early. Boot-args to tell: `kgpu_pause=1500` (the old pauses), or the old fixed delay by a non-keep run.
+- If the gauge says "nothing but black" or finds a huge box: the logo is not where it searches
+  (x 140-940, y 400-2000), or other pixels are lit there. Its log line has the box. -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
 **Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
@@ -1583,6 +1607,39 @@ temp/ios-m8/usblog/live-boot53-20261024-1853.txt.
     now. Safari's two (light and dark, about 19:22) show the keyboard right. Copies are in main
     repo temp/ios-m8/u4/snapshots/.
     - The agent's `/get` refuses a URL-encoded path ("ERR bad request"); send it raw with `curl -g`.
+
+**0996 `0996-kunzite-gpu-boot-logo-gauge.patch` + the waiting wrapper (2026-10-24, written; 0996 not
+built by CI yet).** Asked for by the user after G4. Hackintosh-style: the window server waits for
+the GPU, and the boot logo shows its progress.
+- **Where #53's 3 minutes went:** `kgpu_delay` (a fixed 60 s, for the log listener) plus
+  `kgpu_pause` (1.5 s before each group of reads, so a line reaches the log before a read that
+  could reset the SoC). Both are boot-arg safety margins from the probe's first days.
+- **0996, keep mode only:**
+  - The run starts once `topaz_root_mounted()` (polled every 250 ms, kgpu_delay at most).
+  - Pauses default to 0; kgpu_pause brings them back.
+  - **The logo gauge:**
+    - finds the logo in the panel memory: the box of non-black pixels in x 140-940, y 400-2000;
+    - keeps a copy;
+    - after each step redraws it with the bottom done/last part amber (brightness times colour);
+    - green once RedwoodGPU is published; red if the run ends short or keeps without RedwoodGPU;
+    - nothing after the first frame: `AppleCLCD::present` sets `sweet_fb_presented`.
+  - Checked:
+    - replay: 242 applied, the 4 usual skips;
+    - kunzite_adreno.c and SweetFramebuffer.cpp built with CI's lines: 0 warnings;
+    - new undefined `_sweet_fb_presented` (defined by SweetFramebuffer.o) and `_panic` (from
+      round_page's overflow check).
+  - The pixel format is BGRA (SweetFramebuffer's SWEET_FB_FORMAT_BGRA), so the colours are 0xAARRGGBB.
+- **The wrapper (`bbd_wrap.c`):**
+  - waits up to 90 s for RedwoodGPU (with kgpu_keep and no gl=0), then starts backboardd;
+  - if the GPU never came, backboardd starts on the CPU, and a forked child (`gpu_watch`) waits up
+    to 900 s more and SIGTERMs it once the GPU is there (`proc_name` checks the parent is still
+    backboardd);
+  - now linked with IOKit + CoreFoundation;
+  - installed 19:41 (the previous one is /usr/libexec/backboardd.prev). A restart with the GPU
+    already up started backboardd at once on FD710 (pid 961, "RedwoodGPU: client backboardd
+    (open 4)").
+- Who draws the boot logo is not settled: no code in our kernel tree draws an Apple logo (the
+  progress spinner is off, -noprogress). The gauge finds it by its pixels, whoever drew it.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells

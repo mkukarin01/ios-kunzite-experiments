@@ -28,7 +28,7 @@ python3 -I eagl/mkeagl.py eagl/eagl_slots.txt "$M/gl.xml" "$M/exported-gl.txt" e
 	-framework CoreFoundation -framework IOKit -framework IOSurface -lobjc -o out/libtopaz-gl.dylib
 "${CC[@]}" -dynamiclib -install_name /topaz/lib/libtopaz-inject.dylib topaz_inject.c \
 	-framework CoreFoundation -framework IOKit -lobjc -o out/libtopaz-inject.dylib
-"${CC[@]}" -DREAL="\"$REAL\"" bbd_wrap.c -o out/backboardd
+"${CC[@]}" -DREAL="\"$REAL\"" bbd_wrap.c -framework IOKit -framework CoreFoundation -o out/backboardd
 "${CC[@]}" eagl_check.m -framework OpenGLES -framework Foundation -lobjc -o out/eagl-check
 # (eagl-check as the other test programs are, with the agent's entitlements: it is run over the agent)
 for f in out/libtopaz-gl.dylib out/libtopaz-inject.dylib out/backboardd out/eagl-check; do

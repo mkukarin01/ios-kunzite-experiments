@@ -1,0 +1,287 @@
+kunzite: Adreno 710, after G4 (main repo ios/gpu-glue-plan.md): a GPU-UI boot without the wait for
+the log, and the boot logo as a gauge. The window server is to start only once the GPU is kept
+(userland/gpu/bbd_wrap.c waits for RedwoodGPU), so the time the kept run takes is time the boot
+logo stays on. Keep mode now starts the run as soon as the root filesystem is mounted (the
+firmware comes from it; kgpu_delay is then the most it waits, polled every 250 ms) instead of
+kgpu_delay (60 s) after boot, and its pause before each group of reads is 0 unless kgpu_pause is
+given: the steps are proven (boots #45-#53), and the pauses (1.5 s each) were most of the rest of
+the 3 minutes RedwoodGPU took on #53. The logo gauge (kg_logo_*): at the start of a kept run the
+logo is found in the panel memory (0xb8000000, write-combined: the box of the pixels that are not
+black between x 140-940, y 400-2000) and kept; after each step the logo is drawn again, its
+bottom done/last part amber (a pixel's brightness times the colour); once RedwoodGPU is published
+it is all green, and red if the run ends short or keeps without RedwoodGPU. Nothing is drawn after
+the window server's first frame: SweetFramebuffer's AppleCLCD::present sets sweet_fb_presented,
+and the gauge then lets the panel go. Non-kept runs are unchanged.
+
+diff --git a/bsd/dev/kunzite_adreno.c b/bsd/dev/kunzite_adreno.c
+index 6f16565..53f8991 100644
+--- a/bsd/dev/kunzite_adreno.c
++++ b/bsd/dev/kunzite_adreno.c
+@@ -16,7 +16,11 @@
+  * kgpu_pause ms (default 1500): if a read ends the run (an access the
+  * hypervisor does not like resets the SoC), the line has reached the USB
+  * log and the persistent log. A step that does not find what the next one
+- * needs ends the run.
++ * needs ends the run. In keep mode (below) the run starts as soon as the root
++ * filesystem is mounted (kgpu_delay is then the most it waits) and the pause
++ * is 0 unless kgpu_pause says otherwise: the steps are proven, and the window
++ * server waits for the GPU (glue plan, after G4). The boot logo shows how far
++ * it has got (kg_logo_*).
+  *
+  * Keep mode (glue plan K1, main repo ios/gpu-glue-plan.md 4): with kgpu_keep=1
+  * the run stops after step 21 (or runs 23, 24 after it, with kgpu=23, 24;
+@@ -4322,6 +4326,155 @@ kg_keep_report(unsigned s)
+ /* iokit/Kernel/arm/RedwoodGPU.cpp (extern "C" there) */
+ void RedwoodGPUStart(void);
+ void RedwoodGPUStop(void);
++/*
++ * The boot logo as a gauge (keep mode). The window server now starts only once the GPU is kept
++ * (userland/gpu/bbd_wrap.c waits for RedwoodGPU), and meanwhile the boot logo stays on the
++ * panel. So the logo fills with amber from the bottom up as the steps are done, and it turns
++ * green once RedwoodGPU is published, or red if the run ends short. Its pixels are found once
++ * (whatever is not black in the middle of the panel) and kept; each picture is drawn from those,
++ * a pixel's brightness times the colour. Nothing is drawn once the window server has presented
++ * a frame (sweet_fb_presented, SweetFramebuffer.cpp): the panel is iOS's from then on.
++ */
++#define KG_LOGO_X0       140u            /* the part of the panel searched for the logo */
++#define KG_LOGO_X1       940u
++#define KG_LOGO_Y0       400u
++#define KG_LOGO_Y1       2000u
++#define KG_LOGO_DARK     0x30u           /* a pixel with no channel above this is background */
++#define KG_LOGO_AMBER    0xffffb000u     /* panel pixels are 0xAARRGGBB (BGRA in memory) */
++#define KG_LOGO_GREEN    0xff34c759u
++#define KG_LOGO_RED      0xffff3b30u
++
++extern volatile int sweet_fb_presented;  /* iokit/Kernel/arm/SweetFramebuffer.cpp: set by the first frame */
++
++static struct {
++	vm_offset_t panel;              /* the panel memory, write-combined; 0: no gauge */
++	vm_offset_t orig;               /* the logo's pixels as found, w x h */
++	vm_size_t orig_size;
++	uint32_t x0, y0, w, h;
++} kg_logo;
++
++static uint32_t
++kg_logo_tint(uint32_t pixel, uint32_t colour)
++{
++	uint32_t r = (pixel >> 16) & 0xffu, g = (pixel >> 8) & 0xffu, b = pixel & 0xffu;
++	uint32_t l = r > g ? (r > b ? r : b) : (g > b ? g : b);
++
++	return 0xff000000u | ((((colour >> 16) & 0xffu) * l / 255u) << 16) | ((((colour >> 8) & 0xffu) * l / 255u) << 8) |
++	       ((colour & 0xffu) * l / 255u);
++}
++
++static void
++kg_logo_release(void)
++{
++	if (kg_logo.panel != 0) {
++		ml_io_unmap(kg_logo.panel, KG_PANEL_MAP);
++		kg_logo.panel = 0;
++	}
++	if (kg_logo.orig != 0) {
++		kmem_free(kernel_map, kg_logo.orig, kg_logo.orig_size);
++		kg_logo.orig = 0;
++	}
++}
++
++/* the logo's box and pixels, once, at the start of a kept run */
++static void
++kg_logo_find(void)
++{
++	uint32_t x0 = ~0u, y0 = ~0u, x1 = 0, y1 = 0;
++
++	if (sweet_fb_presented) {
++		printf("SWEET KGPU: logo gauge: none, the window server already shows its frames\n");
++		return;
++	}
++	kg_logo.panel = ml_io_map_unmappable(KG_PANEL_PA, KG_PANEL_MAP, VM_WIMG_WCOMB);
++	if (kg_logo.panel == 0) {
++		printf("SWEET KGPU: logo gauge: none, no mapping of the panel memory\n");
++		return;
++	}
++	for (uint32_t y = KG_LOGO_Y0; y < KG_LOGO_Y1; y++) {
++		const volatile uint32_t *row = (const volatile uint32_t *)(kg_logo.panel + (vm_offset_t)y * KG_PANEL_ROW);
++
++		for (uint32_t x = KG_LOGO_X0; x < KG_LOGO_X1; x++) {
++			uint32_t p = row[x];
++
++			if (((p >> 16) & 0xffu) > KG_LOGO_DARK || ((p >> 8) & 0xffu) > KG_LOGO_DARK || (p & 0xffu) > KG_LOGO_DARK) {
++				x0 = x < x0 ? x : x0;
++				x1 = x > x1 ? x : x1;
++				y0 = y < y0 ? y : y0;
++				y1 = y > y1 ? y : y1;
++			}
++		}
++	}
++	if (x0 == ~0u) {
++		printf("SWEET KGPU: logo gauge: none, nothing but black in the middle of the panel\n");
++		kg_logo_release();
++		return;
++	}
++	kg_logo.x0 = x0;
++	kg_logo.y0 = y0;
++	kg_logo.w = x1 - x0 + 1;
++	kg_logo.h = y1 - y0 + 1;
++	kg_logo.orig_size = round_page((vm_size_t)kg_logo.w * kg_logo.h * 4u);
++	if (kmem_alloc(kernel_map, &kg_logo.orig, kg_logo.orig_size, KMA_DATA, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		kg_logo.orig = 0;
++		printf("SWEET KGPU: logo gauge: none, no memory for the logo's %u x %u pixels\n", kg_logo.w, kg_logo.h);
++		kg_logo_release();
++		return;
++	}
++	for (uint32_t y = 0; y < kg_logo.h; y++) {
++		const volatile uint32_t *row = (const volatile uint32_t *)(kg_logo.panel + (vm_offset_t)(kg_logo.y0 + y) * KG_PANEL_ROW);
++		uint32_t *keep = (uint32_t *)(kg_logo.orig + (vm_offset_t)y * kg_logo.w * 4u);
++
++		for (uint32_t x = 0; x < kg_logo.w; x++) {
++			keep[x] = row[kg_logo.x0 + x];
++		}
++	}
++	printf("SWEET KGPU: logo gauge: the logo at %u,%u, %u x %u: amber per step, green when RedwoodGPU is published, red "
++	    "if the run ends short\n", kg_logo.x0, kg_logo.y0, kg_logo.w, kg_logo.h);
++}
++
++/* the logo's bottom `rows` rows in the colour, the rest as found; false once the panel is iOS's */
++static bool
++kg_logo_draw(uint32_t colour, uint32_t rows)
++{
++	if (kg_logo.panel == 0) {
++		return false;
++	}
++	if (sweet_fb_presented) {
++		kg_logo_release();
++		return false;
++	}
++	for (uint32_t y = 0; y < kg_logo.h; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(kg_logo.panel + (vm_offset_t)(kg_logo.y0 + y) * KG_PANEL_ROW);
++		const uint32_t *keep = (const uint32_t *)(kg_logo.orig + (vm_offset_t)y * kg_logo.w * 4u);
++		bool tinted = y >= kg_logo.h - rows;
++
++		for (uint32_t x = 0; x < kg_logo.w; x++) {
++			row[kg_logo.x0 + x] = tinted ? kg_logo_tint(keep[x], colour) : keep[x];
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
++static void
++kg_logo_progress(unsigned done, unsigned total)
++{
++	if (kg_logo.panel != 0 && total != 0) {
++		(void)kg_logo_draw(KG_LOGO_AMBER, (uint32_t)((uint64_t)kg_logo.h * done / total));
++	}
++}
++
++/* the whole logo in its last colour, which stays until the window server's first frame */
++static void
++kg_logo_end(uint32_t colour)
++{
++	if (kg_logo_draw(colour, kg_logo.h)) {
++		printf("SWEET KGPU: logo gauge: %s\n", colour == KG_LOGO_GREEN ? "green, the GPU is ready" : "red, the run ended short");
++	}
++	kg_logo_release();
++}
++
+ static bool kg_redwood;                 /* RedwoodGPUStart() was called */
+ 
+ /*
+@@ -4350,6 +4503,7 @@ kg_keep(void)
+ 		RedwoodGPUStart();
+ 		printf("SWEET KGPU: RedwoodGPU published: the msm DRM user client for Mesa (selectors 0x40-0x4c, 0x7e)\n");
+ 	}
++	kg_logo_end(kg_redwood ? KG_LOGO_GREEN : KG_LOGO_RED);
+ 	for (;;) {
+ 		unsigned next = kg.report_s != 0 ? said + kg.report_s : ~0u;
+ 
+@@ -4390,7 +4544,20 @@ kg_thread(void *arg, wait_result_t result)
+ 
+ 	(void)arg;
+ 	(void)result;
+-	kg_wait(kg.delay_s * 1000u);
++	if (kg.keep) {
++		/* the firmware comes from the root filesystem: start once it is there, kgpu_delay at most */
++		unsigned waited = 0;
++
++		while (!topaz_root_mounted() && waited < kg.delay_s * 1000u) {
++			kg_wait(250);
++			waited += 250;
++		}
++		printf("SWEET KGPU: keep mode: %s after %u ms; the run starts\n",
++		    topaz_root_mounted() ? "the root filesystem is mounted" : "still no root filesystem", waited);
++		kg_logo_find();
++	} else {
++		kg_wait(kg.delay_s * 1000u);
++	}
+ 	/* (two lines: the console cuts a line at 256 bytes, boot #50) */
+ 	printf("SWEET KGPU: steps 1..%u, %u ms pause before each group; %s\n", kg.last, kg.pause_ms,
+ 	    kg.last <= 3 ? "read only" : "4-5 write, undone at the end; 6-9 read; 10 writes DTCM and restores it; "
+@@ -4411,8 +4578,14 @@ kg_thread(void *arg, wait_result_t result)
+ 			break;
+ 		}
+ 		++done;
++		if (kg.keep) {
++			kg_logo_progress(done, kg.last);
++		}
+ 	}
+ 	printf("SWEET KGPU: %u of %u steps done; %u writes to undo\n", done, kg.last, kg.nundo);
++	if (kg.keep && (done < kg.last || kg.exit_asked)) {
++		kg_logo_end(KG_LOGO_RED);
++	}
+ 	if (kg.keep && done == kg.last && !kg.exit_asked) {
+ 		kg_keep();
+ 	} else if (kg.nundo > 0 && !kg.exit_asked) {
+@@ -4436,7 +4609,7 @@ kunzite_adreno_init(void)
+ 	}
+ 	kg.started = true;
+ 	(void)PE_parse_boot_argn("kgpu_delay", &delay_s, sizeof(delay_s));
+-	(void)PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
++	bool pause_given = PE_parse_boot_argn("kgpu_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("kgpu_hold", &hold_s, sizeof(hold_s));
+ 	(void)PE_parse_boot_argn("kgpu_keep", &keep, sizeof(keep));
+ 	(void)PE_parse_boot_argn("kgpu_keep_s", &keep_s, sizeof(keep_s));
+@@ -4458,12 +4631,20 @@ kunzite_adreno_init(void)
+ 		}
+ 		kg.last = kg.last >= 23 ? kg.last : 21u;
+ 		kg.keep = true;
++		if (!pause_given) {
++			kg.pause_ms = 0;        /* (the steps are proven; kgpu_pause brings the pauses back) */
++		}
+ 		kg.keep_s = keep_s > 0 ? (unsigned)keep_s : 0u;
+ 		kg.report_s = report_s > 0 ? (unsigned)report_s : 0u;
+ 		printf("SWEET KGPU: kgpu_keep: the GPU is kept after step %u, %s; a report every %u s (0: none)\n", kg.last,
+ 		    kg.keep_s != 0 ? "for kgpu_keep_s seconds" : "until the system shuts down", kg.report_s);
+ 	}
+-	printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
++	if (kg.keep) {
++		printf("SWEET KGPU: steps 1..%u once the root filesystem is mounted (at most %u s), %u ms pauses\n", kg.last,
++		    kg.delay_s, kg.pause_ms);
++	} else {
++		printf("SWEET KGPU: steps 1..%u in %u s\n", kg.last, kg.delay_s);
++	}
+ 	kg.running = true;
+ 	kern_return_t kr = kernel_thread_start(kg_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9537838..fa78e2d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,6 +45,10 @@ extern "C" void sweet_amfi_service_init(void);
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ extern "C" void topaz_adreno_init(void);           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
++/* the window server has presented a frame: the panel is iOS's (bsd/dev/kunzite_adreno.c's logo gauge stops) */
++extern "C" {
++volatile int sweet_fb_presented;
++}
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
+ 
+ /*
+@@ -1312,6 +1316,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	uint32_t mask = get32(rec, 0x104);
+ 	static int console_only = -1;
+ 
++	sweet_fb_presented = 1;
+ 	/* boot-arg sweetfb_console=1: debugging, the panel keeps showing the kernel console */
+ 	if (console_only < 0) {
+ 		console_only = 0;
