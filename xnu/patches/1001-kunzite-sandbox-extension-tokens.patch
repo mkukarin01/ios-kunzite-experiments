@@ -1,0 +1,87 @@
+kunzite: the Sandbox stand-in issues and consumes extension tokens (ops 5 and 6) instead of failing
+them with ENOENT. Boot #60's os_log (the phone's tracev3 files read with log show on the Mac): tccd grants
+kTCCServicePhotos "via entitlement 'com.apple.private.tcc.allow'" (authValue 2), then "Failed to issue
+sandbox extension for class: com.apple.tcc.kTCCServicePhotos" and replies kTCCErrorDomain Code=6 "server
+error: Failed to issue Sandbox Extension"; assetsd's tcc_authorization_preflight(kTCCServicePhotos) fails
+on it, and assetsd throws "assetsd requires TCCPhotosService access" (no Photos library, no wallpapers,
+no screenshots). Op 5 (libsystem_sandbox __sandbox_extension_issue: { class, type, path, flags, the
+caller's 2 KB token buffer, two more }) now writes a token shaped like Sandbox.kext's into that buffer;
+op 6 (sandbox_extension_consume: { token, length + 1, int64 handle out }) returns an incrementing
+handle. With no sandbox there is nothing for a token to open. Container paths (op 4, 0x43) still fail.
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 98eb498..38f655c 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -301,12 +301,58 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); container paths fail with
++ * ENOENT. Extension tokens are issued and consumed (kunzite boot #60's
++ * os_log: tccd grants kTCCServicePhotos by entitlement, then "Failed to issue
++ * sandbox extension for class: com.apple.tcc.kTCCServicePhotos", and assetsd's
++ * preflight failed on that kTCCErrorDomain 6, so it threw "assetsd requires
++ * TCCPhotosService access": no Photos, wallpapers or screenshots). With no
++ * sandbox there is nothing for a token to open, but its taker needs one.
++ * The first use of each operation number is logged.
+  */
+ int sweet_sandbox_container_path(user_addr_t arg);
+ static uint64_t sweet_sandbox_seen;
++static volatile SInt64 sweet_sandbox_token_serial, sweet_sandbox_handle_serial;
++
++/*
++ * Extension issue (libsystem_sandbox __sandbox_extension_issue, op 5): { class, type, path,
++ * flags, the caller's 2 KB token buffer, two more } in; a NUL-terminated token into the buffer,
++ * shaped like Sandbox.kext's: HMAC;flags;...;length of the class;class;...
++ */
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	uint64_t a[7];
++	char class[128] = "";
++	char token[256];
++	size_t length = 0;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error != 0) {
++		return error;
++	}
++	if (a[0] != 0) {
++		(void)copyinstr((user_addr_t)a[0], class, sizeof(class), &length);
++	}
++	snprintf(token, sizeof(token), "%040llx;00;00000000;00000000;00000000;%016lx;%s;01;0000000000000000;0000000000000000;",
++	    (unsigned long long)OSIncrementAtomic64(&sweet_sandbox_token_serial) + 1, (unsigned long)strlen(class), class);
++	return copyout(token, (user_addr_t)a[4], strlen(token) + 1);
++}
++
++/* Extension consume (op 6): { token, its length + 1, where the int64 handle goes } in */
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	uint64_t a[3];
++	int64_t handle;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error != 0) {
++		return error;
++	}
++	handle = OSIncrementAtomic64(&sweet_sandbox_handle_serial) + 1;
++	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++}
+ 
+ /* a private patch may answer which container a process is in (a strong definition wins) */
+ __attribute__((weak)) int
+@@ -328,7 +374,9 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	case 4:         /* container path (audit token / pid) */
+ 		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #60 (fairplayd hidden), 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: os_log read -> 1001, 2026-10-25) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -343,6 +343,49 @@ job hidden in the launchd.plist cache).** Log: temp/ios-m8/usblog/live-boot60-20
   CACHE /full/path/of/image`) plus `imageOffset`. The report's own image base was 0x18000 off for
   PhotosUICore.
 
+**os_log (2026-10-25): every daemon's own log, read on the Mac.** The recipe:
+- Copy over the agent (`/get` streams: a 10 MB file was fine; `/put` is the one that dies over 5 MB):
+  - the boot's newest /private/var/db/diagnostics/Persist/*.tracev3 and Special/*.tracev3 (the
+    highest numbers);
+  - timesync/*.timesync;
+  - all of /private/var/db/uuidtext (495 files, 163 MB, 142 MB of it dsc/: the shared cache's format
+    strings).
+- Lay them out as X.logarchive: Persist/, Special/, timesync/ and uuidtext's 00..FF and dsc/ at the
+  top.
+- Info.plist needs time references, or `log show` prints nothing:
+  - `OSArchiveVersion` 4;
+  - `EndTimeRef`;
+  - an `OldestTimeRef` under `HighVolumeMetadata`, `LiveMetadata`, `PersistMetadata`,
+    `SpecialMetadata` and `SignpostMetadata`, each `{ContinuousTime, UUID: the boot's UUID,
+    WallTime}`.
+  - The boot UUID and wall time come from timesync's last 0xbbb0 boot record (here
+    7EC0F715-9BF1-4B52-9640-6D0C8A93ACE1, wall 47.94 s, timebase 625/12).
+- Then `log show --archive X.logarchive --info --debug --style compact --predicate ...`. #60 gave
+  881489 lines. Archive and extracts: main repo temp/ios-m8/oslog60/.
+- **What it showed for Photos (tccd and assetsd):**
+  - tccd grants kTCCServicePhotos to Photos, SpringBoard and assetsd "via entitlement
+    'com.apple.private.tcc.allow'", AUTHREQ_RESULT authValue=2, authReason=11. TCC itself works,
+    and it grants many services by entitlement all boot.
+  - Then, every time: **"Failed to issue sandbox extension for class: com.apple.tcc.kTCCServicePhotos"**.
+  - assetsd's "Activate TCC" operation gets kTCCErrorDomain Code=6 "server error: Failed to issue
+    Sandbox Extension for kTCCServicePhotos". `tcc_authorization_preflight(kTCCServicePhotos)
+    fails`, so it throws "assetsd requires TCCPhotosService access".
+  - Also: "LSM: Failed to perform built-in transition to unobtainable ... currentState=initializing":
+    the library never leaves its initializing state.
+- The Sandbox stand-in (sweet_amfi.c) failed op 5 (extension issue) and op 6 (consume) with ENOENT on
+  purpose.
+  - libsystem_sandbox (disassembled): `__sandbox_extension_issue` mallocs a 2 KB buffer and calls
+    `__sandbox_ms("Sandbox", 5, {class, type, path, flags, buffer, a4, a5})`; success returns the
+    buffer as the token.
+  - `sandbox_extension_consume` calls op 6 with `{token, strlen + 1, &handle}` and returns the
+    handle, or -1.
+- **Fork 1001 `1001-kunzite-sandbox-extension-tokens.patch`:**
+  - op 5 writes a token shaped like Sandbox.kext's (`%040llx;00;00000000;00000000;00000000;<class
+    length %016lx>;<class>;01;0000000000000000;0000000000000000;`) into the caller's buffer;
+  - op 6 returns an incrementing handle;
+  - checked: compiled with CI's line, 0 warnings; replay 247 applied, the 4 usual skips.
+  - 1000 (ENTITLEMENTS_VALIDATED) stays; it was not the gate, but it is right.
+
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
 - **If it panics again: the same image with `gpu_cached=1` added** (cached buffers, like #57), and
@@ -366,6 +409,16 @@ screen turned out to be a different chain: Photos -> checkpointd -> fairplayd, w
 - Copies are in the main repo's temp/ios-m8/u4/fairplay/.
 - **Rollback:** `/mv?p=/System/Library/xpc/launchd.plist.pre-fairplay&to=/System/Library/xpc/launchd.plist`
   (after `/rm` of the new one), then reboot.
+
+**Found in the phone's os_log (log entry "os_log"): TCC grants Photos by entitlement; then the sandbox
+stand-in cannot issue the extension token that comes with the grant, and that error is what fails
+assetsd. Fork 1001 issues and consumes tokens. Next - boot #61 (the user pushes and tags 1001; CI
+kernel, cmdline #54's; fairplayd still hidden):**
+- assetsd stays up when asked (a screenshot, Photos);
+- Photos.sqlite appears under /private/var/mobile/Media/PhotoData;
+- Photos opens with an empty library;
+- the wallpaper list, and screenshots in DCIM;
+- in the os_log, no more "Failed to issue sandbox extension".
 
 **Boot #60 done (log entry): with fairplayd hidden, Photos gets past checkpointd, and then asserts
 on an empty library (no Photos.sqlite). assetsd still throws "requires TCCPhotosService access"
