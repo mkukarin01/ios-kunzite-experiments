@@ -1674,6 +1674,15 @@ temp/ios-m8/usblog/live-boot54-20261024-1952.txt.
     one included (#53 line 19963).
   - 19:57:15: backboardd restarted GPU -> GPU (pid 56 -> 319, FD710, "open 2") to see whether a
     restart alone fixes it.
+  - **Still black after the GPU -> GPU restart (the user).** So it is not "the first start".
+    - [guess] It follows the renderer that was up when Safari built its keyboard. On #53 the
+      keyboard was right only after the CPU renderer had been in between, maybe with Safari
+      keeping what it made then. A Safari started under the GPU renderer gets a black one.
+    - Function 40, the one CoreAnimation's GL renderer refuses, is **"sb3"** (redwood_gl.h
+      REDWOOD_CA_FUNCTIONS).
+  - **Next for it:** a boot with `glcensus=1`. eagl.c then logs, once each, every function
+    CoreAnimation is refused and every draw it makes with no program that we do not draw ("NOT
+    DRAWN ..."), with where and what. Open Safari's keyboard, then read the census.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
