@@ -1,0 +1,99 @@
+kunzite: Adreno 710, glue plan K5's R2 part (main repo ios/gpu-glue-plan.md 3.2, 4): RedwoodGPU's
+buffers and imported surfaces in translated mode. Buffers are write-combined by default, as Linux's
+msm gives freedreno: no buffer of the program's is pushed out of the cache at each submission (on
+#55: 25 MB pushed for 7 submissions, about 1 ms each), and what the GPU writes the CPU reads without
+invalidating;
+gpu_cached=1 keeps the old cached buffers. Topaz's note that a write-combined IOBMD comes out
+contiguous from the lower DDR bank does not hold for this tree's IOBufferMemoryDescriptor. A new
+buffer is pushed out of the cache once at creation in both modes (dc civac through its alias), so
+no dirty zero line from the allocator is written back over it later. Client-memory surfaces carry
+wrapDelta: mapped for wrapDelta + allocSize, with the delta in the offset reported (the GPU saw
+the picture wrapDelta bytes early and its end unmapped); refused when longer than the descriptor.
+Client memory the task could only read (the read-only fallback of sweet_surface_use_task_memory)
+is mapped for the GPU read-only (MSM_BO_GPU_READONLY). Identity mode is unchanged.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index a4e5569..af630f4 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -324,9 +324,15 @@ RedwoodGPUStart(void)
+ 	RedwoodGPU * gpu;
+ 	uint32_t cached = 0;
+ 
+-	/* topaz: buffers are ordinary cached memory by default (gpu_cached=0 asks for write-combined,
+-	 * which IOBMD makes contiguous, from the lower DDR bank the kernel cannot map back) */
+-	cached = redwood_gpu_identity() ? 0 : 1;        /* pool memory is write-combined already */
++	/*
++	 * Buffers are write-combined by default, as Linux's msm gives freedreno: nothing of the
++	 * program's to push out of the cache at each submission, and what the GPU writes is what the
++	 * CPU reads. gpu_cached=1 makes them ordinary cached memory. (kunzite, main repo
++	 * ios/gpu-glue-plan.md 3.2: topaz's note here that a write-combined IOBMD comes out contiguous,
++	 * from the lower DDR bank, does not hold for this tree's IOBufferMemoryDescriptor: only
++	 * kIOMemoryPhysicallyContiguous, a physical mask or an alignment above a page does that.)
++	 */
++	cached = 0;
+ 	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
+ 	gGPUCached = cached != 0;
+ 	gGPULock = IOLockAlloc();
+@@ -834,9 +840,13 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		    fBufferBytes >> 20);
+ 		return kIOReturnNoMemory;
+ 	}
+-	if (gGPUCached) {
+-		redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
+-	}
++	/*
++	 * Once, in both modes: the allocator zeroed these pages through the kernel's cached alias, and
++	 * a dirty line of that left in the cache would one day be written back over the program's data
++	 * (write-combined: the program's and the GPU's writes go straight to memory). dc civac by
++	 * address works on the line whatever the alias's memory type.
++	 */
++	redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
+ 
+ 	IOLockLock(gGPULock);
+ 	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+@@ -920,6 +930,26 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	 * SweetSurface allocates beyond the picture, when the descriptor has them.
+ 	 */
+ 	size = round_page_64(s->allocSize);
++	uint64_t offset = s->offset;
++	uint32_t flags = 0;
++	if (!redwood_gpu_identity() && s->wrapped) {
++		/*
++		 * kunzite (glue plan 3.2): client memory's descriptor starts at the page below the
++		 * client's address, and its pixels start wrapDelta into it. Mapped from byte 0 for
++		 * allocSize, the GPU saw the picture wrapDelta bytes early and its end unmapped. The
++		 * buffer is mapped for wrapDelta + allocSize and its offset carries the delta.
++		 */
++		size = round_page_64((uint64_t)s->wrapDelta + s->allocSize);
++		offset += s->wrapDelta;
++		if (size > s->memory->getLength()) {
++			s->release();
++			return kIOReturnUnsupported;
++		}
++		/* memory the task could only read (the read-only fallback of sweet_surface_use_task_memory): so may the GPU */
++		if ((s->memory->getDirection() & kIODirectionIn) == 0) {
++			flags = MSM_BO_GPU_READONLY;
++		}
++	}
+ 	if (!redwood_gpu_identity() && !s->wrapped) {
+ 		IOBufferMemoryDescriptor * bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+ 		uint64_t want = round_page_64(s->allocSize + 64ull * s->bytesPerRow);
+@@ -937,7 +967,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	request->size = size;
+-	request->offset = s->offset;
++	request->offset = offset;
+ 	request->rowBytes = s->bytesPerRow;
+ 	request->width = s->width;
+ 	request->height = s->height;
+@@ -961,7 +991,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	if (b != NULL) {
+ 		memory->release();
+ 		s->release();
+-	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle)) != NULL) {
++	} else if ((b = newBuffer(s->memory, 0, size, flags, &request->handle)) != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *) s->kernelAddress();
+ 		b->surface = s;

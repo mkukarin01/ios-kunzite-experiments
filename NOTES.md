@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #54, 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 0997 (K5's R2 part), 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -40,6 +40,10 @@ The log of K0-U3 is the handoff below this section.
 **Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
 U4 way 1~~ (done) -> **~~G4~~ (reached)** -> ~~the user's wider look~~ (done) -> **boot #54: 0996
 + the waiting wrapper** (the UI starts on the GPU by itself; the logo gauge) -> the deferred list
+**0997 written (K5's R2 part: write-combined buffers by default, a push at creation, wrapDelta,
+read-only client memory); next boot #56 tests it** (below). The keyboard blur (`sb3`) is parked
+with /topaz/sb3 on and the plain four-tap source: Settings' keyboard right, Safari's black (boot
+#55 entry).
 **Boot #54 done (entry in the log): the GPU was kept about 33 s after `fastboot boot` (#53: 3 min
 11 s), and backboardd started directly on it, with no wait and no restart.** Open: the gauge's
 own lines were not captured (see the entry), and the black Safari keyboard came back on the
@@ -172,9 +176,25 @@ first).** Steps 1 and 2 are done (log entry "BOOT #53").
   - old or garbage pixels: F6 coherency, or the deferred `gpu_cached=0`;
   - wrong blending: framebuffer fetch, the open GMEM-range question below.
 
+**Next - boot #56 (the user pushes 0997, CI builds).**
+- Image: the CI kernel with 0997. Cmdline: #54's (standard + `sweetusb=2 kgpu=21 kgpu_keep=1`).
+- Check, in order:
+  - the UI comes up on the GPU as on #54;
+  - eagl-check on the Adreno (`/run?a=/tmp/eagl-check` after kjoin + libtopaz-gl in /tmp, as on
+    #53): the triangle right through write-combined buffers;
+  - RedwoodGPU's statistics line ("N submissions in M ms: ... KB out of the cache in U us a
+    submission"): the KB should fall to the surfaces' pushes only (#55: 25769 KB in 7
+    submissions);
+  - frame times in eagl's "after N frames" lines (#53 about 5.5 ms);
+  - the user's look (text, images, Safari);
+  - no CONTEXT 0 FAULT. A fault naming a read-only surface means CoreAnimation draws into client
+    memory it could only read.
+- Back to the old buffers without a build: `gpu_cached=1` in the cmdline.
+
 **Deferred (after G4, in this order):**
-1. `gpu_cached=0` / write-combined buffers, read-only client memory and the wrapDelta (§3.2, K5's
-   R2 part).
+1. ~~`gpu_cached=0` / write-combined buffers, read-only client memory and the wrapDelta~~ (0997, to
+   test on #56). Still from §3.2: `trapLock` waiting for a GPU-drawn surface and invalidating it
+   (screenshots, snapshots, kshot).
 2. UCHE_GMEM_RANGE reads 0 even while the GPU is held (open question 1). If CoreAnimation's
    framebuffer fetch draws wrong, it is the first suspect.
 3. Holding the GPU for hours (open question 4).
@@ -1745,7 +1765,10 @@ arrival times in census-boot55.txt.
     - [guess] A pass around sb3 reads its texture in the wrong space (8x-small texture read as if
       full size) or reads unwritten texels. CoreAnimation's own 32-37 blurs, with the same vertex
       shader and offsets, draw right, so sb3's taps are probably not it.
-  - **Left on the phone:** /topaz/sb3 present; the inject with the second source installed
+  - **Parked (the user, 20:21):** the plain four-tap source is back (Settings' keyboard right, Safari's
+    black either way), /topaz/sb3 stays. Next for Safari's keyboard: the passes around sb3 in
+    `BlurState::single_pass_blur` / `Context::blur_surface`; kshot to see each try.
+  - **Left on the phone before the park:** /topaz/sb3 present; the inject with the second source installed
     (previous one /topaz/lib/libtopaz-inject.dylib.prev). Remove /topaz/sb3 and restart backboardd
     for the old behaviour (Settings blocky, Safari black).
 
