@@ -37,8 +37,11 @@ It was checked by generating the table and applying it with the other two Mesa p
 
 **Next:** glue plan K0 = **0990 is done** (boots #46 without GPU boot-args and #47 with `kgpu=22`
 both pass on the CI kernel after 5b87e5c, sha256 99274a14...; entries below boot #45). **K1 =
-0991 (keep mode) is written**, not built or booted: push, CI, then boot #48 with
-`kgpu=21 kgpu_keep=1 kgpu_keep_s=1800` (entry after #47).
+0991 (keep mode) is done**: boot #48 kept the GPU 30 min under iOS with no GMU message and the
+same state in all 31 reports, then the undo ran clean (entry after #47). Found: the UCHE GMEM
+range reads 0 even with GX held; RBBM_NC_MODE_CNTL = 1. **Next: K2 + K3** (glue plan section
+4: page tables on demand, then submission and fences), each a patch and a boot on top of keep
+mode.
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -907,6 +910,33 @@ Expect "21 of 21 steps done", "THE GPU IS KEPT", a report every minute for 30 mi
 agent and the UI as usual, no GMU ERROR lines, "the kept GPU goes after 1800 s: kgpu_keep_s ran
 out", then the undo as #47 and "run over". Look for UCHE_GMEM_RANGE in the reports
 (open question 1) and RBBM_NC_MODE_CNTL (macrotile). A shorter first try: `kgpu_keep_s=120`.
+
+**BOOT #48 (2026-10-24 09:17, shim/out/shim-boot-48.img: standard cmdline + `sweetusb=2 kgpu=21
+kgpu_keep=1 kgpu_keep_s=1800`; kernel = CI after 04b0a29 (the pushed head), sha256 6c9631c2...):
+K1 KEEP MODE PASSES - THE ADRENO 710 STAYED UP 30 MIN UNDER iOS, THEN WENT DOWN CLEANLY.** Log:
+temp/ios-m8/usblog/live-boot48-20261024-0917.txt. Before boot: SHA256SUMS OK; nm has
+`_kunzite_adreno_shutdown`, `_redwood_gpu_on/_ready`, `_gpu_log`. "21 of 21 steps done; 52 writes
+to undo", then "THE GPU IS KEPT ... for 1800 s".
+- **31 reports (0..1800 s), all identical:** gx gdsc 0xf8222800, rpmh_power_state 0,
+  gfx_pwr_clk_status 0, cx_busy 0x71000000 (idle), rbbm_status 0x1, CP rptr/wptr 17/17,
+  sqe_cntl 1, hw_fault 0, CB0 FSR 0x400 (format field only, no fault), gmu2host_intr_info 0, HFI
+  message r/w 36/36, debug 0/0. **No GMU message in 30 min.**
+- **UCHE_GMEM_RANGE_MIN/MAX read 0 throughout**, with GX held. It is not a later write
+  clearing them: these two (lo) words never hold what HLOS writes (the trap/write-thru bases
+  next to them do). Open question 1 stays open, narrowed.
+- **RBBM_NC_MODE_CNTL = 0x1**: macrotile mode 1 (8 channels), as glue plan 3.3 planned to answer.
+- **hbb 14 holds**: 0x812 / 0x2 / 0x22 / 0x20 / 0x200000 in every report.
+- "the kept GPU goes after 1800 s: kgpu_keep_s ran out", "held 1800 s" (cx/gx gdsc on as #47),
+  then the 52 undo entries: CP halted first, OOB_GPU cleared, PREPARE_SLUMBER acked (GX off,
+  RPMh 0xf), CM3 into reset, RSC sleep done, HFI alias unmapped, ..., "after undo: cx gdsc
+  0x22f001 hw_ctrl 0x5ff4 gx gdsc 0x222801" (= #47), "run over".
+- System: 2 h 44 min up when checked (12:02); backboardd (pid 56) and SpringBoard (pid 26) never
+  restarted. driverkitd's one crash early in boot and the bluetoothd/fairplayd respawns are on
+  every boot (#45-#48, #46 without GPU args too): not the GPU's.
+
+Not tested: the exit from `reboot_kernel()` (only the timed exit ran). It is the same undo, run
+by the same thread, woken by `kunzite_adreno_shutdown()`. Next: glue plan K2 (page tables on
+demand, `redwood_gpu_map/unmap/address`) and K3 (submission), on top of keep mode.
 
 **What to expect (read from the merged code before boot #25; boots #25-#31 above are what was seen):**
 - Standard cmdline (`sweetfb_stayon=1 sweetfb_hz=30`): should look like #24. 0948 now tells
