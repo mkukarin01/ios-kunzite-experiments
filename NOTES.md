@@ -48,8 +48,11 @@ the fence through an uncached word, ring wrap, step 24) is done: boot #50** (one
 submissions around the ring, all fences in order, no fault; entry after #49). **Next: K4**
 (parameters, `RedwoodGPUStart()`, a userland client). **K4 = 0994 + redwood-check is done: boot
 #51** (userland read all 14 parameters and made, mapped, wrote and freed buffers through
-RedwoodGPU; entry after #50). Watch: the CX GDSC read 0x5022f001 after #51's undo. **Next:** K5
-or U1 + U3.
+RedwoodGPU; entry after #50). Watch: the CX GDSC read 0x5022f001 after #51's undo (#52's read
+0x22f001 again). **U1 + U3 are done: boot #52 = G3** (Mesa 25.0.7 freedreno FD710, built by
+userland/mesa/mk-mesa-mac.sh, drew GL and GLES2 triangles on the Adreno 710 through RedwoodGPU,
+matching softpipe; entry after #51). **Next:** U2 (eagl/inject libraries), K5 (surfaces), then U4
+(backboardd: ask first).
 
 ## Earlier handoff (2026-10-23, superseded by the one above)
 
@@ -1234,6 +1237,12 @@ Log: temp/ios-m8/usblog/live-boot52-20261024-1338.txt.
   Keep report at 60 s: **fence 607 of 607** (205 submissions from Mesa, all retired); ring wptr
   2291 (wrapped again); CP idle, hw_fault 0, CB0 FSR 0x400; GPU addresses in 1 free range. No
   CONTEXT 0 FAULT, no GMU ERROR, no panic.
+- **The end:** at 900 s "the kept GPU goes ... kgpu_keep_s ran out"; the reports unchanged from
+  60 s (fence 607 of 607); RedwoodGPUStop (silent), then "undoing 54 writes", slumber acked,
+  "gpu page tables made on demand: freed 3 pages" (grown for Mesa's buffers), "after undo: cx
+  gdsc 0x22f001 hw_ctrl 0x5ff4 gx gdsc 0x222801", "run over". **The CX GDSC is back to 0x22f001**:
+  #51's 0x5022f001 did not recur (still not explained). The log has 0 CONTEXT 0 FAULT, GMU ERROR
+  or panic lines.
 
 **Milestone G3 is reached: Mesa draws a triangle on the Adreno 710**, OpenGL and OpenGL ES with
 shaders, checked against softpipe. Next is U2 (eagl/inject libraries), then K5 and U4
