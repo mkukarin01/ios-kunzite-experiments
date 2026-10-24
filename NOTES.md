@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #59, Photos' hang traced to fairplayd, 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: fairplayd's job hidden, 2026-10-25) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -329,9 +329,20 @@ tag xnu-boot-59; cmdline #54's).** Log: temp/ios-m8/usblog/live-boot59-20261025-
 **Boot #59 (fork 1000) is up; 1000 works as written (status 0x26004001 everywhere), but Photos' blank
 screen turned out to be a different chain: Photos -> checkpointd -> fairplayd, which never answers**
 (log entry "BOOT #59"). assetsd was not even started, so 1000's effect on TCC is still untested.
-**Next: the user's call:** hide fairplayd's job (launchd.plist cache, a backup kept; it takes effect
-at the next boot) so checkpointd fails fast instead of hanging, and then see what Photos and assetsd
-do.
+**fairplayd's job is hidden (the user's OK, 03:30), in effect from the next boot.**
+- /System/Library/xpc/launchd.plist on the phone is now the cache without
+  `/System/Library/LaunchDaemons/com.apple.fairplayd.H2.plist` (MachServices com.apple.fairplayd,
+  .versioned, com.apple.unfreed): 531 -> 530 jobs, binary plist, 795103 bytes, owner 0:0.
+- The original (795414 bytes, 0:80) is **/System/Library/xpc/launchd.plist.pre-fairplay**.
+- Copies are in the main repo's temp/ios-m8/u4/fairplay/.
+- **Rollback:** `/mv?p=/System/Library/xpc/launchd.plist.pre-fairplay&to=/System/Library/xpc/launchd.plist`
+  (after `/rm` of the new one), then reboot.
+
+**Next - boot #60** (shim/out/shim-boot-60.img = #59's kernel and cmdline):
+- no "exec fairplayd.H2" in the log;
+- open Photos: does it draw, does checkpointd answer, does assetsd start, and with 1000 does it get
+  past "assetsd requires TCCPhotosService access"?
+- then the wallpaper list, and a screenshot saved to DCIM.
 
 **Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
 ```
