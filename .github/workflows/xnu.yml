@@ -20,6 +20,8 @@ on:
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
+    tags:
+      - "xnu-*"
 
 
 concurrency:
