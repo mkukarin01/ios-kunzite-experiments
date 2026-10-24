@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #58 (0999, write-combined buffers), 2026-10-24) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: Photos scouting -> 1000, 2026-10-24) <<<
 
 **Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
 (K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
@@ -222,6 +222,31 @@ repo's temp/ios-m8/crashes/.
   NSDictionary with a nil object ("attempt to insert nil", via `dictionaryWithObjects:forKeys:count:`).
   The home-screen preview image of a view comes back nil. [guess] It is the same Photos/wallpaper
   chain (no poster image), or a view snapshot this port does not give; check again once assetsd lives.
+- **Followed up (21:24-21:32), new tools `userland/gpu/kcsops` and `ktcc`:**
+  - **kcsops** NAME|PID (or `-w SECONDS NAME`, to catch a process that lives under a second) prints
+    csops status, identity, and the XML and DER entitlement blobs with tcc.allow / kTCCServicePhotos
+    found or not.
+    - On #58, SpringBoard, tccd, locationd, PosterBoard, the agent and **assetsd (caught with -w
+      while the user opened Photos)** are all `0x26000001` = VALID PLATFORM_BINARY SIGNED.
+    - Every blob is complete: assetsd XML 5643 bytes and DER 3726, both with tcc.allow and
+      kTCCServicePhotos.
+    - **CS_ENTITLEMENTS_VALIDATED (0x4000) is on no process.**
+  - **ktcc** (TCCAccessPreflight / TCCAccessCheckAuditToken through the private TCC framework,
+    dlopen):
+    - **denied** for Photos both signed with tcc.allow = kTCCServicePhotos and without;
+    - `csops_audittoken` on its own token works (status and DER), so the kernel gives tccd what it
+      asks for.
+  - tccd's strings: "Granting %@ access to %@ via entitlement 'com.apple.private.tcc.allow'",
+    `SecTaskCopyValuesForEntitlements`, "Failed csops_audittoken()", and a `codesignStatus` per client.
+  - The AMFI stand-in's `sweet_amfi_vnode_check_signature` sets CS_SIGNED and CS_PLATFORM_BINARY,
+    never CS_ENTITLEMENTS_VALIDATED. exec copies that flag from the blob (kern_exec.c :1391).
+  - **Fork 1000 sets it** (`1000-kunzite-amfi-entitlements-validated.patch`): compiled with CI's line,
+    0 warnings; replay 246 applied, the 4 usual skips. [guess] That is tccd's gate. **Test on the next
+    boot:**
+    - `kcsops SpringBoard` shows 0x26004001;
+    - `ktcc` (signed) granted and `ktcc-plain` denied;
+    - Photos opens, the wallpaper list fills, screenshots are saved (DCIM);
+    - no assetsd CRASH in the log.
 
 **Next - boot #58 (the user pushes and tags 0999, CI builds).**
 - Image: the CI kernel with 0999. Cmdline #54's: standard + `sweetusb=2 kgpu=21 kgpu_keep=1`.
@@ -234,6 +259,9 @@ repo's temp/ios-m8/crashes/.
   - RedwoodGPU's statistics line ("N submissions in M ms: ... KB out of the cache") dropping from
     #57's 12-22 MB per line to only the surfaces' pushes;
   - the user's look.
+
+**Next - boot #59: CI kernel with fork 1000 (CS_ENTITLEMENTS_VALIDATED, for TCC / Photos); cmdline #54's.**
+Test as in the "Followed up" entry (kcsops, ktcc, Photos, wallpapers, screenshots).
 
 **Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
 ```

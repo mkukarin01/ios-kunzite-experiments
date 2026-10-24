@@ -1,0 +1,34 @@
+kunzite: the AMFI stand-in marks the code it accepts CS_ENTITLEMENTS_VALIDATED, as AMFI does for code
+whose entitlements it trusts; exec copies the flag from the blob to the process (kern_exec.c). On #58
+every process's status was 0x26000001 (VALID, PLATFORM_BINARY, SIGNED) and tccd granted nothing by
+com.apple.private.tcc.allow: assetsd, whose signature carries kTCCServicePhotos and whose
+entitlements csops and csops_audittoken return in full (XML and DER), was denied Photos and threw
+"assetsd requires TCCPhotosService access" (no Photos, no wallpapers, no screenshots); a test
+program signed with the same entitlement was denied too. tccd keeps each client's codesignStatus.
+[guess, to test on the next boot: that is tccd's gate.]
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 49ead96..98eb498 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -271,6 +271,11 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, sweet_amfi_register);
+  * processes without it. Every signed binary on the root filesystem is a
+  * platform binary. New signatures (ubc_cs_blob_add passes its writable copy;
+  * revalidation passes the read-only blob itself) get their entitlements here.
++ * And CS_ENTITLEMENTS_VALIDATED, which AMFI sets on code whose entitlements it
++ * trusts: exec copies it to the process too. Without it (kunzite #58: status
++ * 0x26000001 everywhere) tccd granted nothing by com.apple.private.tcc.allow:
++ * assetsd, whose signature has kTCCServicePhotos, was denied Photos and threw
++ * "assetsd requires TCCPhotosService access". [guess, to test: tccd's check.]
+  */
+ static int
+ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+@@ -280,7 +285,7 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+     __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
+ {
+ 	mount_t mp = vnode_mount(vp);
+-	*cs_flags |= CS_SIGNED;
++	*cs_flags |= CS_SIGNED | CS_ENTITLEMENTS_VALIDATED;
+ 	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+ 		*cs_flags |= CS_PLATFORM_BINARY;
+ 	}
