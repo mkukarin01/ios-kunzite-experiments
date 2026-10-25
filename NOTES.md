@@ -1,78 +1,76 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: os_log read -> 1001, 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #61, 2026-10-25) <<<
 
-**Where things stand.** Branch `kunzite-topaz-gpu`, 237 patches, last kernel patch **0995
-(K5-min), in the CI kernel sha256 5acb4f65... (origin 7966ee2)**. **U2 is built, and on boot #53
-eagl-check passed on softpipe and on the Adreno**: the EAGL table works through iOS's own
-OpenGL ES. **U4 is in (way 1, 19:03): backboardd draws with Mesa on the Adreno, and G4 is
-reached (the user's look, 19:10).** Seen by the user:
-- the CPU path's redraw artifacts are gone;
-- transparent layers are right;
-- the red tint after the first power-button press (always-on display) is gone, and the colours
-  are right;
-- most animations are smooth;
-- Safari renders correctly;
-- the Settings -> About crash did not show (not sure);
-- the wallpaper cannot be judged: the image has none.
-**The phone's root now has (persistent, all over the agent; the user said this iOS root is spare
-firmware, to be configured on the fly):**
+**Where things stand.** Branch `kunzite-topaz-gpu`, 247 patches, last kernel patch **1001
+(sandbox extension tokens), in the CI kernel sha256 2171df42... (tag xnu-boot-60)**; last image
+shim/out/shim-boot-61.img, cmdline #54's + `sweetusb=2 kgpu=21 kgpu_keep=1`, fairplayd's job
+still hidden. The UI has run on the GPU since #54 (write-combined buffers since 0999/#58; the
+6 h hold on #58 came through without a fault), and **boot #61 is the first boot with the photo
+chain alive** (log entry "BOOT #61"): 1001's tokens are issued and consumed as designed,
+assetsd stays up and creates Photos.sqlite, the first screenshot ever is saved to DCIM and
+imported (thumbnailed) by assetsd, and Photos (MobileSlideShow) execs without a crash. Open
+from #61, all needing a live phone: Photos' own screen, the PosterBoard .ips (the wallpaper
+gallery is still empty; PosterBoard aborts on the parked `_imageForView:` nil), the os_log
+check that "Failed to issue sandbox extension" is gone, and a second screenshot landing in the
+grid. The phone was unplugged at 12:22, so the log ends there.
+
+**The phone's root (persistent; the user said this iOS root is spare firmware, to be configured
+on the fly):**
 - /topaz/lib/{libOSMesa.8.dylib, libtopaz-gl.dylib, libtopaz-inject.dylib} (0644, dirs 0755);
-- /usr/libexec/real/backboardd: the stock binary, moved;
-- /usr/libexec/backboardd: the wrapper, built with `BBD_REAL=/usr/libexec/real/backboardd`.
-- **Rollback:** `/rm?p=/usr/libexec/backboardd`, `/mv?p=/usr/libexec/real/backboardd&to=/usr/libexec/backboardd`,
-  then `/kill` backboardd. **Off without touching files:** `gl=0` in the cmdline. On a boot
-  without the GPU kept, inject waits 5 s, finds no RedwoodGPU and leaves CoreAnimation on the CPU.
-- **Every boot from now on:** the GPU comes up after backboardd would start, so the wrapper
-  (installed 19:41, the previous one kept as /usr/libexec/backboardd.prev) waits for RedwoodGPU
-  up to 90 s. If the GPU is not there by then, backboardd starts on the CPU and a child of the
-  wrapper restarts it once the GPU comes. No manual kill. Fork 0996 makes the GPU come sooner and
-  shows it on the boot logo. Glue milestones G1-G3
-reached: the GPU is kept under iOS, RedwoodGPU is published, and Mesa 25.0.7 (freedreno FD710)
-draws through it (boot #52). Last booted kernel: the CI build after 91ef60f (sha256
-74d75394...), image shim/out/shim-boot-52.img. The step plan is the main repo's
-`ios/gpu-glue-plan.md`:
-- §3.1 is R1's gate table, i.e. what K5 edits, with line numbers in the series' files;
-- §3.5 and §3.6 hold the facts U2 and U4 need;
-- §4-§7 give the steps and their order.
+  /topaz/sb3 is on (the plain four-tap blur; the pre-sb3 inject is libtopaz-inject.dylib.prev);
+- /usr/libexec/real/backboardd: the stock binary; /usr/libexec/backboardd: the waiting wrapper
+  (the one before it is /usr/libexec/backboardd.prev). It waits for RedwoodGPU up to 90 s, then
+  starts on the CPU and restarts itself once the GPU comes (fork 0996 brings the GPU up ~33 s
+  after `fastboot boot`, so since #54 it has not had to wait).
+  **Rollback:** `/rm?p=/usr/libexec/backboardd`,
+  `/mv?p=/usr/libexec/real/backboardd&to=/usr/libexec/backboardd`, then `/kill` backboardd.
+  **Off without touching files:** `gl=0` in the cmdline.
+- /System/Library/xpc/launchd.plist: the cache without fairplayd.H2 (530 jobs; the original is
+  /System/Library/xpc/launchd.plist.pre-fairplay; copies in temp/ios-m8/u4/fairplay/ of the main
+  repo). **Rollback:** `/rm?p=/System/Library/xpc/launchd.plist`, then
+  `/mv?p=/System/Library/xpc/launchd.plist.pre-fairplay&to=/System/Library/xpc/launchd.plist`.
+- /tmp keeps the tools across boots (kjoin, kfind, kdmesg, kshot, kcsops, ktcc, eagl-check).
+- The GPU glue plan (`ios/gpu-glue-plan.md` in the main repo) is walked to its end for now:
+  G1-G4 and the long hold are done; what remains of it is the deferred list below.
+
 The log of K0-U3 is the handoff below this section.
 
-**Order from here:** ~~K5-min~~ (done, 0995) -> ~~U2~~ (done) -> boot #53: ~~K5 kernel, eagl-check,
-U4 way 1~~ (done) -> **~~G4~~ (reached)** -> ~~the user's wider look~~ (done) -> **boot #54: 0996
-+ the waiting wrapper** (the UI starts on the GPU by itself; the logo gauge) -> the deferred list
-**Boot #56 (0997) panicked at backboardd's first GPU buffer: write-combined IOBMDs cannot be made
-from the lower DDR bank's pages** (log entry). **0998 (cached by default again) is in CI's kernel
-887472f9 (tag xnu-boot-57): boot #57 is up, with the UI on the GPU and eagl-check passing** (log
-entry). `gpu_cached=1` is no longer needed. 0997's other changes (push at creation, wrapDelta,
-read-only client memory) are in; no visible check of those yet. The keyboard blur (`sb3`) is parked
-with /topaz/sb3 on and the plain four-tap source: Settings' keyboard right, Safari's black (boot
-#55 entry).
-**Boot #54 done (entry in the log): the GPU was kept about 33 s after `fastboot boot` (#53: 3 min
-11 s), and backboardd started directly on it, with no wait and no restart.** Open: the gauge's
-own lines were not captured (see the entry), and the black Safari keyboard came back on the
-boot's first GPU start.
+**History in one line:** 0995 (K5-min) -> U2 (#53, the EAGL table works) -> U4 way 1 + G4
+(#53-#54, the UI on the GPU) -> 0996 (the gauge; the GPU kept ~33 s, backboardd never waits) ->
+0997/#56 panicked on write-combined IOBMD pages -> 0998/#57 back on cached buffers -> 0999/#58
+write-combined again, right this time (`ptoa`), 6 h hold, smoother than an iPhone X (the user's
+words) -> #59-#61 the photo chain: fairplayd hidden (#60, Photos past checkpointd), 1000
+(entitlements validated), 1001 (sandbox tokens) -> assetsd lives, the library is created, the
+first screenshot is saved and imported.
 
-**Next - boot #54 (the user pushes 0996, CI builds).**
-- Image: the CI kernel with 0996 (check that `kg_logo` is in it: `xcrun nm | grep kg_logo` shows
-  nothing, the functions are static, so look for the string "logo gauge"). Cmdline standard
-  + `sweetusb=2 kgpu=21 kgpu_keep=1`. No kgpu_delay: it is now the most keep mode waits for the
-  root filesystem, 60 s by default.
-- Expect in the log, in order:
-  - "keep mode: the root filesystem is mounted after N ms; the run starts";
-  - "logo gauge: the logo at X,Y, W x H";
-  - steps 1-21 with no pauses;
-  - "RedwoodGPU published", then "logo gauge: green, the GPU is ready";
-  - the wrapper's "topaz: the window server waits for the GPU (up to 90 s)", then "the GPU is
-    there after N s: the window server starts on it", or no wait if the GPU came first;
-  - "backboardd starts WITH DYLD_INSERT_LIBRARIES", an FD710 context, "RedwoodGPU: client
-    backboardd (open 1)". No kill by hand.
-- On the panel (the user): the logo fills amber from the bottom, turns green, then iOS draws.
-- Measure: `fastboot boot` -> agent up -> "RedwoodGPU published" -> first frame (#53: 41 s to the
-  agent, 3 min 11 s to RedwoodGPU).
-- If the logo turns red, or the run fails early: the run now starts right after the root mount,
-  not 60 s into the boot. [guess] Something a step needs may not be up that early. Boot-args to tell: `kgpu_pause=1500` (the old pauses), or the old fixed delay by a non-keep run.
-- If the gauge says "nothing but black" or finds a huge box: the logo is not where it searches
-  (x 140-940, y 400-2000), or other pixels are lit there. Its log line has the box. -> **G4** (lock screen, home screen and Settings drawn by the GPU) -> the deferred list.
+**Next - boot #62** (no new patch needed: kernel 2171df42 and shim-boot-61.img are still the
+current ones; the CI needs nothing until a patch is written). At fastboot time restart the log
+listener and the failure watch — they died with the Mac session on #61 (the watch line is in the
+"Long run" block below):
+```
+cd ios/ios-topaz-experiments && python3 tools/udp-log.py ../../temp/ios-m8/usblog/live-bootNN-$(date +%Y%m%d-%H%M).txt
+```
+Checks waiting on a live phone, in this order:
+1. Photos on screen: open it, then `/run?a=/tmp/kshot` and `/get` the PNGs — does the library
+   view draw (empty, or with IMG_0001's thumbnail)? Any new MobileSlideShow/assetsd .ips?
+   (On #61 it only exec'd; its screen was covered by the wallpaper sheet.)
+2. The PosterBoard .ips of 12:19:04 if it survived, and any new one: symbolize with the
+   temp/ios-m8/crashes pipeline (`ipsw dyld macho` for the unslid __TEXT, then a2s) to confirm
+   the abort is still `_imageForView:` nil.
+3. os_log once more (tracev3 + uuidtext + timesync -> a .logarchive, as for #60): "Failed to
+   issue sandbox extension" should be gone; tccd's Photos grant should complete end to end.
+4. A second screenshot: DCIM/100APPLE/IMG_0002.PNG, and then whether Photos' grid shows it.
+Then pick from the deferred list (the user's order): container path op 4
+(webbookmarksd/syncdefaultsd) -> PosterBoard's nil preview -> Safari's keyboard sb3 ->
+mediaserverd's VideoToolbox abort -> Date & Time hang -> trapLock -> GMEM range -> phase D ->
+the agent's /put streaming (ask first; it replaces the agent binary).
+
+**How to check a patch before pushing** (unchanged): `bash
+temp/ios-m8/series-check/replay.sh <fork>/xnu/patches <tree>` (only TrustCache,
+iobuffermemd_monterey, skywalk_sonoma, syntax_checker_sonoma skip); `bash
+temp/ios-m8/series-check/ci-cxx.sh <tree>/<file> out.o` (ci-cc.sh for bsd/ C); `xcrun nm -u
+out.o` against the CI kernel's symbols.
 After each step: rewrite this section, an entry below, the plan's progress lines, commit.
 
 **Done - K5-min, patch 0995 `0995-kunzite-gpu-k5-surfaces.patch`** (entry in the log below):
@@ -430,6 +428,33 @@ Old plan for #60 (done):
 - open Photos: does it draw, does checkpointd answer, does assetsd start, and with 1000 does it get
   past "assetsd requires TCCPhotosService access"?
 - then the wallpaper list, and a screenshot saved to DCIM.
+
+**BOOT #61 (2026-10-25 12:17-12:22; kernel 2171df42 = 1000 + 1001, tag xnu-boot-60, image
+shim-boot-61.img, cmdline #54's, fairplayd still hidden; the log is
+temp/ios-m8/usblog/live-boot61-20261025-1217.txt): 1001's sandbox-extension tokens hold, and with
+them the photo chain comes up for the first time.**
+- Tokens: tccd op 5 at 12:17:46 (issue) and donotdisturbd op 6 at 12:18:00 (consume) — the
+  stand-in is used exactly as designed, and nothing aborts around either.
+- assetsd: exec 12:18:40, alive to the log's end (12:22). It created the library (Photos.sqlite
+  1904640 bytes + wal/shm, .Photos_SUPPORT, Thumbnails, Metadata, CPL, Journals, MISC) and then
+  processed the new screenshot: surfaces 43/44 (74x160 BGRA / f420 thumbnails) and 45 (a Jpeg
+  surface) in the log.
+- **Screenshots: the first ever saved — DCIM/100APPLE/IMG_0001.PNG (1125x2436 PNG, 269393
+  bytes).** Verified on the Mac (temp/ios-m8/u4/boot61/): a clean home-screen capture — icons,
+  the Spotlight pill, the dock with a badge — so backboardd's GPU composite ->
+  ScreenshotServicesService -> PNG in DCIM -> assetsd import all work. (One
+  "SWEET SURF: ScreenshotServicesService trap 1" line appears and did not stop the save.)
+- Photos: MobileSlideShow exec 12:19:04, **no crash line**. Its own screen was not seen: the
+  wallpaper sheet was up in both kshots taken at 12:19 (kshot-2/4, same directory).
+- Wallpapers: the Add New Wallpaper sheet opens and renders (title, X button, dimmed backdrop)
+  but its gallery is empty. PosterBoard aborted at that moment (sig 6, 12:19:04, pid 218) and
+  launchd relaunched it at once (exec again in the log). Same shape as the parked
+  `_imageForView:` nil crash from the #58 survey; the .ips was not pulled — the phone was
+  unplugged at 12:22, which is also where the log ends.
+- GPU: no CONTEXT 0 FAULT, no GMU ERROR, no panic; frame 8240 by 12:22 with normal per-frame
+  stats (85 GL calls, ~2 ms). driverkitd's early sig 9 is the usual one.
+- Left for the next boot: Photos' own screen, the PosterBoard .ips (12:19:04), the os_log check
+  that "Failed to issue sandbox extension" is gone, and a second screenshot landing in the grid.
 
 **Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
 ```
