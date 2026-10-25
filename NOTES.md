@@ -61,7 +61,9 @@ Checks waiting on a live phone, in this order:
 3. os_log once more (tracev3 + uuidtext + timesync -> a .logarchive, as for #60): "Failed to
    issue sandbox extension" should be gone; tccd's Photos grant should complete end to end.
 4. A second screenshot: DCIM/100APPLE/IMG_0002.PNG, and then whether Photos' grid shows it.
-Then pick from the deferred list (the user's order): container path op 4
+Then either the **sideload route** (the AppSync-equivalent of the scout entry below: a
+libtopaz-mis interposer + installd/SpringBoard wrappers + kinst, tested with a self-built
+ad hoc-signed IPA) or the deferred list (the user's order): container path op 4
 (webbookmarksd/syncdefaultsd) -> PosterBoard's nil preview -> Safari's keyboard sb3 ->
 mediaserverd's VideoToolbox abort -> Date & Time hang -> trapLock -> GMEM range -> phase D ->
 the agent's /put streaming (ask first; it replaces the agent binary).
@@ -455,6 +457,54 @@ them the photo chain comes up for the first time.**
   stats (85 GL calls, ~2 ms). driverkitd's early sig 9 is the usual one.
 - Left for the next boot: Photos' own screen, the PosterBoard .ips (12:19:04), the os_log check
   that "Failed to issue sandbox extension" is gone, and a second screenshot landing in the grid.
+
+**AppSync scout (2026-10-25 evening; the user's clone is the main repo's temp/AppSync, GPLv3 —
+behaviour reference only, no code into the fork). The question was what to do about fairplayd;
+the answer the scout gives: AppSync is not about fairplayd at all, and that is exactly why it
+fits us.**
+- What it is (read in full): two injected dylibs + a standalone installer.
+  - installd dylib: MSHookFunction on /usr/lib/libmis.dylib's
+    `MISValidateSignatureAndCopyInfo[WithProgress]` — call the original; if it leaves the info
+    dict nil (invalid signature), FABRICATE the dict: Entitlements parsed out of the binary's
+    embedded blob (their dump.cpp), TeamID/SigningID (= CFBundleIdentifier), a computed CdHash
+    (bazad/Project-Zero-lineage cdhash.c), SignerCertificate = a hardcoded Apple iPhone OS
+    Application Signing cert, SigningTime = now, SignatureVersion 0x20100, SignerType 2 (App
+    Store). Plus SecCertificateCreateWithData / SecCertificateCopySubjectSummary hooks so those
+    raw cert bytes parse as a certificate.
+  - FrontBoard dylib: FBSSignatureValidationService `trustStateForApplication:` forced to 8
+    (trusted) — the launch-time check behind "app is no longer available".
+  - appinst: hands the IPA to `LSApplicationWorkspace installApplication:withOptions:`; no
+    installation logic of its own. Its only entitlement: platform-application.
+- **Verified against our userland**: `ipsw dyld extract` of the 20H392 cache
+  (temp/gpu-glue-r/dsc/20H392__iPhone10,3_6/libmis.dylib, 153712 bytes) shows BOTH
+  `_MISValidateSignatureAndCopyInfo` (0x1d1ff78d0, a stub) and
+  `_MISValidateSignatureAndCopyInfoWithProgress` (0x1d1ff2fc4, the body) exported; the class and
+  selector `FBSSignatureValidationService` / `trustStateForApplication:` are in
+  FrontBoardServices. Every hook point AppSync uses exists here.
+- Why no Substrate is needed for the same trick: installd and SpringBoard are launchd jobs we
+  can wrap exactly like backboardd (move to *.real, wrapper sets DYLD_INSERT_LIBRARIES), and a
+  dylib with __DATA,__interpose sections redirects the libmis calls (our AMFI stand-in does not
+  enforce library validation; topaz_inject already rides DYLD_INSERT into backboardd). The
+  FrontBoard check is one class_replaceMethod in SpringBoard's context. The kernel side already
+  accepts ad hoc signatures (every /tmp tool runs), so the fake dict's CdHash only has to
+  satisfy installd's bookkeeping.
+- fairplayd reality (from the phone's own launchd.plist copy): the hidden job com.apple.fairplayd.H2
+  served com.apple.fairplayd, com.apple.fairplayd.versioned and com.apple.unfreed — the last on
+  **HostSpecialPort 17**, i.e. the channel amfid/the kernel side uses for FairPlay decryption.
+  That is SEP-backed crypto we cannot and need not emulate: App Store downloads
+  (FairPlay-encrypted) stay out of reach; sideloaded apps are not encrypted, so they never ask.
+  A second daemon, com.apple.fairplaydeviceidentityd, is still registered (not hidden) — watch
+  it for a crash loop on the next boot. With H2 hidden, bootstrap lookups fail fast, which
+  #60/#61 showed callers cope with best.
+- The likely real blockers for "install and run an app", in order: (1) containers — installd
+  asks containermanagerd for the app's data container, and our sandbox stand-in's container
+  path op 4 currently ENOENTs (the parked webbookmarksd/syncdefaultsd issue; same file to fix,
+  sweet_amfi.c); (2) the LSApplicationWorkspace -> lsd -> installd chain on a system with no
+  App Store; (3) GPLv3 — reimplement, borrow cdhash math from XNU/permissive originals.
+- Route (proposed, not started): kinst (appinst-equivalent, ours) + a libtopaz-mis interposer +
+  installd/SpringBoard wrappers, built by mk-topaz-gl.sh's pattern; the test is a self-built,
+  ad hoc-signed IPA. Boot #62 would combine the four pending photo checks with the first
+  install attempt.
 
 **Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
 ```
