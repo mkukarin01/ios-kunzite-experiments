@@ -1,8 +1,14 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #61, 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: kunzite-sw cut + sw-plan, 2026-10-25) <<<
 
-**Where things stand.** Branch `kunzite-topaz-gpu`, 247 patches, last kernel patch **1001
+**Where things stand.** The GPU work is merged: `kunzite` was fast-forwarded to the GPU tip
+(ce5cd8b) and **work continues on branch `kunzite-sw`** (same commit at the cut; next kernel
+patch 1002). The active plan is the main repo's **`ios/sw-plan.md`**: (1) crash survey of all
+boots so far, (2) the containers kit (sandbox stand-in ops 4/13/15/16/66/67 in sweet_amfi.c —
+op meanings already recovered from the 20H392 cache, see the sw-plan), (3) the Waiting widgets
+(likely PosterBoard). The AppSync sideload kit is parked until this SW base is settled (the
+user's call). Patch state: 247 applied, last kernel patch **1001
 (sandbox extension tokens), in the CI kernel sha256 2171df42... (tag xnu-boot-60)**; last image
 shim/out/shim-boot-61.img, cmdline #54's + `sweetusb=2 kgpu=21 kgpu_keep=1`, fairplayd's job
 still hidden. The UI has run on the GPU since #54 (write-combined buffers since 0999/#58; the
@@ -44,29 +50,35 @@ words) -> #59-#61 the photo chain: fairplayd hidden (#60, Photos past checkpoint
 (entitlements validated), 1001 (sandbox tokens) -> assetsd lives, the library is created, the
 first screenshot is saved and imported.
 
-**Next - boot #62** (no new patch needed: kernel 2171df42 and shim-boot-61.img are still the
-current ones; the CI needs nothing until a patch is written). At fastboot time restart the log
-listener and the failure watch — they died with the Mac session on #61 (the watch line is in the
-"Long run" block below):
+**Next - the sw-plan's first round** (details in `ios/sw-plan.md`; one CI cycle, then one boot
+that covers everything):
+1. **Patch 1002** (kunzite-sw): the containers kit's evidence pass — in sweet_sandbox_syscall,
+   debug-dump the raw arg structs of ops 4, 13, 15, 16, 66, 67 (copyin up to 128 bytes,
+   hex-print, answer as today). Verify (replay + ci-cc + nm), commit; the user pushes and tags
+   (xnu-boot-62), CI builds.
+2. **Boot #62** = kernel with 1002, image shim-boot-62.img, cmdline #54's. At fastboot time
+   restart the listener and the failure watch (they died with the Mac session on #61; the watch
+   line is in the "Long run" block below):
 ```
 cd ios/ios-topaz-experiments && python3 tools/udp-log.py ../../temp/ios-m8/usblog/live-bootNN-$(date +%Y%m%d-%H%M).txt
 ```
-Checks waiting on a live phone, in this order:
-1. Photos on screen: open it, then `/run?a=/tmp/kshot` and `/get` the PNGs — does the library
-   view draw (empty, or with IMG_0001's thumbnail)? Any new MobileSlideShow/assetsd .ips?
-   (On #61 it only exec'd; its screen was covered by the wallpaper sheet.)
-2. The PosterBoard .ips of 12:19:04 if it survived, and any new one: symbolize with the
-   temp/ios-m8/crashes pipeline (`ipsw dyld macho` for the unslid __TEXT, then a2s) to confirm
-   the abort is still `_imageForView:` nil.
-3. os_log once more (tracev3 + uuidtext + timesync -> a .logarchive, as for #60): "Failed to
-   issue sandbox extension" should be gone; tccd's Photos grant should complete end to end.
-4. A second screenshot: DCIM/100APPLE/IMG_0002.PNG, and then whether Photos' grid shows it.
-Then either the **sideload route** (the AppSync-equivalent of the scout entry below: a
-libtopaz-mis interposer + installd/SpringBoard wrappers + kinst, tested with a self-built
-ad hoc-signed IPA) or the deferred list (the user's order): container path op 4
-(webbookmarksd/syncdefaultsd) -> PosterBoard's nil preview -> Safari's keyboard sb3 ->
-mediaserverd's VideoToolbox abort -> Date & Time hang -> trapLock -> GMEM range -> phase D ->
-the agent's /put streaming (ask first; it replaces the agent binary).
+   In that one boot, in order:
+   - the crash survey: full CrashReporter listing, diff against temp/ios-m8/crashes/, pull and
+     symbolize every new .ips; the PosterBoard .ips of #61 12:19:04; whether
+     fairplaydeviceidentityd idles or crash-loops;
+   - the op dumps: what launchd's op 4 and containermanagerd's op 15/16 actually carry;
+   - the four photo checks still pending from #61: Photos' own screen (kshot), the os_log
+     "Failed to issue sandbox extension" line (a .logarchive as for #60), a second screenshot
+     into the grid, the Wallpaper list;
+   - the Waiting placeholders: what installcoordinationd/SpringBoard state says while they are
+     on screen.
+3. Then **patch 1003** implements the ops (registry + defaults) per what 1002 showed;
+   acceptance: webbookmarksd/syncdefaultsd stop aborting, containermanagerd's ops stop
+   erroring, /private/var/mobile/Containers/Data populates, the sandbox-op histogram diff is
+   otherwise clean.
+The older deferred list (Safari's keyboard sb3 -> mediaserverd's VideoToolbox abort -> Date &
+Time hang -> trapLock -> GMEM range -> phase D -> the agent's /put streaming, ask first) stands
+behind the sw-plan, and the AppSync sideload kit is parked until the SW base is settled.
 
 **How to check a patch before pushing** (unchanged): `bash
 temp/ios-m8/series-check/replay.sh <fork>/xnu/patches <tree>` (only TrustCache,
