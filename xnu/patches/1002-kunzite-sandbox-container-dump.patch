@@ -1,0 +1,100 @@
+kunzite: the sandbox stand-in dumps the container operations' arguments (the sw-plan's evidence
+pass, patch 1002). Boot logs show launchd calling op 4 twice a boot and containermanagerd calling
+ops 15 and 16 every boot, while webbookmarksd and syncdefaultsd abort on nil container paths;
+libsystem_sandbox's wrappers in the 20H392 cache name op 4 sandbox_container_path_for_audit_token/
+_for_pid, 13 the set_container_path family, 66 set for audit token, 67 = 0x43 container
+expected, but nothing names 15 and 16. Ops 4, 13, 15, 16, 66 and 0x43 (= 67) now print each call's
+argument struct word by word (as much as reads in, up to 128 bytes) plus any string the first
+words point at, and answer exactly as before: 4 and 0x43 still ENOENT, the rest still succeed
+with no data. One boot's log is the design input for 1003, which will answer the ops for real.
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -352,6 +352,66 @@
+ 	}
+ 	handle = OSIncrementAtomic64(&sweet_sandbox_handle_serial) + 1;
+ 	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++}
++
++/*
++ * kunzite 1002: the container-operations evidence pass (sw-plan S2). The ops the
++ * container plumbing uses, from libsystem_sandbox's wrappers in the 20H392 cache:
++ * 4 sandbox_container_path_for_audit_token/_for_pid (launchd asks, twice a boot),
++ * 13 sandbox_set_container_path_for_application_group/_for_signing_id,
++ * 66 sandbox_set_container_path_for_audit_token, 67 and 0x43
++ * sandbox_get_container_expected, and 15/16, which containermanagerd itself calls
++ * (their wrappers are not in libsystem_sandbox). Each call's argument struct is
++ * dumped word by word (as much as reads in), and any word that points at a string
++ * gets that string, so one boot's log shows what the callers actually send. The
++ * answers do not change: 4 and 0x43 still fail with ENOENT, the rest still
++ * succeed with no data. What 1003 answers comes from what this prints.
++ */
++static void
++sweet_sandbox_dump(struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t a[16];
++	char name[32];
++	char text[96];
++	size_t words = 0;
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	while (words < sizeof(a) / sizeof(a[0]) &&
++	    copyin(arg + words * sizeof(uint64_t), &a[words], sizeof(a[words])) == 0) {
++		words++;
++	}
++	if (words == 0) {
++		printf("SWEET Sandbox: %s op %d dump: nothing reads in\n", name, call);
++		return;
++	}
++	for (size_t i = 0; i < words; i += 4) {
++		printf("SWEET Sandbox: %s op %d words %lu: %016llx %016llx %016llx %016llx\n",
++		    name, call, (unsigned long)words,
++		    (unsigned long long)a[i],
++		    (unsigned long long)(i + 1 < words ? a[i + 1] : 0),
++		    (unsigned long long)(i + 2 < words ? a[i + 2] : 0),
++		    (unsigned long long)(i + 3 < words ? a[i + 3] : 0));
++	}
++	for (size_t i = 0; i < words && i < 8; i++) {
++		size_t length = 0;
++
++		if (a[i] <= 0x10000 || a[i] >= 0x100000000000ULL) {
++			continue;
++		}
++		if (copyinstr((user_addr_t)a[i], text, sizeof(text), &length) != 0 || length < 3) {
++			continue;
++		}
++		if (length > sizeof(text)) {
++			length = sizeof(text);
++		}
++		for (size_t j = 0; j < length; j++) {
++			if (text[j] < 0x20 || text[j] > 0x7e) {
++				text[j] = '.';
++			}
++		}
++		text[length - 1] = 0;
++		printf("SWEET Sandbox: %s op %d word %lu text %s\n", name, call, (unsigned long)i, text);
++	}
+ }
+ 
+ /* a private patch may answer which container a process is in (a strong definition wins) */
+@@ -372,12 +432,20 @@
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		sweet_sandbox_dump(p, call, arg);
+ 		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
+ 		return sweet_sandbox_extension_consume(arg);
+-	case 0x43:      /* container expected */
++	case 13:        /* set container path (app group / signing id) */
++	case 15:        /* containermanagerd's own, wrapper not in libsystem_sandbox */
++	case 16:        /* containermanagerd's own, wrapper not in libsystem_sandbox */
++	case 66:        /* set container path (audit token) */
++		sweet_sandbox_dump(p, call, arg);
++		return 0;
++	case 0x43:      /* container expected (sandbox_get_container_expected, op 67 decimal) */
++		sweet_sandbox_dump(p, call, arg);
+ 		return ENOENT;
+ 	default:
+ 		return 0;

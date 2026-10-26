@@ -52,10 +52,16 @@ first screenshot is saved and imported.
 
 **Next - the sw-plan's first round** (details in `ios/sw-plan.md`; one CI cycle, then one boot
 that covers everything):
-1. **Patch 1002** (kunzite-sw): the containers kit's evidence pass — in sweet_sandbox_syscall,
-   debug-dump the raw arg structs of ops 4, 13, 15, 16, 66, 67 (copyin up to 128 bytes,
-   hex-print, answer as today). Verify (replay + ci-cc + nm), commit; the user pushes and tags
-   (xnu-boot-62), CI builds.
+1. **Patch 1002 is written, verified and committed on kunzite-sw** (the containers kit's
+   evidence pass): `sweet_sandbox_dump()` prints each call's argument struct word by word
+   (up to 128 bytes) plus any string the first eight words point at, for ops 4, 13, 15, 16, 66
+   and 0x43. The compiler caught that 0x43 and decimal 67 are the same op
+   (sandbox_get_container_expected), so 0x43 keeps its own case with the dump. Answers are
+   unchanged: 4 and 0x43 still ENOENT, 13/15/16/66 still return 0. Verified: replay 248
+   applied with only the 4 expected skips and the patched file byte-identical to the edit;
+   CI's compile line clean; the undefined-symbol set identical to 1001's (36 = 36, nothing
+   new for the kernel to link). **The user pushes kunzite-sw and tags (xnu-boot-62); CI
+   builds.**
 2. **Boot #62** = kernel with 1002, image shim-boot-62.img, cmdline #54's. At fastboot time
    restart the listener and the failure watch (they died with the Mac session on #61; the watch
    line is in the "Long run" block below):
