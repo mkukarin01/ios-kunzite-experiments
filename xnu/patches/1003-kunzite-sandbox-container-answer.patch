@@ -1,0 +1,96 @@
+kunzite: the sandbox stand-in answers op 4, the container-path lookup (the containers kit's
+implementation, patch 1003; design from 1002's boot-#62 dump). Op 4 is called by everyone —
+cfprefsd alone 21,368 times in ten minutes on #62, retrying on the old ENOENT — with the struct
+{ pid, 0 or pid-version, the caller's out-buffer, 0x400 } in both the _for_pid and the
+_for_audit_token shapes (buf at word 2, length at word 3). Nothing ever calls the setters, so
+there is no registry: the answer is the target pid's home, /private/var/root for uid 0 and
+/private/var/mobile otherwise, copied into the caller's buffer; a pid that no longer exists
+gets ESRCH. The strong definition replaces the weak stand-in that returned ENOENT. 1002's
+argument dump now prints only with sweet_sbx_dump=1 in the boot-args, so the storm of console
+lines goes with the storm of retries.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -28,6 +28,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -353,6 +354,8 @@
+ 	handle = OSIncrementAtomic64(&sweet_sandbox_handle_serial) + 1;
+ 	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
+ }
++
++static TUNABLE(bool, sweet_sbx_dump, "sweet_sbx_dump", false);
+ 
+ /*
+  * kunzite 1002: the container-operations evidence pass (sw-plan S2). The ops the
+@@ -375,6 +378,11 @@
+ 	char text[96];
+ 	size_t words = 0;
+ 
++	/* kunzite 1003: the dump was the evidence pass; 1003 answers op 4, so it
++	 * prints only when asked for (sweet_sbx_dump=1 in the boot-args). */
++	if (!sweet_sbx_dump) {
++		return;
++	}
+ 	proc_name(proc_pid(p), name, sizeof(name));
+ 	while (words < sizeof(a) / sizeof(a[0]) &&
+ 	    copyin(arg + words * sizeof(uint64_t), &a[words], sizeof(a[words])) == 0) {
+@@ -414,11 +422,49 @@
+ 	}
+ }
+ 
+-/* a private patch may answer which container a process is in (a strong definition wins) */
+-__attribute__((weak)) int
+-sweet_sandbox_container_path(__unused user_addr_t arg)
++/*
++ * kunzite 1003: answer op 4, the container-path lookup. Boot #62's dump showed
++ * it is called by everyone (cfprefsd alone 21,368 times in ten minutes,
++ * retrying on our ENOENT) with the struct { pid, 0 or pid-version, the caller's
++ * out-buffer, 0x400 } — sandbox_container_path_for_pid/_for_audit_token, both
++ * with buf at word 2 and its length at word 3. Nothing calls the setters, so
++ * there is no registry to consult: the answer is the target's home
++ * (/private/var/root for uid 0, /private/var/mobile for everyone else). A pid
++ * that no longer exists gets ESRCH; the old answer was ENOENT for everything.
++ */
++int
++sweet_sandbox_container_path(user_addr_t arg)
+ {
+-	return ENOENT;
++	uint64_t a[5];
++	char path[] = "/private/var/mobile";
++	kauth_cred_t cred;
++	proc_t target;
++	size_t length;
++	int error, pid;
++
++	error = copyin(arg, a, sizeof(a));
++	if (error != 0) {
++		return error;
++	}
++	pid = (int)a[0];
++	if (pid <= 0) {
++		pid = proc_pid(current_proc());
++	}
++	target = proc_find(pid);
++	if (target == PROC_NULL) {
++		return ESRCH;
++	}
++	cred = kauth_cred_proc_ref(target);
++	if (kauth_cred_getuid(cred) == 0) {
++		strlcpy(path, "/private/var/root", sizeof(path));
++	}
++	kauth_cred_unref(&cred);
++	proc_rele(target);
++	length = strlen(path) + 1;
++	if (a[3] < length) {
++		return ENAMETOOLONG;
++	}
++	return copyout(path, (user_addr_t)a[2], length);
+ }
+ 
+ static int

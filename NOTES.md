@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #62, 2026-10-27) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: 1003 written+verified, 2026-10-27) <<<
 
 **Where things stand.** Branch **`kunzite-sw`** (the GPU line is merged into `kunzite` and
 pushed). **Boot #62 ran 1002's container-ops dump and settled the containers kit's design**
@@ -55,14 +55,19 @@ words) -> #59-#61 the photo chain: fairplayd hidden (#60, Photos past checkpoint
 first screenshot is saved and imported.
 
 **Next - two moves, independent of each other (details in `ios/sw-plan.md`):**
-1. **Patch 1003 (kunzite-sw, needs CI): answer op 4.** In sweet_sandbox_syscall: read
-   { pid, 0, buf, 0x400 }, copyout the target pid's home path ("/private/var/mobile" for uid
-   501, "/private/var/root" for 0, proc home otherwise), return 0 — no registry (nothing calls
-   the setters). Keep ops 13/15/16/66 as-is. Quiet the dump: keep 1002's dumper behind a
-   boot-arg (say sweet_sbx_dump=1) or first-use-per-caller, so cfprefsd's 70/s does not print.
-   Acceptance on the next boot: the op-4 storm collapses (a few hundred lines, not 21k),
-   webbookmarksd/syncdefaultsd produce no new nil-path .ips, /private/var/mobile/Containers
-   populates or at least stops erroring, everything else unchanged.
+1. **Patch 1003 is written, verified and committed on kunzite-sw** — a strong
+   `sweet_sandbox_container_path` replaces the weak ENOENT stand-in: read
+   { pid, 0/pid-version, buf, 0x400 } (buf at word 2, length at word 3 — both shapes), answer
+   with the target pid's home (/private/var/root for uid 0, /private/var/mobile otherwise);
+   ESRCH for a dead pid; ENAMETOOLONG for a short buffer. 1002's dump prints only with
+   sweet_sbx_dump=1. Verified: replay 249 applied (4 expected skips, file byte-identical),
+   CI's compile line clean, and the six new undefined symbols (_proc_find, _proc_rele,
+   _kauth_cred_proc_ref, _kauth_cred_getuid, _kauth_cred_unref, _current_proc) all present
+   in the CI kernel binary. **The user pushes kunzite-sw and tags (xnu-boot-63).**
+   Boot #63 checks: the op-4 storm is gone from the log; webbookmarksd/syncdefaultsd make no
+   new .ips; /private/var/mobile/Containers state; Photos opens straight away; the hour-run
+   slowdown (re-measure — the 70/s printf storm is the first suspect, now gone); wallpapers
+   and the Waiting placeholders still need eyes.
 2. **The fairplayd stub (phone-side, no CI): the checkpointd unblock.** Both Photos and Phone
    hang on checkpointd's "mach_msg send on intransit port" to fairplayd's unregistered
    service. Build a tiny mach server (our iOS cross-compile, like the bbd wrapper) that
@@ -555,6 +560,11 @@ SIGKILL of launchd (CS_KILLED)", kern_exec.c:196. The kernel and 1002 were fine.
   .versioned / com.apple.unfreed (HostSpecialPort 17) and answers every message with a MIG
   error would let checkpointd fail gracefully instead of hanging its callers. Phone-side
   install like the backboardd wrapper (launchd job restored with the stub as Program); no CI.
+- The user's hour on #62 (added later): **Photos opened fine** (after the early watchdog
+  kills), wallpapers still missing, and **the phone slowed down over ~1 h of uptime** — first
+  report of degradation over time. Candidate causes to re-scout: the 70/s op-4 dump printf
+  storm over the USB console (1003 removes it), memory pressure (there was a JetsamEvent on
+  this boot), or something accumulating. Measure an hour on #63 before and after.
 - New crash reports pulled to temp/ios-m8/crashes/boot62/: MobileSlideShow x6, MobilePhone x5
   (all the watchdog above), JetsamEvent-160152, plus older-boot files still on the phone
   (SiriSearchFeedback, ExcUserFault_ktcc x2 = our own tool). MobilePhone is a new survey item
