@@ -1,14 +1,18 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: kunzite-sw cut + sw-plan, 2026-10-25) <<<
+## >>> CONTINUATION PLAN - READ FIRST (rewritten after every step; last step: boot #62, 2026-10-27) <<<
 
-**Where things stand.** The GPU work is merged: `kunzite` was fast-forwarded to the GPU tip
-(ce5cd8b) and **work continues on branch `kunzite-sw`** (same commit at the cut; next kernel
-patch 1002). The active plan is the main repo's **`ios/sw-plan.md`**: (1) crash survey of all
-boots so far, (2) the containers kit (sandbox stand-in ops 4/13/15/16/66/67 in sweet_amfi.c —
-op meanings already recovered from the 20H392 cache, see the sw-plan), (3) the Waiting widgets
-(likely PosterBoard). The AppSync sideload kit is parked until this SW base is settled (the
-user's call). Patch state: 247 applied, last kernel patch **1001
+**Where things stand.** Branch **`kunzite-sw`** (the GPU line is merged into `kunzite` and
+pushed). **Boot #62 ran 1002's container-ops dump and settled the containers kit's design**
+(log entry "BOOT #62"): op 4 = { pid, 0, buf, 0x400 } is called by everyone (cfprefsd 21k
+retries on ENOENT in 10 min), the setters (13/66) and 0x43 are NEVER called, ops 15/16 carry
+no strings — so **1003 = answer op 4 with the target pid's home path and quiet the dump**
+(gate it behind a boot-arg or once-per-caller). The second finding is bigger: **Photos and
+Phone hang on checkpointd, which blocks sending to fairplayd's now-unregistered Mach service
+("intransit port") — the stub-fairplayd server (AppSync scout entry) is the fix, phone-side,
+no CI needed.** webbookmarksd/syncdefaultsd are alive on #62; watch for their XPC-activity
+aborts. The AppSync sideload kit stays parked. Patch state: 248 applied, last kernel patch
+**1002
 (sandbox extension tokens), in the CI kernel sha256 2171df42... (tag xnu-boot-60)**; last image
 shim/out/shim-boot-61.img, cmdline #54's + `sweetusb=2 kgpu=21 kgpu_keep=1`, fairplayd's job
 still hidden. The UI has run on the GPU since #54 (write-combined buffers since 0999/#58; the
@@ -50,38 +54,37 @@ words) -> #59-#61 the photo chain: fairplayd hidden (#60, Photos past checkpoint
 (entitlements validated), 1001 (sandbox tokens) -> assetsd lives, the library is created, the
 first screenshot is saved and imported.
 
-**Next - the sw-plan's first round** (details in `ios/sw-plan.md`; one CI cycle, then one boot
-that covers everything):
-1. **Patch 1002 is written, verified and committed on kunzite-sw** (the containers kit's
-   evidence pass): `sweet_sandbox_dump()` prints each call's argument struct word by word
-   (up to 128 bytes) plus any string the first eight words point at, for ops 4, 13, 15, 16, 66
-   and 0x43. The compiler caught that 0x43 and decimal 67 are the same op
-   (sandbox_get_container_expected), so 0x43 keeps its own case with the dump. Answers are
-   unchanged: 4 and 0x43 still ENOENT, 13/15/16/66 still return 0. Verified: replay 248
-   applied with only the 4 expected skips and the patched file byte-identical to the edit;
-   CI's compile line clean; the undefined-symbol set identical to 1001's (36 = 36, nothing
-   new for the kernel to link). **The user pushes kunzite-sw and tags (xnu-boot-62); CI
-   builds.**
-2. **Boot #62** = kernel with 1002, image shim-boot-62.img, cmdline #54's. At fastboot time
-   restart the listener and the failure watch (they died with the Mac session on #61; the watch
-   line is in the "Long run" block below):
+**Next - two moves, independent of each other (details in `ios/sw-plan.md`):**
+1. **Patch 1003 (kunzite-sw, needs CI): answer op 4.** In sweet_sandbox_syscall: read
+   { pid, 0, buf, 0x400 }, copyout the target pid's home path ("/private/var/mobile" for uid
+   501, "/private/var/root" for 0, proc home otherwise), return 0 — no registry (nothing calls
+   the setters). Keep ops 13/15/16/66 as-is. Quiet the dump: keep 1002's dumper behind a
+   boot-arg (say sweet_sbx_dump=1) or first-use-per-caller, so cfprefsd's 70/s does not print.
+   Acceptance on the next boot: the op-4 storm collapses (a few hundred lines, not 21k),
+   webbookmarksd/syncdefaultsd produce no new nil-path .ips, /private/var/mobile/Containers
+   populates or at least stops erroring, everything else unchanged.
+2. **The fairplayd stub (phone-side, no CI): the checkpointd unblock.** Both Photos and Phone
+   hang on checkpointd's "mach_msg send on intransit port" to fairplayd's unregistered
+   service. Build a tiny mach server (our iOS cross-compile, like the bbd wrapper) that
+   bootstrap_check_ins com.apple.fairplayd, com.apple.fairplayd.versioned and
+   com.apple.unfreed (HostSpecialPort 17 per the job's plist) and answers every message with
+   a MIG error, so callers fail fast instead of hanging. Install like the backboardd wrapper:
+   restore the fairplayd.H2 job in /System/Library/xpc/launchd.plist with the stub as
+   Program (original plist still at launchd.plist.pre-fairplay; keep a stub-rollforward
+   rollback). Test on any boot: Photos opens past checkpointd (even to an error/empty
+   library) instead of hanging to the watchdog.
+3. Still open from #62: the wallpaper sheet and the Waiting placeholders need eyes on a
+   running phone (kshot or the user); the os_log check of "Failed to issue sandbox extension"
+   can ride the next .logarchive; webbookmarksd/syncdefaultsd's XPC-activity abort may still
+   fire later in a long run — check CrashReporter before shutting the phone down.
+   The listener for a live boot is:
 ```
 cd ios/ios-topaz-experiments && python3 tools/udp-log.py ../../temp/ios-m8/usblog/live-bootNN-$(date +%Y%m%d-%H%M).txt
 ```
-   In that one boot, in order:
-   - the crash survey: full CrashReporter listing, diff against temp/ios-m8/crashes/, pull and
-     symbolize every new .ips; the PosterBoard .ips of #61 12:19:04; whether
-     fairplaydeviceidentityd idles or crash-loops;
-   - the op dumps: what launchd's op 4 and containermanagerd's op 15/16 actually carry;
-   - the four photo checks still pending from #61: Photos' own screen (kshot), the os_log
-     "Failed to issue sandbox extension" line (a .logarchive as for #60), a second screenshot
-     into the grid, the Wallpaper list;
-   - the Waiting placeholders: what installcoordinationd/SpringBoard state says while they are
-     on screen.
-3. Then **patch 1003** implements the ops (registry + defaults) per what 1002 showed;
-   acceptance: webbookmarksd/syncdefaultsd stop aborting, containermanagerd's ops stop
-   erroring, /private/var/mobile/Containers/Data populates, the sandbox-op histogram diff is
-   otherwise clean.
+   The cmdline, VERBATIM (take 1 of #62 panicked on a one-letter boot-arg typo):
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_stayon=1 ufslogsecs=1 sweetusb=2 kgpu=21 kgpu_keep=1
+```
 The older deferred list (Safari's keyboard sb3 -> mediaserverd's VideoToolbox abort -> Date &
 Time hang -> trapLock -> GMEM range -> phase D -> the agent's /put streaming, ask first) stands
 behind the sw-plan, and the AppSync sideload kit is parked until the SW base is settled.
@@ -523,6 +526,39 @@ fits us.**
   installd/SpringBoard wrappers, built by mk-topaz-gl.sh's pattern; the test is a self-built,
   ad hoc-signed IPA. Boot #62 would combine the four pending photo checks with the first
   install attempt.
+
+**BOOT #62 (2026-10-27; kernel 0c8dfb43 = kunzite-sw + 1002, tag xnu-boot-62; log
+temp/ios-m8/usblog/live-boot62-20261027-2052.txt). Take 1 panicked in MY payload — the boot-arg
+was misspelled `unentitlement_ios_sim_launch`, so launchd (an iOS binary on this macOS-platform
+kernel) was killed at exec: OS_REASON_EXEC 0xe = EXEC_EXIT_REASON_WRONG_PLATFORM, "unexpected
+SIGKILL of launchd (CS_KILLED)", kern_exec.c:196. The kernel and 1002 were fine. Take 2
+(image sha256 20dd2097..., cmdline now VERBATIM in the plan above) boots normally:**
+- **1002's dump works and rewrote the op-4 picture.** The old first-use log showed one caller
+  per op per boot; really op 4 (container path) is called by EVERYONE: cfprefsd alone 21,368
+  times in ~10 min (it retries on ENOENT — a storm we never saw), containermanagerd 1,508x op
+  15 + 412x op 4, xpcproxy 1,008x, SpringBoard 769x, backboardd 316x, syncdefaultsd 256x,
+  plus locationd, MobileSlideShow, homed, chronod, bluetoothd, Preferences... The op-4 wire
+  format is confirmed from the dumps: { pid, 0, out-buffer, 0x400 } — exactly
+  sandbox_container_path_for_pid/_audit_token as disassembled. **Nobody calls ops 13, 66 or
+  0x43** (the setters and get-expected are unused), and op 15/16's arguments are opaque
+  pointers (no strings) — so 1003 needs no registry: answer op 4 with a computed path
+  (the target pid's home: 501 -> /private/var/mobile, 0 -> /private/var/root) and the storm
+  should collapse.
+- **The webbookmarksd/syncdefaultsd nil-path victims are ALIVE this boot** (pids 233/130) with
+  containermanagerd (63) — but their abort was in an XPC activity; watch for new .ips later.
+- **Photos and Phone now HANG (runningboard watchdog 0x8BADF00D, "failed to terminate
+  gracefully after 5.0s"), and both hang on the same wall: checkpointd is blocked in
+  "mach_msg send on intransit port" — it sends to a Mach service with no receiver, which is
+  fairplayd, whose job we hid.** Photos' main thread waits on a pthread condvar for
+  checkpointd's reply and never gets it. This is the concrete evidence for the stub-fairplayd
+  idea from the AppSync scout entry: a tiny server that checks in com.apple.fairplayd /
+  .versioned / com.apple.unfreed (HostSpecialPort 17) and answers every message with a MIG
+  error would let checkpointd fail gracefully instead of hanging its callers. Phone-side
+  install like the backboardd wrapper (launchd job restored with the stub as Program); no CI.
+- New crash reports pulled to temp/ios-m8/crashes/boot62/: MobileSlideShow x6, MobilePhone x5
+  (all the watchdog above), JetsamEvent-160152, plus older-boot files still on the phone
+  (SiriSearchFeedback, ExcUserFault_ktcc x2 = our own tool). MobilePhone is a new survey item
+  — same checkpointd chain, not a separate bug.
 
 **Long run without me (the user, on the Mac, from the main repo), for the hours-long GPU hold:**
 ```
