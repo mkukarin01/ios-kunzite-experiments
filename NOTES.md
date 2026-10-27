@@ -55,15 +55,20 @@ words) -> #59-#61 the photo chain: fairplayd hidden (#60, Photos past checkpoint
 first screenshot is saved and imported.
 
 **Next - two moves, independent of each other (details in `ios/sw-plan.md`):**
-1. **Patch 1003 is written, verified and committed on kunzite-sw** — a strong
-   `sweet_sandbox_container_path` replaces the weak ENOENT stand-in: read
-   { pid, 0/pid-version, buf, 0x400 } (buf at word 2, length at word 3 — both shapes), answer
-   with the target pid's home (/private/var/root for uid 0, /private/var/mobile otherwise);
-   ESRCH for a dead pid; ENAMETOOLONG for a short buffer. 1002's dump prints only with
-   sweet_sbx_dump=1. Verified: replay 249 applied (4 expected skips, file byte-identical),
-   CI's compile line clean, and the six new undefined symbols (_proc_find, _proc_rele,
-   _kauth_cred_proc_ref, _kauth_cred_getuid, _kauth_cred_unref, _current_proc) all present
-   in the CI kernel binary. **The user pushes kunzite-sw and tags (xnu-boot-63).**
+1. **Patch 1003 v2 is written, verified and committed on kunzite-sw.** v1 never linked in
+   CI: it made sweet_amfi.c's container-path definition strong, but **0936's
+   topaz_sandbox_container.c already IS the strong definition** the weak stand-in defers to
+   ("a private patch may answer...", duplicate symbol at the kernel link — a per-file compile
+   and symbol diff cannot catch that; grep the whole tree for an existing definition first).
+   v2 instead gives 0936's function the fallback: capture the target's uid while the proc is
+   held, and at every exit that returned ENOENT (no env, no map, stack read failed, no
+   CFFIXED_USER_HOME) answer the uid's home — /private/var/root for 0,
+   /private/var/mobile otherwise; the CFFIXED_USER_HOME answer is unchanged, a dead pid
+   still ESRCH. sweet_amfi.c keeps only the dump gate (sweet_sbx_dump=1). Verified: replay
+   249 applied, both files byte-identical to the edits, CI's compile line clean on both.
+   NOTE: the LOCAL ci-cc.sh line emits weak definitions as T (a minimal __attribute__((weak))
+   test compiles to T here) — do not trust local nm for weak/strong questions; diff the
+   sources. **The user pushes kunzite-sw and tags (xnu-boot-64; 63 burned on v1).**
    Boot #63 checks: the op-4 storm is gone from the log; webbookmarksd/syncdefaultsd make no
    new .ips; /private/var/mobile/Containers state; Photos opens straight away; the hour-run
    slowdown (re-measure — the 70/s printf storm is the first suspect, now gone); wallpapers

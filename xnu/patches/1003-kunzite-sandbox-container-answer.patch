@@ -1,25 +1,20 @@
-kunzite: the sandbox stand-in answers op 4, the container-path lookup (the containers kit's
-implementation, patch 1003; design from 1002's boot-#62 dump). Op 4 is called by everyone —
-cfprefsd alone 21,368 times in ten minutes on #62, retrying on the old ENOENT — with the struct
-{ pid, 0 or pid-version, the caller's out-buffer, 0x400 } in both the _for_pid and the
-_for_audit_token shapes (buf at word 2, length at word 3). Nothing ever calls the setters, so
-there is no registry: the answer is the target pid's home, /private/var/root for uid 0 and
-/private/var/mobile otherwise, copied into the caller's buffer; a pid that no longer exists
-gets ESRCH. The strong definition replaces the weak stand-in that returned ENOENT. 1002's
-argument dump now prints only with sweet_sbx_dump=1 in the boot-args, so the storm of console
-lines goes with the storm of retries.
+kunzite: op 4, the container-path lookup, always answers (the containers kit's implementation,
+patch 1003 v2; design from 1002's boot-#62 dump). Boot #62 showed op 4 is called by everyone —
+cfprefsd alone 21,368 times in ten minutes, retrying on the ENOENT — and almost no process here
+carries CFFIXED_USER_HOME, so 0936's environment answer almost always fell to 0970's ENOENT.
+topaz_sandbox_container.c now captures the target's uid while the proc is held and falls back
+to its home (/private/var/root for uid 0, /private/var/mobile otherwise) at every exit that
+used to return ENOENT: no environment, no map, a failed stack read, or no CFFIXED_USER_HOME.
+The environment answer, when the variable is there, is unchanged; a dead pid still gets ESRCH.
+v1 of this patch defined the answer as a strong symbol in sweet_amfi.c and CI's link failed:
+0936's definition in topaz_sandbox_container.o already is the strong one the weak stand-in in
+sweet_amfi.c defers to. sweet_amfi.c keeps only the other change: 1002's argument dump now
+prints only with sweet_sbx_dump=1 in the boot-args, so the console storm goes with the retry
+storm.
 
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -28,6 +28,7 @@
- #include <libkern/amfi/amfi.h>
- #include <mach/kern_return.h>
- #include <sys/codesign.h>
-+#include <sys/kauth.h>
- #include <sys/mount.h>
- #include <sys/priv.h>
- #include <sys/proc.h>
-@@ -353,6 +354,8 @@
+@@ -353,6 +353,8 @@
  	handle = OSIncrementAtomic64(&sweet_sandbox_handle_serial) + 1;
  	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
  }
@@ -28,7 +23,7 @@ lines goes with the storm of retries.
  
  /*
   * kunzite 1002: the container-operations evidence pass (sw-plan S2). The ops the
-@@ -375,6 +378,11 @@
+@@ -375,6 +377,11 @@
  	char text[96];
  	size_t words = 0;
  
@@ -40,57 +35,94 @@ lines goes with the storm of retries.
  	proc_name(proc_pid(p), name, sizeof(name));
  	while (words < sizeof(a) / sizeof(a[0]) &&
  	    copyin(arg + words * sizeof(uint64_t), &a[words], sizeof(a[words])) == 0) {
-@@ -414,11 +422,49 @@
- 	}
- }
+--- a/bsd/kern/topaz_sandbox_container.c
++++ b/bsd/kern/topaz_sandbox_container.c
+@@ -8,6 +8,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <sys/proc_internal.h>
++#include <sys/kauth.h>
+ #include <kern/task.h>
+ #include <mach/vm_param.h>
+ #include <vm/vm_kern.h>
+@@ -20,6 +21,22 @@
+ #define SANDBOX_SYSCALL_CONTAINER_PATH  4
+ #define SANDBOX_CONTAINER_VARIABLE      "CFFIXED_USER_HOME="
  
--/* a private patch may answer which container a process is in (a strong definition wins) */
--__attribute__((weak)) int
--sweet_sandbox_container_path(__unused user_addr_t arg)
 +/*
-+ * kunzite 1003: answer op 4, the container-path lookup. Boot #62's dump showed
-+ * it is called by everyone (cfprefsd alone 21,368 times in ten minutes,
-+ * retrying on our ENOENT) with the struct { pid, 0 or pid-version, the caller's
-+ * out-buffer, 0x400 } — sandbox_container_path_for_pid/_for_audit_token, both
-+ * with buf at word 2 and its length at word 3. Nothing calls the setters, so
-+ * there is no registry to consult: the answer is the target's home
-+ * (/private/var/root for uid 0, /private/var/mobile for everyone else). A pid
-+ * that no longer exists gets ESRCH; the old answer was ENOENT for everything.
++ * kunzite 1003: the fallback answer. Most processes here have no CFFIXED_USER_HOME —
++ * boot #62's dump showed op 4 called by everyone, answered ENOENT, and retried (cfprefsd
++ * alone 21,368 times in ten minutes). With the target's uid known, answer its home:
++ * /private/var/root for uid 0, /private/var/mobile otherwise — a valid, existing,
++ * absolute path, so callers stop retrying and stop reading missing paths.
 + */
-+int
-+sweet_sandbox_container_path(user_addr_t arg)
- {
--	return ENOENT;
-+	uint64_t a[5];
-+	char path[] = "/private/var/mobile";
-+	kauth_cred_t cred;
-+	proc_t target;
-+	size_t length;
-+	int error, pid;
++static int
++sandbox_container_home(uid_t uid, user_addr_t buffer, user_size_t size)
++{
++	const char *path = uid == 0 ? "/private/var/root" : "/private/var/mobile";
++	size_t length = strlen(path) + 1;
 +
-+	error = copyin(arg, a, sizeof(a));
-+	if (error != 0) {
-+		return error;
-+	}
-+	pid = (int)a[0];
-+	if (pid <= 0) {
-+		pid = proc_pid(current_proc());
-+	}
-+	target = proc_find(pid);
-+	if (target == PROC_NULL) {
-+		return ESRCH;
-+	}
-+	cred = kauth_cred_proc_ref(target);
-+	if (kauth_cred_getuid(cred) == 0) {
-+		strlcpy(path, "/private/var/root", sizeof(path));
-+	}
++	return size < length ? ENAMETOOLONG : copyout(path, buffer, length);
++}
++
+ int
+ sweet_sandbox_container_path(user_addr_t arg)
+ {
+@@ -32,6 +49,8 @@
+ 	} args;
+ 	const size_t prefix_len = sizeof(SANDBOX_CONTAINER_VARIABLE) - 1;
+ 	proc_t p;
++	kauth_cred_t cred;
++	uid_t uid;
+ 	task_t task;
+ 	vm_map_t map;
+ 	vm_map_copy_t copy = NULL;
+@@ -54,12 +73,16 @@
+ 		proc_rele(p);
+ 		return ESRCH;
+ 	}
++	cred = kauth_cred_proc_ref(p);
++	uid = kauth_cred_getuid(cred);
 +	kauth_cred_unref(&cred);
-+	proc_rele(target);
-+	length = strlen(path) + 1;
-+	if (a[3] < length) {
-+		return ENAMETOOLONG;
-+	}
-+	return copyout(path, (user_addr_t)a[2], length);
- }
+ 	user_stack = p->user_stack;
+ 	argslen = p->p_argslen;
+ 	task = proc_task(p);
+ 	if (user_stack == 0 || argslen == 0 || task == TASK_NULL) {
++		error = sandbox_container_home(uid, args.buffer, args.size);
+ 		proc_rele(p);
+-		return ENOENT;
++		return error;
+ 	}
+ 	/* the same way as sysctl_procargsx(): the task keeps the map alive once the process is let go */
+ 	task_reference(task);
+@@ -67,7 +90,7 @@
+ 	map = get_task_map_reference(task);
+ 	task_deallocate(task);
+ 	if (map == VM_MAP_NULL) {
+-		return ENOENT;
++		return sandbox_container_home(uid, args.buffer, args.size);
+ 	}
+ 	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
+ 	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+@@ -83,15 +106,16 @@
+ 			vm_map_copy_discard(copy);
+ 		}
+ 		kmem_free(kernel_map, strings, strings_size);
+-		return ENOENT;                  /* the process is on its way out, or has unmapped its own stack */
++		return sandbox_container_home(uid, args.buffer, args.size); /* on its way out, or unmapped its own stack */
+ 	}
  
- static int
+ 	/*
+-	 * kunzite: no CFFIXED_USER_HOME is ENOENT, as op 4 answered before 0936. Success without
+-	 * a path made callers read their own uninitialised buffer as one (syncdefaultsd,
+-	 * webbookmarksd: +[NSURL fileURLWithPath:] threw, boot #25).
++	 * kunzite 1003: no CFFIXED_USER_HOME falls back to the uid's home (sandbox_container_home).
++	 * 0936 returned success without writing the buffer, and callers read their uninitialised
++	 * buffer as a path (syncdefaultsd, webbookmarksd: +[NSURL fileURLWithPath:] threw, boot
++	 * #25); 0970 answered ENOENT instead, which #62 showed they retry forever.
+ 	 */
+-	error = ENOENT;
++	error = sandbox_container_home(uid, args.buffer, args.size);
+ 	end = (const char *)(strings + strings_size);
+ 	for (s = end - argslen; s < end; s += len + 1) {
+ 		len = strnlen(s, end - s);
